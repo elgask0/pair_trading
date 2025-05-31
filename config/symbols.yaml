@@ -1,0 +1,22 @@
+trading_pairs:
+  - symbol1: "MEXCFTS_PERP_GIGA_USDT"
+    symbol2: "MEXCFTS_PERP_SPX_USDT"
+    entry_zscore: 2.0
+    exit_zscore: 0.5
+    stop_loss_zscore: 3.0
+    position_size_pct: 0.1
+    correlation_window: 60
+    cointegration_window: 1440
+    zscore_window: 60
+    min_correlation: 0.7
+    is_active: true
+    notes: "Initial pair for testing"
+
+  # Ejemplo para agregar más pares:
+  # - symbol1: "MEXCFTS_PERP_OTRO_USDT"
+  #   symbol2: "MEXCFTS_PERP_OTRO2_USDT"
+  #   entry_zscore: 1.75
+  #   exit_zscore: 0.25
+  #   stop_loss_zscore: 2.5
+  #   position_size_pct: 0.08
+  #   is_active: false
