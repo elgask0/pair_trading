@@ -273,6 +273,29 @@ class DataIngestion:
         
         return total_records
     
+    def ingest_symbol_data(self, symbol: str) -> bool:
+        """Ingest all data for a single symbol"""
+        log.info(f"Starting complete ingestion for {symbol}")
+        
+        # Step 1: Update symbol info
+        if not self.update_symbol_info(symbol):
+            log.error(f"Failed to update symbol info for {symbol}")
+            return False
+        
+        # Step 2: Ingest OHLCV data (incremental)
+        if not self.ingest_ohlcv_data(symbol):
+            log.error(f"Failed to ingest OHLCV data for {symbol}")
+            return False
+        
+        # Step 3: Ingest orderbook data (incremental)
+        try:
+            self.ingest_orderbook_data(symbol)
+        except Exception as e:
+            log.warning(f"Orderbook ingestion failed for {symbol}: {e}")
+        
+        log.info(f"Successfully processed {symbol}")
+        return True
+    
     def ingest_all_symbols(self) -> bool:
         """Complete incremental ingestion for all symbols"""
         log.info("Starting complete incremental data ingestion for all symbols")
@@ -289,24 +312,11 @@ class DataIngestion:
         for symbol in symbols_to_process:
             log.info(f"\n=== Processing {symbol} ===")
             
-            # Step 1: Update symbol info
-            if not self.update_symbol_info(symbol):
-                log.error(f"Failed to update symbol info for {symbol}")
-                continue
-            
-            # Step 2: Ingest OHLCV data (incremental)
-            if not self.ingest_ohlcv_data(symbol):
-                log.error(f"Failed to ingest OHLCV data for {symbol}")
-                continue
-            
-            # Step 3: Ingest orderbook data (incremental)
-            try:
-                self.ingest_orderbook_data(symbol)
-            except Exception as e:
-                log.warning(f"Orderbook ingestion failed for {symbol}: {e}")
-            
-            success_count += 1
-            log.info(f"Successfully processed {symbol} ({success_count}/{total_symbols})")
+            if self.ingest_symbol_data(symbol):
+                success_count += 1
+                log.info(f"Successfully processed {symbol} ({success_count}/{total_symbols})")
+            else:
+                log.error(f"Failed to process {symbol}")
         
         log.info(f"Complete incremental ingestion finished: {success_count}/{total_symbols} symbols successful")
         return success_count == total_symbols
@@ -428,7 +438,7 @@ class DataIngestion:
         return len(records)
     
     def _insert_orderbook_data(self, df: pd.DataFrame, symbol: str) -> int:
-        """Insert orderbook data into database"""
+        """Insert orderbook data into database - FIXED VERSION"""
         records = []
         
         for timestamp, row in df.iterrows():
@@ -437,12 +447,19 @@ class DataIngestion:
                 'timestamp': timestamp
             }
             
-            # Add bid and ask levels
+            # Add bid and ask levels - CONVERTIR A TIPOS PYTHON NATIVOS
             for i in range(1, 11):
-                record_data[f'bid{i}_price'] = row.get(f'bid{i}_price')
-                record_data[f'bid{i}_size'] = row.get(f'bid{i}_size')
-                record_data[f'ask{i}_price'] = row.get(f'ask{i}_price')
-                record_data[f'ask{i}_size'] = row.get(f'ask{i}_size')
+                # Obtener valores y convertir np.float64 a float nativo de Python
+                bid_price = row.get(f'bid{i}_price')
+                bid_size = row.get(f'bid{i}_size')
+                ask_price = row.get(f'ask{i}_price')
+                ask_size = row.get(f'ask{i}_size')
+                
+                # Conversión segura a tipos Python nativos
+                record_data[f'bid{i}_price'] = float(bid_price) if pd.notna(bid_price) else None
+                record_data[f'bid{i}_size'] = float(bid_size) if pd.notna(bid_size) else None
+                record_data[f'ask{i}_price'] = float(ask_price) if pd.notna(ask_price) else None
+                record_data[f'ask{i}_size'] = float(ask_size) if pd.notna(ask_size) else None
             
             records.append(Orderbook(**record_data))
         
