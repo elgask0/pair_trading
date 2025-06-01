@@ -11,8 +11,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.coinapi_client import coinapi_client
 from src.data.ingestion import data_ingestion
-from src.utils.logger import log
 from config.settings import settings
+from src.utils.logger import get_setup_logger
+
+log = get_setup_logger()
 
 def test_single_day_ohlcv(symbol: str, test_date: str):
     """Test OHLCV ingestion for a single day"""

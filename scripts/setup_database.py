@@ -11,8 +11,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.database.connection import db_manager
 from src.database.migrations import create_all_tables
 from src.database.models import Symbol, PairConfiguration
-from src.utils.logger import log
 from config.settings import settings
+from src.utils.logger import get_setup_logger
+
+log = get_setup_logger()
 
 def setup_symbols():
     """Initialize symbols table with trading pairs"""
