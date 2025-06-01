@@ -11,9 +11,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.ingestion import data_ingestion
 from config.settings import settings
-from src.utils.logger import get_setup_logger
+from src.utils.logger import get_ingestion_logger
 
-log = get_setup_logger()
+log = get_ingestion_logger()
 
 def main():
     parser = argparse.ArgumentParser(description="Ingest historical data from CoinAPI")
