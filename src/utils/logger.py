@@ -1,4 +1,4 @@
-from loguru import logger
+from loguru import logger as loguru_logger
 import sys
 import os
 from pathlib import Path
@@ -8,7 +8,7 @@ def setup_logger(script_name: str = None):
     """Setup structured logging with loguru for specific scripts"""
     
     # Remove default handler
-    logger.remove()
+    loguru_logger.remove()
     
     # Ensure logs directory exists
     logs_dir = Path("logs")
@@ -21,7 +21,7 @@ def setup_logger(script_name: str = None):
         log_file = logs_dir / "trading.log"
     
     # Console handler with colors
-    logger.add(
+    loguru_logger.add(
         sys.stdout,
         level=settings.LOG_LEVEL,
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
@@ -29,7 +29,7 @@ def setup_logger(script_name: str = None):
     )
     
     # File handler for specific script
-    logger.add(
+    loguru_logger.add(
         str(log_file),
         level=settings.LOG_LEVEL,
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
@@ -38,22 +38,18 @@ def setup_logger(script_name: str = None):
         compression="zip"
     )
     
-    # Also keep a general trading.log for overall system
-    if script_name and script_name != "trading":
-        logger.add(
+    # Always add to general trading.log with simple format
+    if script_name != "trading":  # Evitar duplicados
+        loguru_logger.add(
             str(logs_dir / "trading.log"),
             level="INFO",  # Only important messages go to general log
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | [{extra[script]}] {name}:{function} - {message}",
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function} - {message}",
             rotation="10 MB",
             retention="30 days",
             compression="zip"
         )
     
-    # Add script name to context
-    if script_name:
-        logger = logger.bind(script=script_name)
-    
-    return logger
+    return loguru_logger
 
 # Convenience functions for different scripts
 def get_setup_logger():
