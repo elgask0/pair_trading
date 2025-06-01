@@ -19,35 +19,79 @@ class CoinAPIClient:
             'X-CoinAPI-Key': self.api_key,
             'Accept': 'application/json'
         })
-        self.rate_limit_delay = 0.5
+        self.rate_limit_delay = 1.0
     
     def _safe_request(self, url: str, params: Dict = None, retries: int = 3) -> requests.Response:
-        """Safe request with retries"""
+        """Safe request with retries and optimized error handling"""
         for attempt in range(retries):
+            # Rate limiting more conservative
             time.sleep(self.rate_limit_delay)
             
             try:
-                response = self.session.get(url, params=params, timeout=30)
+                # Intelligent timeout based on endpoint type
+                timeout = 60 if 'orderbook' in url else 30
+                response = self.session.get(url, params=params, timeout=timeout)
+                
+                # Enhanced credit monitoring
+                remaining = response.headers.get('X-RateLimit-Remaining-Day')
+                used = response.headers.get('X-RateLimit-Request-Count-Day')
+                limit = response.headers.get('X-RateLimit-Limit-Day')
+                
+                if remaining and used:
+                    log.info(f"API Usage: {used}/{limit} ({remaining} remaining)")
+                    
+                    # Early warning when approaching limit
+                    if int(remaining) < 2000:
+                        log.warning(f"APPROACHING LIMIT: Only {remaining} API calls remaining!")
+                        # Slow down even more when approaching limit
+                        time.sleep(2.0)
+                        
+                    # Critical stop to preserve remaining calls
+                    if int(remaining) < 500:
+                        log.error(f"CRITICAL: Stopping ingestion - only {remaining} calls left")
+                        log.error(f"Wait for daily reset or upgrade plan")
+                        raise APIError(f"API limit protection: {remaining} calls remaining")
+                
                 response.raise_for_status()
                 return response
                 
             except requests.exceptions.HTTPError as e:
                 if e.response and e.response.status_code == 429:
+                    # Intelligent rate limiting handling
                     retry_after = e.response.headers.get("Retry-After")
-                    wait_time = int(retry_after) if retry_after and retry_after.isdigit() else (2 ** attempt)
-                    log.warning(f"Rate limit hit (429). Retrying after {wait_time} seconds.")
+                    if retry_after and retry_after.isdigit():
+                        wait_time = int(retry_after)
+                        log.warning(f"Rate limited (429). Waiting {wait_time}s as requested by server")
+                    else:
+                        # More aggressive exponential backoff for 429s
+                        wait_time = min(300, 30 * (2 ** attempt))  # Max 5 minutes
+                        log.warning(f"Rate limited (429). Waiting {wait_time}s (exponential backoff)")
+                    
                     time.sleep(wait_time)
                     continue
+                    
                 elif e.response and e.response.status_code == 400:
                     log.error(f"Bad request (400): {e.response.text}")
                     raise APIError(f"Bad request: {e.response.text}")
                 raise
-            except Exception as e:
+                
+            except requests.exceptions.Timeout as e:
                 if attempt < retries - 1:
-                    wait_time = 2 ** attempt
-                    log.warning(f"Request failed ({e}). Retrying in {wait_time} seconds.")
+                    # Smarter backoff for timeouts
+                    wait_time = min(60, 10 * (2 ** attempt))  # 10s, 20s, 40s (max 60s)
+                    log.warning(f"Timeout on attempt {attempt + 1}/{retries}. Retrying in {wait_time}s")
                     time.sleep(wait_time)
                 else:
+                    log.error(f"Request timed out after {retries} attempts: {url}")
+                    raise APIError(f"Request timed out after {retries} attempts: {e}")
+                    
+            except Exception as e:
+                if attempt < retries - 1:
+                    wait_time = 5 * (2 ** attempt)  # 5s, 10s, 20s
+                    log.warning(f"Request failed ({e}). Retrying in {wait_time}s")
+                    time.sleep(wait_time)
+                else:
+                    log.error(f"Request failed after {retries} attempts: {e}")
                     raise APIError(f"Request failed after {retries} attempts: {e}")
     
     def get_symbol_info(self, symbol: str) -> Dict:
@@ -129,10 +173,10 @@ class CoinAPIClient:
         
         url = f"{self.base_url}/ohlcv/{symbol}/history"
         params = {
-            "period_id": "1MIN",  # 1 minuto como pediste
+            "period_id": "1MIN",
             "time_start": start_time,
             "time_end": end_time,
-            "limit": 1500  # Máximo por día (1440 min + buffer)
+            "limit": 1500  # Maximum per day (1440 min + buffer)
         }
         
         try:
@@ -157,7 +201,7 @@ class CoinAPIClient:
         url = f"{self.base_url}/orderbooks/{symbol}/history"
         params = {
             "date": date_str,
-            "limit_levels": 10  # 10 niveles como pediste
+            "limit_levels": 10
         }
         
         try:
