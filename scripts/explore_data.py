@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-Data cleaning script with intelligent forward fill and comprehensive validation
-Fills gaps in OHLCV data and marks synthetic data in database
+Análisis de datos con threshold P80 automático
 """
 
 import sys
 import os
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from sqlalchemy import text, MetaData, Table, Column, Boolean, Integer, String, DateTime, Float
-from sqlalchemy.dialects.postgresql import insert
 import matplotlib.pyplot as plt
-import seaborn as sns
+from datetime import datetime
+from sqlalchemy import text
 from pathlib import Path
+from typing import Dict
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.database.connection import db_manager
@@ -21,174 +19,412 @@ from src.utils.logger import get_validation_logger
 
 log = get_validation_logger()
 
-# Create plots directory
-plots_dir = Path("plots")
-plots_dir.mkdir(exist_ok=True)
-
-def add_synthetic_data_columns():
-    """Add columns to track synthetic/filled data"""
-    log.info("Adding synthetic data tracking columns...")
+def add_database_columns():
+    """Añadir columnas necesarias"""
+    log.info("Adding database columns...")
     
     with db_manager.get_session() as session:
-        # Add is_synthetic column to OHLCV table if it doesn't exist
-        try:
-            session.execute(text("""
-                ALTER TABLE ohlcv 
-                ADD COLUMN IF NOT EXISTS is_synthetic BOOLEAN DEFAULT FALSE,
-                ADD COLUMN IF NOT EXISTS fill_method VARCHAR(50),
-                ADD COLUMN IF NOT EXISTS fill_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            """))
-            log.info("Added synthetic tracking columns to OHLCV table")
-        except Exception as e:
-            log.warning(f"Columns may already exist in OHLCV: {e}")
-        
-        # Add similar columns to orderbook table
         try:
             session.execute(text("""
                 ALTER TABLE orderbook 
-                ADD COLUMN IF NOT EXISTS is_synthetic BOOLEAN DEFAULT FALSE,
-                ADD COLUMN IF NOT EXISTS fill_method VARCHAR(50),
-                ADD COLUMN IF NOT EXISTS fill_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ADD COLUMN IF NOT EXISTS liquidity_quality VARCHAR(20),
+                ADD COLUMN IF NOT EXISTS valid_for_trading BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS spread_pct FLOAT,
+                ADD COLUMN IF NOT EXISTS threshold_p80 FLOAT
             """))
-            log.info("Added synthetic tracking columns to orderbook table")
+            log.info("Added columns to orderbook table")
         except Exception as e:
-            log.warning(f"Columns may already exist in orderbook: {e}")
+            log.warning(f"Columns may already exist: {e}")
 
-def load_and_analyze_ohlcv_data(symbol):
-    """Load OHLCV data and analyze gaps"""
-    log.info(f"Loading OHLCV data for {symbol}...")
+def check_if_already_processed(symbol: str) -> bool:
+    """Verificar si el símbolo ya fue procesado"""
+    with db_manager.get_session() as session:
+        result = session.execute(text("""
+            SELECT COUNT(*) as processed_count
+            FROM orderbook 
+            WHERE symbol = :symbol 
+            AND liquidity_quality IS NOT NULL
+        """), {'symbol': symbol}).fetchone()
+        
+        if result.processed_count > 0:
+            log.info(f"{symbol} already processed ({result.processed_count:,} records). Skipping database update.")
+            return True
+        return False
+
+def load_data(symbol: str):
+    """Cargar datos OHLCV y orderbook"""
+    log.info(f"Loading data for {symbol}...")
     
     with db_manager.get_session() as session:
-        query = text("""
-            SELECT timestamp, open, high, low, close, volume, 
-                   COALESCE(is_synthetic, FALSE) as is_synthetic,
-                   fill_method
+        # OHLCV
+        ohlcv_query = text("""
+            SELECT timestamp, open, high, low, close, volume
             FROM ohlcv 
             WHERE symbol = :symbol
             ORDER BY timestamp
         """)
+        ohlcv_df = pd.read_sql(ohlcv_query, session.bind, params={"symbol": symbol}, index_col='timestamp')
         
-        df = pd.read_sql(query, session.bind, params={"symbol": symbol}, index_col='timestamp')
-        
-        if len(df) == 0:
-            log.warning(f"No OHLCV data found for {symbol}")
-            return None
-        
-        log.info(f"Loaded {len(df):,} records for {symbol}")
-        log.info(f"Existing synthetic records: {df['is_synthetic'].sum()}")
-        
-        return df
-
-def load_and_analyze_orderbook_data(symbol):
-    """Load orderbook data and analyze quality"""
-    log.info(f"Loading orderbook data for {symbol}...")
-    
-    with db_manager.get_session() as session:
-        query = text("""
-            SELECT timestamp, 
-                   bid1_price, bid1_size, ask1_price, ask1_size,
-                   bid2_price, bid2_size, ask2_price, ask2_size,
-                   bid3_price, bid3_size, ask3_price, ask3_size,
-                   COALESCE(is_synthetic, FALSE) as is_synthetic
+        # Orderbook
+        orderbook_query = text("""
+            SELECT timestamp, bid1_price, bid1_size, ask1_price, ask1_size,
+                   liquidity_quality, valid_for_trading, spread_pct, threshold_p80
             FROM orderbook 
             WHERE symbol = :symbol
             ORDER BY timestamp
         """)
+        orderbook_df = pd.read_sql(orderbook_query, session.bind, params={"symbol": symbol}, index_col='timestamp')
         
-        df = pd.read_sql(query, session.bind, params={"symbol": symbol}, index_col='timestamp')
-        
-        if len(df) == 0:
-            log.warning(f"No orderbook data found for {symbol}")
-            return None
-        
-        log.info(f"Loaded {len(df):,} orderbook records for {symbol}")
-        return df
+        log.info(f"Loaded {len(ohlcv_df):,} OHLCV and {len(orderbook_df):,} orderbook records")
+        return ohlcv_df, orderbook_df
 
-def analyze_orderbook_quality(symbol, orderbook_df):
-    """Comprehensive orderbook quality analysis"""
-    log.info(f"\n=== ORDERBOOK QUALITY ANALYSIS FOR {symbol} ===")
+def calculate_p80_threshold(orderbook_df: pd.DataFrame) -> float:
+    """Calcular threshold basado en percentil 80"""
     
-    if orderbook_df is None or len(orderbook_df) == 0:
-        log.warning("No orderbook data to analyze")
-        return
-    
-    # Basic quality checks
-    total_records = len(orderbook_df)
-    
-    # Check for missing best bid/ask
-    missing_best_bid = orderbook_df['bid1_price'].isna().sum()
-    missing_best_ask = orderbook_df['ask1_price'].isna().sum()
-    
-    log.info(f"Missing best bid: {missing_best_bid:,} ({missing_best_bid/total_records*100:.2f}%)")
-    log.info(f"Missing best ask: {missing_best_ask:,} ({missing_best_ask/total_records*100:.2f}%)")
-    
-    # Calculate spreads where possible
     valid_quotes = orderbook_df.dropna(subset=['bid1_price', 'ask1_price'])
+    if len(valid_quotes) == 0:
+        return 0.1  # Default fallback
     
-    if len(valid_quotes) > 0:
-        spreads = valid_quotes['ask1_price'] - valid_quotes['bid1_price']
-        spread_pct = spreads / valid_quotes['bid1_price'] * 100
-        
-        log.info(f"\n--- SPREAD ANALYSIS ---")
-        log.info(f"Valid quotes: {len(valid_quotes):,} ({len(valid_quotes)/total_records*100:.1f}%)")
-        log.info(f"Spread statistics (absolute):")
-        log.info(f"  Mean: {spreads.mean():.6f}")
-        log.info(f"  Median: {spreads.median():.6f}")
-        log.info(f"  Std: {spreads.std():.6f}")
-        log.info(f"  Min: {spreads.min():.6f}")
-        log.info(f"  Max: {spreads.max():.6f}")
-        
-        log.info(f"Spread statistics (%):")
-        log.info(f"  Mean: {spread_pct.mean():.4f}%")
-        log.info(f"  Median: {spread_pct.median():.4f}%")
-        log.info(f"  95th percentile: {spread_pct.quantile(0.95):.4f}%")
-        log.info(f"  99th percentile: {spread_pct.quantile(0.99):.4f}%")
-        
-        # Check for crossed book
-        crossed_book = (spreads < 0).sum()
-        log.info(f"Crossed book instances: {crossed_book} ({crossed_book/len(valid_quotes)*100:.3f}%)")
-        
-        # Check for unrealistic spreads
-        wide_spreads = (spread_pct > 5).sum()  # >5% spread
-        log.info(f"Very wide spreads (>5%): {wide_spreads} ({wide_spreads/len(valid_quotes)*100:.3f}%)")
+    spreads = valid_quotes['ask1_price'] - valid_quotes['bid1_price']
+    spread_pct = spreads / valid_quotes['bid1_price'] * 100
     
-    # Analyze depth beyond level 1
-    level2_coverage = (~orderbook_df[['bid2_price', 'ask2_price']].isna()).all(axis=1).sum()
-    level3_coverage = (~orderbook_df[['bid3_price', 'ask3_price']].isna()).all(axis=1).sum()
+    # Percentil 80 - el 80% de los datos tendrán spreads menores a este valor
+    p80_threshold = spread_pct.quantile(0.80)
     
-    log.info(f"\n--- DEPTH ANALYSIS ---")
-    log.info(f"Level 2 coverage: {level2_coverage:,} ({level2_coverage/total_records*100:.1f}%)")
-    log.info(f"Level 3 coverage: {level3_coverage:,} ({level3_coverage/total_records*100:.1f}%)")
-    
-    # Analyze size distributions
-    if 'bid1_size' in orderbook_df.columns:
-        valid_sizes = orderbook_df.dropna(subset=['bid1_size', 'ask1_size'])
-        if len(valid_sizes) > 0:
-            log.info(f"\n--- SIZE ANALYSIS ---")
-            log.info(f"Bid1 size stats:")
-            log.info(f"  Mean: {valid_sizes['bid1_size'].mean():,.0f}")
-            log.info(f"  Median: {valid_sizes['bid1_size'].median():,.0f}")
-            log.info(f"  Min: {valid_sizes['bid1_size'].min():,.0f}")
-            log.info(f"  Max: {valid_sizes['bid1_size'].max():,.0f}")
-            
-            log.info(f"Ask1 size stats:")
-            log.info(f"  Mean: {valid_sizes['ask1_size'].mean():,.0f}")
-            log.info(f"  Median: {valid_sizes['ask1_size'].median():,.0f}")
-            log.info(f"  Min: {valid_sizes['ask1_size'].min():,.0f}")
-            log.info(f"  Max: {valid_sizes['ask1_size'].max():,.0f}")
+    return p80_threshold
 
-def validate_ohlcv_coherence(symbol, ohlcv_df):
-    """Validate OHLCV data coherence and relationships"""
-    log.info(f"\n=== OHLCV COHERENCE ANALYSIS FOR {symbol} ===")
+def analyze_spread_quality(symbol: str, orderbook_df: pd.DataFrame, threshold: float):
+    """Analizar calidad de spreads con threshold P80"""
     
-    if ohlcv_df is None or len(ohlcv_df) == 0:
-        log.warning("No OHLCV data to analyze")
+    valid_quotes = orderbook_df.dropna(subset=['bid1_price', 'ask1_price'])
+    if len(valid_quotes) == 0:
+        return None
+    
+    spreads = valid_quotes['ask1_price'] - valid_quotes['bid1_price']
+    spread_pct = spreads / valid_quotes['bid1_price'] * 100
+    
+    # Aplicar threshold P80
+    good_data_mask = spread_pct <= threshold
+    good_data_pct = good_data_mask.mean() * 100
+    
+    # Clasificación basada en P80
+    excellent_threshold = threshold * 0.5
+    fair_threshold = threshold * 1.5
+    
+    quality_counts = {
+        'excellent': (spread_pct <= excellent_threshold).sum(),
+        'good': ((spread_pct > excellent_threshold) & (spread_pct <= threshold)).sum(),
+        'fair': ((spread_pct > threshold) & (spread_pct <= fair_threshold)).sum(),
+        'poor': (spread_pct > fair_threshold).sum()
+    }
+    
+    total_records = len(spread_pct)
+    quality_pct = {k: v/total_records*100 for k, v in quality_counts.items()}
+    
+    log.info(f"{symbol} Spread Analysis:")
+    log.info(f"  P80 threshold: {threshold:.4f}%")
+    log.info(f"  Average spread: {spread_pct.mean():.4f}%")
+    log.info(f"  Median spread: {spread_pct.median():.4f}%")
+    log.info(f"  Good data (≤P80): {good_data_pct:.1f}%")
+    log.info(f"  Quality - Excellent: {quality_pct['excellent']:.1f}%, Good: {quality_pct['good']:.1f}%, Fair: {quality_pct['fair']:.1f}%, Poor: {quality_pct['poor']:.1f}%")
+    
+    return {
+        'symbol': symbol,
+        'threshold': threshold,
+        'spread_pct': spread_pct,
+        'good_data_pct': good_data_pct,
+        'quality_counts': quality_counts,
+        'quality_pct': quality_pct,
+        'total_records': total_records,
+        'basic_stats': {
+            'mean': spread_pct.mean(),
+            'median': spread_pct.median(),
+            'p25': spread_pct.quantile(0.25),
+            'p50': spread_pct.quantile(0.50),
+            'p75': spread_pct.quantile(0.75),
+            'p80': threshold,
+            'p95': spread_pct.quantile(0.95)
+        }
+    }
+
+def update_database_quality(symbol: str, threshold: float):
+    """Actualizar base de datos con información de calidad usando P80"""
+    log.info(f"Updating database quality for {symbol} with P80 threshold {threshold:.4f}%...")
+    
+    with db_manager.get_session() as session:
+        # 1. Calcular spread_pct y guardar threshold P80
+        session.execute(text("""
+            UPDATE orderbook 
+            SET spread_pct = ((ask1_price - bid1_price) / bid1_price * 100),
+                threshold_p80 = :threshold
+            WHERE symbol = :symbol 
+            AND bid1_price IS NOT NULL 
+            AND ask1_price IS NOT NULL
+            AND bid1_price > 0
+        """), {'symbol': symbol, 'threshold': threshold})
+        
+        # 2. Clasificar basado en P80
+        excellent_threshold = threshold * 0.5
+        fair_threshold = threshold * 1.5
+        
+        # Excellent (≤50% del P80)
+        session.execute(text("""
+            UPDATE orderbook 
+            SET liquidity_quality = 'Excellent', valid_for_trading = TRUE
+            WHERE symbol = :symbol AND spread_pct <= :excellent_threshold
+        """), {'symbol': symbol, 'excellent_threshold': excellent_threshold})
+        
+        # Good (50% del P80 < spread ≤ P80)
+        session.execute(text("""
+            UPDATE orderbook 
+            SET liquidity_quality = 'Good', valid_for_trading = TRUE
+            WHERE symbol = :symbol 
+            AND spread_pct > :excellent_threshold 
+            AND spread_pct <= :threshold
+        """), {'symbol': symbol, 'excellent_threshold': excellent_threshold, 'threshold': threshold})
+        
+        # Fair (P80 < spread ≤ 150% del P80)
+        session.execute(text("""
+            UPDATE orderbook 
+            SET liquidity_quality = 'Fair', valid_for_trading = FALSE
+            WHERE symbol = :symbol 
+            AND spread_pct > :threshold 
+            AND spread_pct <= :fair_threshold
+        """), {'symbol': symbol, 'threshold': threshold, 'fair_threshold': fair_threshold})
+        
+        # Poor (>150% del P80)
+        session.execute(text("""
+            UPDATE orderbook 
+            SET liquidity_quality = 'Poor', valid_for_trading = FALSE
+            WHERE symbol = :symbol 
+            AND spread_pct > :fair_threshold
+        """), {'symbol': symbol, 'fair_threshold': fair_threshold})
+        
+        # Verificar resultados
+        result = session.execute(text("""
+            SELECT 
+                COUNT(*) as total,
+                COUNT(CASE WHEN valid_for_trading THEN 1 END) as good_trading,
+                COUNT(CASE WHEN liquidity_quality = 'Excellent' THEN 1 END) as excellent,
+                COUNT(CASE WHEN liquidity_quality = 'Good' THEN 1 END) as good,
+                COUNT(CASE WHEN liquidity_quality = 'Fair' THEN 1 END) as fair,
+                COUNT(CASE WHEN liquidity_quality = 'Poor' THEN 1 END) as poor
+            FROM orderbook 
+            WHERE symbol = :symbol
+        """), {'symbol': symbol}).fetchone()
+        
+        log.info(f"Database updated for {symbol}:")
+        log.info(f"  Total records: {result.total:,}")
+        log.info(f"  Valid for trading (≤P80): {result.good_trading:,} ({result.good_trading/result.total*100:.1f}%)")
+        log.info(f"  Excellent: {result.excellent:,}, Good: {result.good:,}, Fair: {result.fair:,}, Poor: {result.poor:,}")
+
+def create_spread_analysis_plot(analysis: Dict):
+    """Crear gráfico de análisis de spreads"""
+    
+    symbol = analysis['symbol']
+    spread_pct = analysis['spread_pct']
+    threshold = analysis['threshold']
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # 1. Distribución de spreads
+    axes[0, 0].hist(spread_pct, bins=100, alpha=0.7, edgecolor='black', density=True)
+    axes[0, 0].axvline(threshold, color='red', linestyle='-', linewidth=2, 
+                      label=f'P80 Threshold: {threshold:.4f}%')
+    axes[0, 0].axvline(analysis['basic_stats']['median'], color='blue', linestyle='--', 
+                      label=f'Median: {analysis["basic_stats"]["median"]:.4f}%')
+    
+    axes[0, 0].set_title(f'{symbol} - Spread Distribution')
+    axes[0, 0].set_xlabel('Spread %')
+    axes[0, 0].set_ylabel('Density')
+    axes[0, 0].legend()
+    axes[0, 0].set_yscale('log')
+    
+    # 2. Percentiles con P80 marcado
+    percentiles = np.arange(1, 101)
+    spread_values = np.percentile(spread_pct.values, percentiles)
+    
+    axes[0, 1].plot(percentiles, spread_values, linewidth=2)
+    axes[0, 1].axhline(threshold, color='red', linestyle='-', 
+                      label=f'P80: {threshold:.4f}%')
+    axes[0, 1].axvline(80, color='red', linestyle='--', alpha=0.7)
+    
+    axes[0, 1].set_title(f'{symbol} - Percentile Analysis')
+    axes[0, 1].set_xlabel('Percentile')
+    axes[0, 1].set_ylabel('Spread %')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # 3. Data availability vs threshold
+    thresholds_range = np.linspace(spread_pct.quantile(0.01), spread_pct.quantile(0.99), 50)
+    data_availability = [(spread_pct <= t).mean() * 100 for t in thresholds_range]
+    
+    axes[1, 0].plot(thresholds_range, data_availability, linewidth=2)
+    axes[1, 0].axvline(threshold, color='red', linestyle='-', 
+                      label=f'P80: {analysis["good_data_pct"]:.1f}%')
+    axes[1, 0].set_title(f'{symbol} - Data Availability vs Threshold')
+    axes[1, 0].set_xlabel('Threshold %')
+    axes[1, 0].set_ylabel('Data Availability %')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # 4. Quality pie chart
+    quality_labels = list(analysis['quality_pct'].keys())
+    quality_values = list(analysis['quality_pct'].values())
+    colors = ['green', 'lightgreen', 'yellow', 'red']
+    
+    axes[1, 1].pie(quality_values, labels=quality_labels, colors=colors, 
+                   autopct='%1.1f%%', startangle=90)
+    axes[1, 1].set_title(f'{symbol} - Quality Distribution (P80 Based)')
+    
+    plt.tight_layout()
+    
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+    plt.savefig(plots_dir / f'{symbol}_spread_analysis.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+def create_ohlcv_analysis_plot(symbol: str, ohlcv_df: pd.DataFrame):
+    """Análisis OHLCV simplificado"""
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # 1. Evolución de precios
+    daily_prices = ohlcv_df.groupby(ohlcv_df.index.date)['close'].last()
+    axes[0, 0].plot(daily_prices.index, daily_prices.values, linewidth=1, alpha=0.8)
+    axes[0, 0].set_title(f'{symbol} - Price Evolution')
+    axes[0, 0].set_ylabel('Price')
+    axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 0].tick_params(axis='x', rotation=45)
+    
+    # 2. Distribución de volumen
+    real_volume = ohlcv_df['volume'][ohlcv_df['volume'] > 0]
+    if len(real_volume) > 0:
+        axes[0, 1].hist(real_volume, bins=50, alpha=0.7, edgecolor='black')
+        axes[0, 1].set_title(f'{symbol} - Volume Distribution')
+        axes[0, 1].set_xlabel('Volume')
+        axes[0, 1].set_ylabel('Frequency')
+        axes[0, 1].set_xscale('log')
+        axes[0, 1].set_yscale('log')
+    
+    # 3. Distribución de returns
+    returns = ohlcv_df['close'].pct_change().dropna()
+    if len(returns) > 0:
+        axes[1, 0].hist(returns * 100, bins=50, alpha=0.7, edgecolor='black')
+        axes[1, 0].set_title(f'{symbol} - Return Distribution')
+        axes[1, 0].set_xlabel('1-minute Returns %')
+        axes[1, 0].set_ylabel('Frequency')
+        axes[1, 0].set_yscale('log')
+        
+        vol = returns.std() * 100
+        axes[1, 0].text(0.7, 0.9, f'Volatility: {vol:.3f}%', 
+                       transform=axes[1, 0].transAxes, 
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.7))
+    
+    # 4. Patrones horarios
+    hourly_volume = ohlcv_df.groupby(ohlcv_df.index.hour)['volume'].mean()
+    axes[1, 1].bar(hourly_volume.index, hourly_volume.values, alpha=0.7)
+    axes[1, 1].set_title(f'{symbol} - Hourly Volume Pattern')
+    axes[1, 1].set_xlabel('Hour (UTC)')
+    axes[1, 1].set_ylabel('Average Volume')
+    axes[1, 1].set_xticks(range(0, 24, 2))
+    
+    plt.tight_layout()
+    
+    plots_dir = Path("plots")
+    plt.savefig(plots_dir / f'{symbol}_ohlcv_analysis.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+def create_comparison_plot(analyses: Dict):
+    """Crear gráfico de comparación usando P80"""
+    
+    if len(analyses) < 2:
         return
     
-    # Basic OHLCV validation
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    symbols = []
+    thresholds = []
+    good_data_pcts = []
+    avg_spreads = []
+    
+    for symbol, analysis in analyses.items():
+        if analysis:
+            symbol_short = symbol.split('_')[-2]
+            symbols.append(symbol_short)
+            thresholds.append(analysis['threshold'])
+            good_data_pcts.append(analysis['good_data_pct'])
+            avg_spreads.append(analysis['basic_stats']['mean'])
+    
+    colors = ['blue', 'orange', 'green', 'red'][:len(symbols)]
+    
+    # 1. P80 Thresholds
+    bars1 = axes[0, 0].bar(symbols, thresholds, color=colors, alpha=0.7)
+    axes[0, 0].set_title('P80 Thresholds (Auto-calculated)')
+    axes[0, 0].set_ylabel('Threshold %')
+    for bar, value in zip(bars1, thresholds):
+        height = bar.get_height()
+        axes[0, 0].text(bar.get_x() + bar.get_width()/2., height + height*0.01,
+                       f'{value:.4f}%', ha='center', va='bottom')
+    
+    # 2. Good data availability (exactly 80%)
+    bars2 = axes[0, 1].bar(symbols, good_data_pcts, color=colors, alpha=0.7)
+    axes[0, 1].set_title('Good Data Availability (≤P80)')
+    axes[0, 1].set_ylabel('Availability %')
+    axes[0, 1].axhline(y=80, color='red', linestyle='--', alpha=0.7, label='Expected 80%')
+    axes[0, 1].legend()
+    for bar, value in zip(bars2, good_data_pcts):
+        height = bar.get_height()
+        axes[0, 1].text(bar.get_x() + bar.get_width()/2., height + 1,
+                       f'{value:.1f}%', ha='center', va='bottom')
+    
+    # 3. Average spreads vs P80 thresholds
+    x_pos = range(len(symbols))
+    width = 0.35
+    bars3 = axes[1, 0].bar([x - width/2 for x in x_pos], avg_spreads, width, 
+                          color=colors, alpha=0.7, label='Avg Spread')
+    bars4 = axes[1, 0].bar([x + width/2 for x in x_pos], thresholds, width,
+                          color=colors, alpha=0.3, label='P80 Threshold')
+    axes[1, 0].set_title('Average Spread vs P80 Threshold')
+    axes[1, 0].set_ylabel('Spread %')
+    axes[1, 0].set_xticks(x_pos)
+    axes[1, 0].set_xticklabels(symbols)
+    axes[1, 0].legend()
+    
+    # 4. Summary table
+    axes[1, 1].axis('tight')
+    axes[1, 1].axis('off')
+    
+    table_data = []
+    for i, symbol in enumerate(symbols):
+        table_data.append([
+            symbol,
+            f"{thresholds[i]:.4f}%",
+            f"{good_data_pcts[i]:.1f}%",
+            f"{avg_spreads[i]:.4f}%"
+        ])
+    
+    table = axes[1, 1].table(cellText=table_data,
+                           colLabels=['Symbol', 'P80 Threshold', 'Good Data %', 'Avg Spread'],
+                           cellLoc='center',
+                           loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.5)
+    axes[1, 1].set_title('P80 Analysis Summary')
+    
+    plt.tight_layout()
+    
+    plots_dir = Path("plots")
+    plt.savefig(plots_dir / 'symbols_comparison_p80.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+def analyze_ohlcv_quality(symbol: str, ohlcv_df: pd.DataFrame):
+    """Análisis básico de calidad OHLCV"""
+    
     total_records = len(ohlcv_df)
     
-    # Check for invalid OHLC relationships
+    # Validaciones básicas
     invalid_ohlc = (
         (ohlcv_df['high'] < ohlcv_df['open']) |
         (ohlcv_df['high'] < ohlcv_df['close']) |
@@ -197,1801 +433,103 @@ def validate_ohlcv_coherence(symbol, ohlcv_df):
         (ohlcv_df['high'] < ohlcv_df['low'])
     ).sum()
     
-    log.info(f"Invalid OHLC relationships: {invalid_ohlc} ({invalid_ohlc/total_records*100:.3f}%)")
-    
-    # Check for zero/negative prices
-    zero_prices = ((ohlcv_df[['open', 'high', 'low', 'close']] <= 0).any(axis=1)).sum()
-    log.info(f"Zero/negative prices: {zero_prices} ({zero_prices/total_records*100:.3f}%)")
-    
-    # Check for zero volume
     zero_volume = (ohlcv_df['volume'] == 0).sum()
-    log.info(f"Zero volume records: {zero_volume} ({zero_volume/total_records*100:.3f}%)")
     
-    # Check for price gaps/jumps
+    # Movimientos extremos
     price_changes = ohlcv_df['close'].pct_change().dropna()
-    extreme_moves = (abs(price_changes) > 0.5).sum()  # >50% moves
-    log.info(f"Extreme price moves (>50%): {extreme_moves} ({extreme_moves/len(price_changes)*100:.3f}%)")
-    
-    if extreme_moves > 0:
-        log.info("Top 5 largest price moves:")
-        top_moves = price_changes.abs().nlargest(5)
-        for timestamp, move in top_moves.items():
-            direction = "UP" if price_changes.loc[timestamp] > 0 else "DOWN"
-            log.info(f"  {timestamp}: {direction} {abs(move)*100:.2f}%")
-    
-    # Analyze price-volume relationship
-    if zero_volume < total_records:  # If we have volume data
-        # Volume-weighted average price
-        vwap_proxy = (ohlcv_df['close'] * ohlcv_df['volume']).rolling(window=60).sum() / ohlcv_df['volume'].rolling(window=60).sum()
-        
-        # Check for volume spikes
-        volume_mean = ohlcv_df['volume'].mean()
-        volume_std = ohlcv_df['volume'].std()
-        volume_spikes = (ohlcv_df['volume'] > volume_mean + 5 * volume_std).sum()
-        
-        log.info(f"\n--- VOLUME ANALYSIS ---")
-        log.info(f"Volume spikes (>5σ): {volume_spikes} ({volume_spikes/total_records*100:.3f}%)")
-        log.info(f"Volume statistics:")
-        log.info(f"  Mean: {volume_mean:,.0f}")
-        log.info(f"  Std: {volume_std:,.0f}")
-        log.info(f"  Min: {ohlcv_df['volume'].min():,.0f}")
-        log.info(f"  Max: {ohlcv_df['volume'].max():,.0f}")
-
-def cross_validate_ohlcv_orderbook(symbol, ohlcv_df, orderbook_df):
-    """Cross-validate OHLCV data against orderbook data"""
-    log.info(f"\n=== CROSS-VALIDATION: OHLCV vs ORDERBOOK FOR {symbol} ===")
-    
-    if ohlcv_df is None or orderbook_df is None:
-        log.warning("Missing data for cross-validation")
-        return
-    
-    # Find overlapping time periods
-    ohlcv_start = ohlcv_df.index.min()
-    ohlcv_end = ohlcv_df.index.max()
-    ob_start = orderbook_df.index.min()
-    ob_end = orderbook_df.index.max()
-    
-    overlap_start = max(ohlcv_start, ob_start)
-    overlap_end = min(ohlcv_end, ob_end)
-    
-    log.info(f"OHLCV period: {ohlcv_start} to {ohlcv_end}")
-    log.info(f"Orderbook period: {ob_start} to {ob_end}")
-    log.info(f"Overlap period: {overlap_start} to {overlap_end}")
-    
-    if overlap_start >= overlap_end:
-        log.warning("No overlapping time period found")
-        return
-    
-    # Filter to overlap period
-    ohlcv_overlap = ohlcv_df[(ohlcv_df.index >= overlap_start) & (ohlcv_df.index <= overlap_end)]
-    
-    # For each OHLCV minute, find closest orderbook snapshots
-    validation_results = []
-    
-    # Sample every 60 minutes for performance (full validation would be too slow)
-    sample_timestamps = ohlcv_overlap.index[::60][:100]  # Sample 100 points
-    
-    log.info(f"Sampling {len(sample_timestamps)} points for validation...")
-    
-    for timestamp in sample_timestamps:
-        ohlcv_row = ohlcv_overlap.loc[timestamp]
-        
-        # Find orderbook snapshots within ±30 seconds
-        window_start = timestamp - pd.Timedelta(seconds=30)
-        window_end = timestamp + pd.Timedelta(seconds=30)
-        
-        ob_window = orderbook_df[(orderbook_df.index >= window_start) & 
-                                (orderbook_df.index <= window_end)]
-        
-        if len(ob_window) > 0:
-            # Get representative orderbook data (median of window)
-            median_bid = ob_window['bid1_price'].median()
-            median_ask = ob_window['ask1_price'].median()
-            
-            if pd.notna(median_bid) and pd.notna(median_ask):
-                # Check if OHLCV prices are within reasonable bounds
-                mid_price = (median_bid + median_ask) / 2
-                
-                # OHLCV prices should be within bid-ask spread or close to it
-                within_spread_open = median_bid <= ohlcv_row['open'] <= median_ask
-                within_spread_close = median_bid <= ohlcv_row['close'] <= median_ask
-                
-                # Or within reasonable distance (e.g., 2% of mid price)
-                tolerance = mid_price * 0.02
-                close_to_mid_open = abs(ohlcv_row['open'] - mid_price) <= tolerance
-                close_to_mid_close = abs(ohlcv_row['close'] - mid_price) <= tolerance
-                
-                validation_results.append({
-                    'timestamp': timestamp,
-                    'ohlcv_open': ohlcv_row['open'],
-                    'ohlcv_close': ohlcv_row['close'],
-                    'ob_bid': median_bid,
-                    'ob_ask': median_ask,
-                    'ob_mid': mid_price,
-                    'within_spread_open': within_spread_open,
-                    'within_spread_close': within_spread_close,
-                    'close_to_mid_open': close_to_mid_open,
-                    'close_to_mid_close': close_to_mid_close,
-                    'ob_samples': len(ob_window)
-                })
-    
-    if validation_results:
-        validation_df = pd.DataFrame(validation_results)
-        
-        within_spread_open_pct = validation_df['within_spread_open'].mean() * 100
-        within_spread_close_pct = validation_df['within_spread_close'].mean() * 100
-        close_to_mid_open_pct = validation_df['close_to_mid_open'].mean() * 100
-        close_to_mid_close_pct = validation_df['close_to_mid_close'].mean() * 100
-        
-        log.info(f"Cross-validation results ({len(validation_df)} samples):")
-        log.info(f"  Open prices within spread: {within_spread_open_pct:.1f}%")
-        log.info(f"  Close prices within spread: {within_spread_close_pct:.1f}%")
-        log.info(f"  Open prices close to mid (±2%): {close_to_mid_open_pct:.1f}%")
-        log.info(f"  Close prices close to mid (±2%): {close_to_mid_close_pct:.1f}%")
-        
-        # Identify outliers
-        outliers = validation_df[
-            ~validation_df['within_spread_open'] & 
-            ~validation_df['within_spread_close'] &
-            ~validation_df['close_to_mid_open'] &
-            ~validation_df['close_to_mid_close']
-        ]
-        
-        if len(outliers) > 0:
-            log.warning(f"Found {len(outliers)} potential data quality issues:")
-            for _, outlier in outliers.head(5).iterrows():
-                log.warning(f"  {outlier['timestamp']}: OHLCV {outlier['ohlcv_open']:.6f}-{outlier['ohlcv_close']:.6f}, "
-                          f"OB {outlier['ob_bid']:.6f}-{outlier['ob_ask']:.6f}")
-
-def identify_gaps_for_filling(symbol, df):
-    """Identify gaps that should be filled vs gaps that should be left alone"""
-    log.info(f"\n=== GAP IDENTIFICATION FOR {symbol} ===")
-    
-    if df is None or len(df) == 0:
-        return [], []
-    
-    # Create expected timeline
-    start_date = df.index.min()
-    end_date = df.index.max()
-    expected_timeline = pd.date_range(start=start_date, end=end_date, freq='1min')
-    
-    # Find gaps
-    gaps_to_fill = []
-    gaps_to_skip = []
-    
-    current_gap = []
-    
-    for expected_time in expected_timeline:
-        if expected_time not in df.index:
-            current_gap.append(expected_time)
-        else:
-            if current_gap:
-                gap_duration = len(current_gap)
-                gap_start = current_gap[0]
-                gap_end = current_gap[-1]
-                
-                # Decision logic for filling gaps
-                if gap_duration <= 5:
-                    # Always fill very small gaps (≤5 minutes)
-                    gaps_to_fill.append({
-                        'start': gap_start,
-                        'end': gap_end,
-                        'duration': gap_duration,
-                        'method': 'ffill_small',
-                        'reason': 'small_gap'
-                    })
-                elif gap_duration <= 60:
-                    # Fill medium gaps (≤1 hour) during trading hours
-                    gaps_to_fill.append({
-                        'start': gap_start,
-                        'end': gap_end,
-                        'duration': gap_duration,
-                        'method': 'ffill_medium',
-                        'reason': 'medium_gap'
-                    })
-                elif gap_duration <= 720:  # ≤12 hours
-                    # Case-by-case for large gaps
-                    gaps_to_skip.append({
-                        'start': gap_start,
-                        'end': gap_end,
-                        'duration': gap_duration,
-                        'reason': 'large_gap_review'
-                    })
-                else:
-                    # Never fill very large gaps (>12 hours)
-                    gaps_to_skip.append({
-                        'start': gap_start,
-                        'end': gap_end,
-                        'duration': gap_duration,
-                        'reason': 'maintenance_gap'
-                    })
-                
-                current_gap = []
-    
-    # Handle final gap if exists
-    if current_gap:
-        gap_duration = len(current_gap)
-        gap_start = current_gap[0]
-        gap_end = current_gap[-1]
-        
-        if gap_duration <= 60:
-            gaps_to_fill.append({
-                'start': gap_start,
-                'end': gap_end,
-                'duration': gap_duration,
-                'method': 'ffill_final',
-                'reason': 'final_gap'
-            })
-        else:
-            gaps_to_skip.append({
-                'start': gap_start,
-                'end': gap_end,
-                'duration': gap_duration,
-                'reason': 'final_large_gap'
-            })
-    
-    log.info(f"Gaps to fill: {len(gaps_to_fill)}")
-    log.info(f"Gaps to skip: {len(gaps_to_skip)}")
-    
-    if gaps_to_fill:
-        total_fill_minutes = sum(gap['duration'] for gap in gaps_to_fill)
-        log.info(f"Total minutes to fill: {total_fill_minutes:,}")
-        
-        # Show gap categories
-        small_gaps = [g for g in gaps_to_fill if g['duration'] <= 5]
-        medium_gaps = [g for g in gaps_to_fill if 5 < g['duration'] <= 60]
-        
-        log.info(f"  Small gaps (≤5min): {len(small_gaps)}")
-        log.info(f"  Medium gaps (6-60min): {len(medium_gaps)}")
-    
-    if gaps_to_skip:
-        total_skip_minutes = sum(gap['duration'] for gap in gaps_to_skip)
-        log.info(f"Total minutes to skip: {total_skip_minutes:,}")
-        
-        # Show largest skipped gaps
-        largest_skipped = sorted(gaps_to_skip, key=lambda x: x['duration'], reverse=True)[:5]
-        log.info("Largest skipped gaps:")
-        for gap in largest_skipped:
-            log.info(f"  {gap['start']} to {gap['end']}: {gap['duration']/60:.1f}h ({gap['reason']})")
-    
-    return gaps_to_fill, gaps_to_skip
-
-def perform_forward_fill(symbol, df, gaps_to_fill):
-    """Perform forward fill operation and return filled data"""
-    log.info(f"\n=== PERFORMING FORWARD FILL FOR {symbol} ===")
-    
-    if not gaps_to_fill:
-        log.info("No gaps to fill")
-        return [], df  # Return original data
-    
-    filled_records = []
-    
-    for gap in gaps_to_fill:
-        # Find the last valid record before the gap
-        pre_gap_data = df[df.index < gap['start']]
-        
-        if len(pre_gap_data) == 0:
-            log.warning(f"No data before gap starting at {gap['start']}, skipping")
-            continue
-        
-        last_valid = pre_gap_data.iloc[-1]
-        
-        # Create filled records for each minute in the gap
-        gap_timeline = pd.date_range(start=gap['start'], end=gap['end'], freq='1min')
-        
-        for timestamp in gap_timeline:
-            filled_record = {
-                'symbol': symbol,
-                'timestamp': timestamp,
-                'open': float(last_valid['open']),  # Convert to Python float
-                'high': float(last_valid['high']),  # Convert to Python float
-                'low': float(last_valid['low']),    # Convert to Python float
-                'close': float(last_valid['close']), # Convert to Python float
-                'volume': 0,  # Synthetic data gets 0 volume
-                'is_synthetic': True,
-                'fill_method': gap['method'],
-                'fill_timestamp': datetime.now()
-            }
-            filled_records.append(filled_record)
-    
-    log.info(f"Created {len(filled_records)} synthetic records")
-    
-    if filled_records:
-        # Convert to DataFrame for return
-        filled_df = pd.DataFrame(filled_records)
-        filled_df.set_index('timestamp', inplace=True)
-        
-        # Combine with original data
-        combined_df = pd.concat([df, filled_df]).sort_index()
-        
-        log.info(f"Combined dataset: {len(combined_df)} records ({len(filled_records)} synthetic)")
-        
-        return filled_records, combined_df
-    
-    return [], df
-
-def insert_synthetic_data(symbol, filled_records):
-    """Insert synthetic data into database"""
-    if not filled_records:
-        log.info("No synthetic data to insert")
-        return
-    
-    log.info(f"Inserting {len(filled_records)} synthetic records for {symbol}...")
-    
-    with db_manager.get_session() as session:
-        for record in filled_records:
-            # Use PostgreSQL ON CONFLICT to avoid duplicates
-            insert_stmt = text("""
-                INSERT INTO ohlcv (symbol, timestamp, open, high, low, close, volume, 
-                                 is_synthetic, fill_method, fill_timestamp, created_at)
-                VALUES (:symbol, :timestamp, :open, :high, :low, :close, :volume,
-                       :is_synthetic, :fill_method, :fill_timestamp, CURRENT_TIMESTAMP)
-                ON CONFLICT (symbol, timestamp) DO UPDATE SET
-                    is_synthetic = EXCLUDED.is_synthetic,
-                    fill_method = EXCLUDED.fill_method,
-                    fill_timestamp = EXCLUDED.fill_timestamp
-            """)
-            
-            session.execute(insert_stmt, record)
-        
-        log.info(f"Successfully inserted synthetic data for {symbol}")
-
-def create_pre_fill_analysis(symbol, ohlcv_df, orderbook_df):
-    """Create comprehensive pre-fill analysis and visualizations"""
-    log.info(f"\n=== PRE-FILL ANALYSIS FOR {symbol} ===")
-    
-    # Create comprehensive pre-fill plots
-    fig, axes = plt.subplots(3, 2, figsize=(20, 15))
-    
-    # 1. Coverage timeline
-    start_date = ohlcv_df.index.min()
-    end_date = ohlcv_df.index.max()
-    expected_timeline = pd.date_range(start=start_date, end=end_date, freq='1min')
-    
-    # Daily coverage
-    coverage_series = pd.Series(index=expected_timeline, data=False)
-    coverage_series.loc[ohlcv_df.index] = True
-    daily_coverage = coverage_series.resample('D').mean() * 100
-    
-    axes[0, 0].plot(daily_coverage.index, daily_coverage.values, linewidth=1, alpha=0.8)
-    axes[0, 0].set_title(f'{symbol} - Pre-Fill Daily Coverage %')
-    axes[0, 0].set_ylabel('Coverage %')
-    axes[0, 0].grid(True, alpha=0.3)
-    axes[0, 0].set_ylim(0, 105)
-    
-    # 2. Price and volume over time
-    if len(ohlcv_df) > 0:
-        daily_prices = ohlcv_df.groupby(ohlcv_df.index.date)['close'].last()
-        daily_volume = ohlcv_df.groupby(ohlcv_df.index.date)['volume'].sum()
-        
-        axes[0, 1].plot(daily_prices.index, daily_prices.values, linewidth=1, alpha=0.8)
-        axes[0, 1].set_title(f'{symbol} - Pre-Fill Daily Prices')
-        axes[0, 1].set_ylabel('Price')
-        axes[0, 1].grid(True, alpha=0.3)
-        axes[0, 1].tick_params(axis='x', rotation=45)
-    
-    # 3. Volume distribution
-    if len(ohlcv_df) > 0 and 'volume' in ohlcv_df.columns:
-        volumes = ohlcv_df['volume'][ohlcv_df['volume'] > 0]
-        if len(volumes) > 0:
-            axes[1, 0].hist(volumes, bins=50, alpha=0.7, edgecolor='black')
-            axes[1, 0].set_title(f'{symbol} - Pre-Fill Volume Distribution')
-            axes[1, 0].set_xlabel('Volume')
-            axes[1, 0].set_ylabel('Frequency')
-            axes[1, 0].set_yscale('log')
-            axes[1, 0].set_xscale('log')
-    
-    # 4. Hourly coverage pattern
-    hourly_presence = pd.Series(index=expected_timeline, data=False)
-    hourly_presence.loc[ohlcv_df.index] = True
-    hourly_coverage = hourly_presence.groupby(hourly_presence.index.hour).mean() * 100
-    
-    axes[1, 1].bar(hourly_coverage.index, hourly_coverage.values, alpha=0.7)
-    axes[1, 1].set_title(f'{symbol} - Pre-Fill Hourly Coverage %')
-    axes[1, 1].set_xlabel('Hour (UTC)')
-    axes[1, 1].set_ylabel('Coverage %')
-    axes[1, 1].set_xticks(range(0, 24, 2))
-    
-    # 5. Orderbook spread analysis (if available)
-    if orderbook_df is not None and len(orderbook_df) > 0:
-        valid_quotes = orderbook_df.dropna(subset=['bid1_price', 'ask1_price'])
-        if len(valid_quotes) > 100:
-            spreads = valid_quotes['ask1_price'] - valid_quotes['bid1_price']
-            spread_pct = spreads / valid_quotes['bid1_price'] * 100
-            
-            # Sample for performance
-            sample_spreads = spread_pct.sample(min(10000, len(spread_pct)))
-            
-            axes[2, 0].hist(sample_spreads, bins=50, alpha=0.7, edgecolor='black')
-            axes[2, 0].set_title(f'{symbol} - Orderbook Spread Distribution (%)')
-            axes[2, 0].set_xlabel('Spread %')
-            axes[2, 0].set_ylabel('Frequency')
-            axes[2, 0].set_yscale('log')
-        else:
-            axes[2, 0].text(0.5, 0.5, 'Insufficient orderbook data', transform=axes[2, 0].transAxes, ha='center')
-    else:
-        axes[2, 0].text(0.5, 0.5, 'No orderbook data', transform=axes[2, 0].transAxes, ha='center')
-    
-    # 6. Price volatility analysis
-    if len(ohlcv_df) > 0:
-        returns = ohlcv_df['close'].pct_change().dropna()
-        if len(returns) > 0:
-            axes[2, 1].hist(returns * 100, bins=50, alpha=0.7, edgecolor='black')
-            axes[2, 1].set_title(f'{symbol} - Pre-Fill Return Distribution (%)')
-            axes[2, 1].set_xlabel('1-minute Returns %')
-            axes[2, 1].set_ylabel('Frequency')
-            axes[2, 1].set_yscale('log')
-    
-    plt.tight_layout()
-    plt.savefig(plots_dir / f'{symbol}_pre_fill_analysis.png', dpi=300, bbox_inches='tight')
-    log.info(f"Saved pre-fill analysis to {plots_dir / f'{symbol}_pre_fill_analysis.png'}")
-    plt.close()
-
-def create_post_fill_analysis(symbol, original_df, filled_df, gaps_filled, gaps_skipped):
-    """Create comprehensive post-fill analysis and visualizations"""
-    log.info(f"\n=== POST-FILL ANALYSIS FOR {symbol} ===")
-    
-    # Create comprehensive post-fill plots
-    fig, axes = plt.subplots(3, 2, figsize=(20, 15))
-    
-    # Timeline setup
-    start_date = original_df.index.min()
-    end_date = original_df.index.max()
-    expected_timeline = pd.date_range(start=start_date, end=end_date, freq='1min')
-    
-    # 1. Coverage comparison
-    original_coverage = pd.Series(index=expected_timeline, data=False)
-    original_coverage.loc[original_df.index] = True
-    filled_coverage = pd.Series(index=expected_timeline, data=False)
-    filled_coverage.loc[filled_df.index] = True
-    
-    daily_original = original_coverage.resample('D').mean() * 100
-    daily_filled = filled_coverage.resample('D').mean() * 100
-    
-    axes[0, 0].plot(daily_original.index, daily_original.values, label='Original', alpha=0.7, linewidth=1)
-    axes[0, 0].plot(daily_filled.index, daily_filled.values, label='After Fill', alpha=0.7, linewidth=1)
-    axes[0, 0].set_title(f'{symbol} - Coverage Comparison')
-    axes[0, 0].set_ylabel('Coverage %')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    axes[0, 0].set_ylim(0, 105)
-    
-    # 2. Gap analysis
-    if gaps_filled or gaps_skipped:
-        gap_sizes_filled = [gap['duration'] for gap in gaps_filled]
-        gap_sizes_skipped = [gap['duration'] for gap in gaps_skipped]
-        
-        bins = [0, 5, 15, 60, 360, 720, float('inf')]
-        labels = ['≤5min', '6-15min', '16-60min', '1-6h', '6-12h', '>12h']
-        
-        filled_counts = pd.cut(gap_sizes_filled, bins=bins, labels=labels).value_counts() if gap_sizes_filled else pd.Series(dtype=int)
-        skipped_counts = pd.cut(gap_sizes_skipped, bins=bins, labels=labels).value_counts() if gap_sizes_skipped else pd.Series(dtype=int)
-        
-        gap_analysis = pd.DataFrame({
-            'Filled': filled_counts,
-            'Skipped': skipped_counts
-        }).fillna(0)
-        
-        gap_analysis.plot(kind='bar', stacked=True, ax=axes[0, 1], alpha=0.7)
-        axes[0, 1].set_title(f'{symbol} - Gap Treatment by Size')
-        axes[0, 1].set_ylabel('Number of Gaps')
-        axes[0, 1].set_xlabel('Gap Duration')
-        axes[0, 1].tick_params(axis='x', rotation=45)
-    
-    # 3. Volume comparison (synthetic vs real)
-    real_data = filled_df[~filled_df.get('is_synthetic', False)]
-    synthetic_data = filled_df[filled_df.get('is_synthetic', False)]
-    
-    if len(real_data) > 0:
-        daily_volume_real = real_data.groupby(real_data.index.date)['volume'].sum()
-        axes[1, 0].bar(daily_volume_real.index, daily_volume_real.values, alpha=0.7, label='Real Data')
-        
-        if len(synthetic_data) > 0:
-            daily_volume_synthetic = synthetic_data.groupby(synthetic_data.index.date)['volume'].sum()
-            axes[1, 0].bar(daily_volume_synthetic.index, daily_volume_synthetic.values, 
-                          alpha=0.7, label='Synthetic Data', bottom=daily_volume_real.reindex(daily_volume_synthetic.index, fill_value=0))
-        
-        axes[1, 0].set_title(f'{symbol} - Daily Volume (Real vs Synthetic)')
-        axes[1, 0].set_ylabel('Volume')
-        axes[1, 0].legend()
-        axes[1, 0].tick_params(axis='x', rotation=45)
-    
-    # 4. Synthetic data distribution over time
-    if len(synthetic_data) > 0:
-        synthetic_daily = synthetic_data.groupby(synthetic_data.index.date).size()
-        axes[1, 1].bar(synthetic_daily.index, synthetic_daily.values, alpha=0.7, color='red')
-        axes[1, 1].set_title(f'{symbol} - Synthetic Records per Day')
-        axes[1, 1].set_ylabel('Synthetic Records')
-        axes[1, 1].tick_params(axis='x', rotation=45)
-    else:
-        axes[1, 1].text(0.5, 0.5, 'No synthetic data', transform=axes[1, 1].transAxes, ha='center')
-    
-    # 5. Price continuity check
-    price_jumps = filled_df['close'].pct_change().abs()
-    large_jumps = price_jumps[price_jumps > 0.1]  # >10% jumps
-    
-    if len(large_jumps) > 0:
-        axes[2, 0].scatter(large_jumps.index, large_jumps.values * 100, alpha=0.6, s=20)
-        axes[2, 0].set_title(f'{symbol} - Large Price Jumps (>10%)')
-        axes[2, 0].set_ylabel('Jump Size %')
-        axes[2, 0].tick_params(axis='x', rotation=45)
-        
-        # Highlight synthetic data points
-        synthetic_jumps = large_jumps[filled_df.loc[large_jumps.index].get('is_synthetic', False)]
-        if len(synthetic_jumps) > 0:
-            axes[2, 0].scatter(synthetic_jumps.index, synthetic_jumps.values * 100, 
-                             color='red', alpha=0.8, s=30, label='At synthetic data')
-            axes[2, 0].legend()
-    else:
-        axes[2, 0].text(0.5, 0.5, 'No large price jumps', transform=axes[2, 0].transAxes, ha='center')
-    
-    # 6. Data quality metrics (Fixed pie chart)
-    total_records = len(filled_df)
-    synthetic_count = len(synthetic_data)
-    real_count = len(real_data)
-    
-    quality_metrics = {
-        'Real Data': real_count,
-        'Synthetic Data': synthetic_count
-    }
-    
-    # Create pie chart without alpha parameter
-    wedges, texts, autotexts = axes[2, 1].pie(quality_metrics.values(), labels=quality_metrics.keys(), 
-                                              autopct='%1.1f%%', colors=['green', 'orange'])
-    
-    # Apply alpha manually to wedges
-    for wedge in wedges:
-        wedge.set_alpha(0.7)
-    
-    axes[2, 1].set_title(f'{symbol} - Data Composition')
-    
-    plt.tight_layout()
-    plt.savefig(plots_dir / f'{symbol}_post_fill_analysis.png', dpi=300, bbox_inches='tight')
-    log.info(f"Saved post-fill analysis to {plots_dir / f'{symbol}_post_fill_analysis.png'}")
-    plt.close()
-
-def analyze_spread_stability(symbol, orderbook_df):
-    """Analyze bid-ask spread stability and identify optimal trading periods"""
-    log.info(f"\n=== SPREAD STABILITY ANALYSIS FOR {symbol} ===")
-    
-    if orderbook_df is None or len(orderbook_df) == 0:
-        log.warning("No orderbook data for spread analysis")
-        return None, None
-    
-    # Calculate bid-ask spread
-    valid_quotes = orderbook_df.dropna(subset=['bid1_price', 'ask1_price'])
-    
-    if len(valid_quotes) == 0:
-        log.warning("No valid quotes for spread analysis")
-        return None, None
-    
-    spreads = valid_quotes['ask1_price'] - valid_quotes['bid1_price']
-    spread_pct = spreads / valid_quotes['bid1_price'] * 100
-    
-    # Add spread data to the dataframe
-    spread_data = pd.DataFrame({
-        'spread_abs': spreads,
-        'spread_pct': spread_pct
-    }, index=valid_quotes.index)
-    
-    # Calculate daily statistics
-    daily_spread_stats = spread_data.groupby(spread_data.index.date).agg({
-        'spread_pct': ['mean', 'median', 'std', 'count']
-    }).round(6)
-    
-    daily_spread_stats.columns = ['mean_spread', 'median_spread', 'std_spread', 'count']
-    
-    # More intelligent and stricter threshold calculation
-    # Use the point where spread stabilizes (after initial volatility)
-    sorted_spreads = daily_spread_stats['mean_spread'].sort_values()
-    
-    # Find the "elbow" where spreads stabilize (more conservative approach)
-    # Use P15 instead of P30 to be more strict about what's "good"
-    stable_threshold_pct = sorted_spreads.quantile(0.15)  # Bottom 15% (stricter)
-    
-    # Alternative: use a more sophisticated approach
-    # Look for the natural break point in the distribution
-    median_spread = sorted_spreads.median()
-    q25_spread = sorted_spreads.quantile(0.25)
-    
-    # Use the smaller of P15 or Q25 to be stricter
-    stable_threshold_pct = min(stable_threshold_pct, q25_spread)
-    
-    # Don't focus on consecutive periods - just provide the threshold for filtering
-    log.info(f"Total daily observations: {len(daily_spread_stats)}")
-    log.info(f"Average daily spread: {daily_spread_stats['mean_spread'].mean():.4f}%")
-    log.info(f"Median daily spread: {daily_spread_stats['mean_spread'].median():.4f}%")
-    log.info(f"STRICT liquidity threshold: {stable_threshold_pct:.4f}% (bottom 15% regime)")
-    
-    # Calculate how much data meets the strict criteria
-    good_regime_pct = (daily_spread_stats['mean_spread'] <= stable_threshold_pct).mean() * 100
-    log.info(f"Days meeting strict criteria: {good_regime_pct:.1f}%")
-    
-    # Provide recommendations based on threshold only
-    log.info(f"\nRECOMMENDATION FOR TRADING:")
-    log.info(f"  Use only data where spread <= {stable_threshold_pct:.4f}%")
-    log.info(f"  This gives you the best {good_regime_pct:.1f}% of trading conditions")
-    
-    # Calculate minute-level statistics for this threshold
-    minute_good_data = spread_data[spread_data['spread_pct'] <= stable_threshold_pct]
-    if len(minute_good_data) > 0:
-        log.info(f"\nDATA AVAILABILITY:")
-        log.info(f"  Good quality minutes: {len(minute_good_data):,}")
-        log.info(f"  Total minutes: {len(spread_data):,}")
-        log.info(f"  Good quality percentage: {len(minute_good_data)/len(spread_data)*100:.1f}%")
-        log.info(f"  Average spread in good data: {minute_good_data['spread_pct'].mean():.4f}%")
-    
-    return None, daily_spread_stats  # No periods, just threshold data
-
-def add_liquidity_quality_column(symbol, orderbook_df, daily_spread_stats, stable_threshold):
-    """Add liquidity quality assessment to orderbook data"""
-    log.info(f"\n=== ADDING LIQUIDITY QUALITY ASSESSMENT FOR {symbol} ===")
-    
-    if orderbook_df is None or daily_spread_stats is None:
-        return orderbook_df
-    
-    # Calculate spread for all orderbook data
-    valid_quotes = orderbook_df.dropna(subset=['bid1_price', 'ask1_price'])
-    spreads = valid_quotes['ask1_price'] - valid_quotes['bid1_price']
-    spread_pct = spreads / valid_quotes['bid1_price'] * 100
-    
-    # Create liquidity quality column
-    orderbook_df['liquidity_quality'] = 'Unknown'
-    orderbook_df['valid_for_trading'] = False
-    orderbook_df['spread_pct'] = np.nan
-    
-    # Add spread percentage
-    orderbook_df.loc[valid_quotes.index, 'spread_pct'] = spread_pct
-    
-    # More strict classification thresholds
-    excellent_threshold = stable_threshold * 0.7  # 70% of threshold (stricter)
-    good_threshold = stable_threshold
-    fair_threshold = stable_threshold * 1.5  # 1.5x threshold (tighter)
-    
-    # Assign quality categories
-    mask_excellent = spread_pct <= excellent_threshold
-    mask_good = (spread_pct > excellent_threshold) & (spread_pct <= good_threshold)
-    mask_fair = (spread_pct > good_threshold) & (spread_pct <= fair_threshold)
-    mask_poor = spread_pct > fair_threshold
-    
-    orderbook_df.loc[valid_quotes.index[mask_excellent], 'liquidity_quality'] = 'Excellent'
-    orderbook_df.loc[valid_quotes.index[mask_good], 'liquidity_quality'] = 'Good'
-    orderbook_df.loc[valid_quotes.index[mask_fair], 'liquidity_quality'] = 'Fair'
-    orderbook_df.loc[valid_quotes.index[mask_poor], 'liquidity_quality'] = 'Poor'
-    
-    # Mark as valid for trading (Only Excellent + Good with strict threshold)
-    orderbook_df.loc[valid_quotes.index[mask_excellent | mask_good], 'valid_for_trading'] = True
-    
-    # Statistics
-    total_valid = len(valid_quotes)
-    excellent_count = mask_excellent.sum()
-    good_count = mask_good.sum()
-    fair_count = mask_fair.sum()
-    poor_count = mask_poor.sum()
-    trading_valid_count = (mask_excellent | mask_good).sum()
-    
-    log.info(f"STRICT Liquidity Quality Distribution:")
-    log.info(f"  Excellent (<={excellent_threshold:.4f}%): {excellent_count:,} ({excellent_count/total_valid*100:.1f}%)")
-    log.info(f"  Good (<={good_threshold:.4f}%): {good_count:,} ({good_count/total_valid*100:.1f}%)")
-    log.info(f"  Fair (<={fair_threshold:.4f}%): {fair_count:,} ({fair_count/total_valid*100:.1f}%)")
-    log.info(f"  Poor (>{fair_threshold:.4f}%): {poor_count:,} ({poor_count/total_valid*100:.1f}%)")
-    log.info(f"  VALID FOR TRADING: {trading_valid_count:,} ({trading_valid_count/total_valid*100:.1f}%)")
-    
-    return orderbook_df
-
-def comprehensive_orderbook_analysis(symbol, orderbook_df):
-    """Comprehensive orderbook analysis with detailed visualizations"""
-    log.info(f"\n=== COMPREHENSIVE ORDERBOOK ANALYSIS FOR {symbol} ===")
-    
-    if orderbook_df is None or len(orderbook_df) == 0:
-        log.warning("No orderbook data for comprehensive analysis")
-        return
-    
-    # First, analyze spread stability
-    stable_period, daily_spread_stats = analyze_spread_stability(symbol, orderbook_df)
-    
-    # Create orderbook analysis plots
-    fig, axes = plt.subplots(3, 2, figsize=(20, 15))
-    
-    # Sample data for performance (use every 100th record)
-    sample_df = orderbook_df.iloc[::100]
-    log.info(f"Using {len(sample_df):,} samples for orderbook analysis")
-    
-def comprehensive_orderbook_analysis(symbol, orderbook_df):
-    """Comprehensive orderbook analysis with detailed visualizations"""
-    log.info(f"\n=== COMPREHENSIVE ORDERBOOK ANALYSIS FOR {symbol} ===")
-    
-    if orderbook_df is None or len(orderbook_df) == 0:
-        log.warning("No orderbook data for comprehensive analysis")
-        return None, None
-    
-    # First, analyze spread stability
-    stable_period, daily_spread_stats = analyze_spread_stability(symbol, orderbook_df)
-    
-    # Get the strict threshold for this symbol
-    if daily_spread_stats is not None:
-        sorted_spreads = daily_spread_stats['mean_spread'].sort_values()
-        stable_threshold_pct = sorted_spreads.quantile(0.15)  # Strict P15
-        q25_spread = sorted_spreads.quantile(0.25)
-        stable_threshold_pct = min(stable_threshold_pct, q25_spread)  # Most strict
-        
-        # Add liquidity quality assessment
-        orderbook_df = add_liquidity_quality_column(symbol, orderbook_df, daily_spread_stats, stable_threshold_pct)
-    else:
-        stable_threshold_pct = None
-    
-    # Create orderbook analysis plots
-    fig, axes = plt.subplots(3, 2, figsize=(20, 15))
-    
-    # Sample data for performance (use every 100th record)
-    sample_df = orderbook_df.iloc[::100]
-    log.info(f"Using {len(sample_df):,} samples for orderbook analysis")
-    
-    # 1. Spread over time with intelligent stability zones
-    valid_quotes = sample_df.dropna(subset=['bid1_price', 'ask1_price'])
-    if len(valid_quotes) > 0:
-        spreads = valid_quotes['ask1_price'] - valid_quotes['bid1_price']
-        spread_pct = spreads / valid_quotes['bid1_price'] * 100
-        
-        # Daily average spreads
-        daily_spreads = spread_pct.groupby(spread_pct.index.date).mean()
-        
-        axes[0, 0].plot(daily_spreads.index, daily_spreads.values, linewidth=1, alpha=0.8, color='blue')
-        axes[0, 0].set_title(f'{symbol} - Daily Average Spread % with Stability Analysis')
-        axes[0, 0].set_ylabel('Spread %')
-        axes[0, 0].grid(True, alpha=0.3)
-        axes[0, 0].tick_params(axis='x', rotation=45)
-        
-        # Highlight stable period if identified
-        if stable_period:
-            stable_start, stable_end = stable_period
-            axes[0, 0].axvspan(stable_start, stable_end, alpha=0.3, color='green', 
-                              label=f'Recommended Period\n{stable_start} to {stable_end}')
-        
-        # Add strict threshold line
-        if stable_threshold_pct is not None:
-            axes[0, 0].axhline(y=stable_threshold_pct, color='red', linestyle='--', alpha=0.7, 
-                              label=f'STRICT Threshold: {stable_threshold_pct:.4f}%')
-        
-        axes[0, 0].legend()
-        
-        # 2. Spread distribution with intelligent regime analysis
-        axes[0, 1].hist(spread_pct, bins=50, alpha=0.7, edgecolor='black', color='lightblue')
-        axes[0, 1].set_title(f'{symbol} - Spread Distribution with Regime Analysis')
-        axes[0, 1].set_xlabel('Spread %')
-        axes[0, 1].set_ylabel('Frequency')
-        axes[0, 1].set_yscale('log')
-        
-        # Add statistics and intelligent regime boundaries
-        mean_spread = spread_pct.mean()
-        median_spread = spread_pct.median()
-        
-        if stable_threshold_pct is not None:
-            excellent_threshold = stable_threshold_pct * 0.7
-            fair_threshold = stable_threshold_pct * 1.5
-            
-            axes[0, 1].axvline(mean_spread, color='red', linestyle='-', alpha=0.8, label=f'Mean: {mean_spread:.4f}%')
-            axes[0, 1].axvline(median_spread, color='orange', linestyle='-', alpha=0.8, label=f'Median: {median_spread:.4f}%')
-            axes[0, 1].axvline(excellent_threshold, color='green', linestyle='--', alpha=0.8, label=f'Excellent: <{excellent_threshold:.4f}%')
-            axes[0, 1].axvline(stable_threshold_pct, color='blue', linestyle='--', alpha=0.8, label=f'Good: <{stable_threshold_pct:.4f}%')
-            axes[0, 1].axvline(fair_threshold, color='purple', linestyle='--', alpha=0.8, label=f'Fair: <{fair_threshold:.4f}%')
-            
-            # Calculate regime percentages
-            excellent_pct = (spread_pct <= excellent_threshold).mean() * 100
-            good_pct = ((spread_pct > excellent_threshold) & (spread_pct <= stable_threshold_pct)).mean() * 100
-            fair_pct = ((spread_pct > stable_threshold_pct) & (spread_pct <= fair_threshold)).mean() * 100
-            poor_pct = (spread_pct > fair_threshold).mean() * 100
-            
-            regime_text = f'STRICT Liquidity Regimes:\nExcellent: {excellent_pct:.1f}%\nGood: {good_pct:.1f}%\nFair: {fair_pct:.1f}%\nPoor: {poor_pct:.1f}%'
-            axes[0, 1].text(0.65, 0.7, regime_text, transform=axes[0, 1].transAxes, 
-                           bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.7))
-        
-        axes[0, 1].legend(fontsize=8)
-    
-    # 3. Bid-Ask sizes
-    valid_sizes = sample_df.dropna(subset=['bid1_size', 'ask1_size'])
-    if len(valid_sizes) > 0:
-        axes[1, 0].scatter(valid_sizes['bid1_size'], valid_sizes['ask1_size'], alpha=0.5, s=1)
-        axes[1, 0].set_title(f'{symbol} - Bid vs Ask Sizes')
-        axes[1, 0].set_xlabel('Bid1 Size')
-        axes[1, 0].set_ylabel('Ask1 Size')
-        axes[1, 0].set_xscale('log')
-        axes[1, 0].set_yscale('log')
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # Add diagonal line for reference
-        min_size = min(valid_sizes['bid1_size'].min(), valid_sizes['ask1_size'].min())
-        max_size = max(valid_sizes['bid1_size'].max(), valid_sizes['ask1_size'].max())
-        axes[1, 0].plot([min_size, max_size], [min_size, max_size], 'r--', alpha=0.5, label='Equal sizes')
-        axes[1, 0].legend()
-    
-    # 4. Size imbalance over time
-    if len(valid_sizes) > 0:
-        size_imbalance = (valid_sizes['bid1_size'] - valid_sizes['ask1_size']) / (valid_sizes['bid1_size'] + valid_sizes['ask1_size'])
-        daily_imbalance = size_imbalance.groupby(size_imbalance.index.date).mean()
-        
-        axes[1, 1].plot(daily_imbalance.index, daily_imbalance.values, linewidth=1, alpha=0.8)
-        axes[1, 1].set_title(f'{symbol} - Daily Size Imbalance')
-        axes[1, 1].set_ylabel('Imbalance (Bid-Ask)/(Bid+Ask)')
-        axes[1, 1].axhline(y=0, color='red', linestyle='--', alpha=0.5)
-        axes[1, 1].grid(True, alpha=0.3)
-        axes[1, 1].tick_params(axis='x', rotation=45)
-    
-    # 5. Depth analysis (levels 1-3)
-    depth_coverage = {}
-    for level in [1, 2, 3]:
-        bid_col = f'bid{level}_price'
-        ask_col = f'ask{level}_price'
-        if bid_col in sample_df.columns and ask_col in sample_df.columns:
-            valid_level = (~sample_df[[bid_col, ask_col]].isna()).all(axis=1).sum()
-            depth_coverage[f'Level {level}'] = valid_level / len(sample_df) * 100
-    
-    if depth_coverage:
-        axes[2, 0].bar(depth_coverage.keys(), depth_coverage.values(), alpha=0.7)
-        axes[2, 0].set_title(f'{symbol} - Orderbook Depth Coverage')
-        axes[2, 0].set_ylabel('Coverage %')
-        axes[2, 0].set_ylim(0, 105)
-        
-        # Add value labels on bars
-        for i, (k, v) in enumerate(depth_coverage.items()):
-            axes[2, 0].text(i, v + 1, f'{v:.1f}%', ha='center', va='bottom')
-    
-    # 6. Mid-price volatility
-    if len(valid_quotes) > 0:
-        mid_price = (valid_quotes['bid1_price'] + valid_quotes['ask1_price']) / 2
-        mid_returns = mid_price.pct_change().dropna()
-        
-        if len(mid_returns) > 0:
-            axes[2, 1].hist(mid_returns * 100, bins=50, alpha=0.7, edgecolor='black')
-            axes[2, 1].set_title(f'{symbol} - Mid-Price Return Distribution')
-            axes[2, 1].set_xlabel('Mid-Price Returns %')
-            axes[2, 1].set_ylabel('Frequency')
-            axes[2, 1].set_yscale('log')
-            
-            # Add statistics
-            vol = mid_returns.std() * 100
-            axes[2, 1].axvline(0, color='red', linestyle='--', alpha=0.5)
-            axes[2, 1].text(0.7, 0.9, f'Volatility: {vol:.4f}%', transform=axes[2, 1].transAxes, 
-                           bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.7))
-    
-    plt.tight_layout()
-    plt.savefig(plots_dir / f'{symbol}_orderbook_analysis.png', dpi=300, bbox_inches='tight')
-    log.info(f"Saved orderbook analysis to {plots_dir / f'{symbol}_orderbook_analysis.png'}")
-    plt.close()
-    
-    # Return the stable period and daily spread stats
-    return stable_period, daily_spread_stats
-
-def comprehensive_ohlcv_analysis(symbol, filled_df):
-    """Comprehensive OHLCV analysis with detailed visualizations"""
-    log.info(f"\n=== COMPREHENSIVE OHLCV ANALYSIS FOR {symbol} ===")
-    
-    if filled_df is None or len(filled_df) == 0:
-        log.warning("No OHLCV data for comprehensive analysis")
-        return
-    
-    # Create OHLCV analysis plots
-    fig, axes = plt.subplots(3, 2, figsize=(20, 15))
-    
-    # Separate real and synthetic data
-    is_synthetic = filled_df.get('is_synthetic', pd.Series(False, index=filled_df.index))
-    real_data = filled_df[~is_synthetic]
-    synthetic_data = filled_df[is_synthetic]
-    
-    log.info(f"Real records: {len(real_data):,}, Synthetic records: {len(synthetic_data):,}")
-    
-    # 1. Price evolution with synthetic markers
-    daily_prices = filled_df.groupby(filled_df.index.date)['close'].last()
-    axes[0, 0].plot(daily_prices.index, daily_prices.values, linewidth=1, alpha=0.8, label='Price')
-    
-    # Mark days with synthetic data
-    if len(synthetic_data) > 0:
-        synthetic_days = synthetic_data.groupby(synthetic_data.index.date).size()
-        for day, count in synthetic_days.items():
-            if day in daily_prices.index:
-                axes[0, 0].scatter(day, daily_prices.loc[day], color='red', s=count/10, alpha=0.6)
-    
-    axes[0, 0].set_title(f'{symbol} - Price Evolution (Red dots = Synthetic data)')
-    axes[0, 0].set_ylabel('Price')
-    axes[0, 0].grid(True, alpha=0.3)
-    axes[0, 0].tick_params(axis='x', rotation=45)
-    
-    # 2. Volume analysis
-    real_volume = real_data['volume'][real_data['volume'] > 0]
-    
-    if len(real_volume) > 0:
-        axes[0, 1].hist(real_volume, bins=50, alpha=0.7, edgecolor='black')
-        axes[0, 1].set_title(f'{symbol} - Volume Distribution (Real Data Only)')
-        axes[0, 1].set_xlabel('Volume')
-        axes[0, 1].set_ylabel('Frequency')
-        axes[0, 1].set_xscale('log')
-        axes[0, 1].set_yscale('log')
-        
-        # Add percentile lines
-        percentiles = [25, 50, 75, 95]
-        colors = ['green', 'orange', 'red', 'purple']
-        for p, color in zip(percentiles, colors):
-            val = real_volume.quantile(p/100)
-            axes[0, 1].axvline(val, color=color, linestyle='--', alpha=0.7, label=f'P{p}: {val:.0f}')
-        axes[0, 1].legend()
-    
-    # 3. Return analysis
-    returns = filled_df['close'].pct_change().dropna()
-    real_returns = real_data['close'].pct_change().dropna()
-    
-    if len(returns) > 0:
-        axes[1, 0].hist(real_returns * 100, bins=50, alpha=0.7, edgecolor='black', label='Real data')
-        
-        # Overlay synthetic transitions if any
-        synthetic_indices = synthetic_data.index
-        if len(synthetic_indices) > 0:
-            # Find returns at synthetic data points
-            synthetic_returns = returns[returns.index.isin(synthetic_indices)]
-            if len(synthetic_returns) > 0:
-                axes[1, 0].hist(synthetic_returns * 100, bins=50, alpha=0.5, 
-                               edgecolor='red', color='red', label='At synthetic points')
-        
-        axes[1, 0].set_title(f'{symbol} - Return Distribution')
-        axes[1, 0].set_xlabel('1-minute Returns %')
-        axes[1, 0].set_ylabel('Frequency')
-        axes[1, 0].set_yscale('log')
-        axes[1, 0].legend()
-        
-        # Add statistics
-        vol = real_returns.std() * 100
-        skew = real_returns.skew()
-        axes[1, 0].text(0.7, 0.9, f'Volatility: {vol:.3f}%\nSkewness: {skew:.3f}', 
-                       transform=axes[1, 0].transAxes, 
-                       bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.7))
-    
-    # 4. OHLC relationships
-    if len(filled_df) > 0:
-        # High-Low range as % of close
-        hl_range = (filled_df['high'] - filled_df['low']) / filled_df['close'] * 100
-        
-        axes[1, 1].hist(hl_range, bins=50, alpha=0.7, edgecolor='black')
-        axes[1, 1].set_title(f'{symbol} - High-Low Range Distribution')
-        axes[1, 1].set_xlabel('Range % of Close')
-        axes[1, 1].set_ylabel('Frequency')
-        axes[1, 1].set_yscale('log')
-        
-        # Mark synthetic data ranges
-        if len(synthetic_data) > 0:
-            synthetic_hl = (synthetic_data['high'] - synthetic_data['low']) / synthetic_data['close'] * 100
-            if len(synthetic_hl) > 0:
-                axes[1, 1].axvline(synthetic_hl.mean(), color='red', linestyle='--', 
-                                  label=f'Synthetic avg: {synthetic_hl.mean():.3f}%')
-                axes[1, 1].legend()
-    
-    # 5. Trading patterns by hour
-    hourly_volume = filled_df.groupby(filled_df.index.hour)['volume'].mean()
-    hourly_count = filled_df.groupby(filled_df.index.hour).size()
-    
-    ax5_twin = axes[2, 0].twinx()
-    
-    bars1 = axes[2, 0].bar(hourly_volume.index, hourly_volume.values, alpha=0.7, color='blue', label='Avg Volume')
-    bars2 = ax5_twin.bar(hourly_count.index + 0.3, hourly_count.values, alpha=0.7, color='orange', width=0.6, label='Record Count')
-    
-    axes[2, 0].set_title(f'{symbol} - Hourly Trading Patterns')
-    axes[2, 0].set_xlabel('Hour (UTC)')
-    axes[2, 0].set_ylabel('Average Volume', color='blue')
-    ax5_twin.set_ylabel('Record Count', color='orange')
-    axes[2, 0].set_xticks(range(0, 24, 2))
-    
-    # Add synthetic data count by hour
-    if len(synthetic_data) > 0:
-        hourly_synthetic = synthetic_data.groupby(synthetic_data.index.hour).size()
-        for hour, count in hourly_synthetic.items():
-            axes[2, 0].text(hour, hourly_volume.get(hour, 0) * 1.1, f'S:{count}', 
-                           ha='center', va='bottom', color='red', fontsize=8)
-    
-    # 6. Data quality heatmap
-    # Create a heatmap showing data availability by hour and day of week
-    filled_df_copy = filled_df.copy()
-    filled_df_copy['hour'] = filled_df_copy.index.hour
-    filled_df_copy['weekday'] = filled_df_copy.index.day_name()
-    
-    # Count records by hour and weekday
-    heatmap_data = filled_df_copy.groupby(['weekday', 'hour']).size().unstack(fill_value=0)
-    
-    # Reorder weekdays
-    weekday_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-    heatmap_data = heatmap_data.reindex(weekday_order)
-    
-    im = axes[2, 1].imshow(heatmap_data.values, aspect='auto', cmap='YlOrRd', interpolation='nearest')
-    axes[2, 1].set_title(f'{symbol} - Data Availability Heatmap')
-    axes[2, 1].set_xlabel('Hour (UTC)')
-    axes[2, 1].set_ylabel('Day of Week')
-    axes[2, 1].set_xticks(range(0, 24, 2))
-    axes[2, 1].set_xticklabels(range(0, 24, 2))
-    axes[2, 1].set_yticks(range(len(weekday_order)))
-    axes[2, 1].set_yticklabels(weekday_order)
-    
-    # Add colorbar
-    plt.colorbar(im, ax=axes[2, 1], label='Record Count')
-    
-    plt.tight_layout()
-    plt.savefig(plots_dir / f'{symbol}_ohlcv_analysis.png', dpi=300, bbox_inches='tight')
-    log.info(f"Saved OHLCV analysis to {plots_dir / f'{symbol}_ohlcv_analysis.png'}")
-    plt.close()
-
-def generate_cleaning_summary(symbols_analysis):
-    """Generate comprehensive cleaning summary"""
-    log.info("\n" + "="*80)
-    log.info("DATA CLEANING SUMMARY")
-    log.info("="*80)
-    
-    for symbol, analysis in symbols_analysis.items():
-        log.info(f"\n{symbol} CLEANING RESULTS:")
-        
-        original_df = analysis['original_df']
-        filled_df = analysis.get('filled_df', original_df)
-        gaps_filled = analysis.get('gaps_filled', [])
-        gaps_skipped = analysis.get('gaps_skipped', [])
-        filled_records = analysis.get('filled_records', [])
-        
-        # Original stats
-        original_count = len(original_df)
-        original_synthetic = original_df['is_synthetic'].sum() if 'is_synthetic' in original_df.columns else 0
-        
-        # After cleaning stats
-        new_synthetic = len(filled_records)
-        total_after = len(filled_df)
-        total_synthetic_after = original_synthetic + new_synthetic
-        
-        log.info(f"  Original records: {original_count:,}")
-        log.info(f"  Records after cleaning: {total_after:,}")
-        log.info(f"  New synthetic records: {new_synthetic:,}")
-        log.info(f"  Total synthetic records: {total_synthetic_after:,} ({total_synthetic_after/total_after*100:.1f}%)")
-        
-        # Gap analysis
-        if gaps_filled:
-            total_filled_minutes = sum(gap['duration'] for gap in gaps_filled)
-            log.info(f"  Gaps filled: {len(gaps_filled)} ({total_filled_minutes:,} minutes)")
-            
-            # Break down by size
-            small_gaps = [g for g in gaps_filled if g['duration'] <= 5]
-            medium_gaps = [g for g in gaps_filled if 5 < g['duration'] <= 60]
-            
-            log.info(f"    Small gaps (≤5min): {len(small_gaps)}")
-            log.info(f"    Medium gaps (6-60min): {len(medium_gaps)}")
-        
-        if gaps_skipped:
-            total_skipped_minutes = sum(gap['duration'] for gap in gaps_skipped)
-            log.info(f"  Gaps skipped: {len(gaps_skipped)} ({total_skipped_minutes:,} minutes)")
-        
-        # Coverage improvement
-        start_date = original_df.index.min()
-        end_date = original_df.index.max()
-        expected_minutes = pd.date_range(start=start_date, end=end_date, freq='1min')
-        
-        original_coverage = len(original_df) / len(expected_minutes) * 100
-        filled_coverage = len(filled_df) / len(expected_minutes) * 100
-        
-        log.info(f"  Coverage improvement: {original_coverage:.1f}% → {filled_coverage:.1f}% (+{filled_coverage-original_coverage:.1f}%)")
-        
-        # Data quality assessment
-        if filled_coverage >= 95:
-            quality = "EXCELLENT"
-        elif filled_coverage >= 85:
-            quality = "GOOD"
-        elif filled_coverage >= 70:
-            quality = "FAIR"
-        else:
-            quality = "POOR"
-        
-        log.info(f"  Final quality assessment: {quality}")
-    
-    log.info("\n" + "="*80)
-
-def create_final_comparison_plots(symbols_analysis):
-    """Create final comparison plots between symbols"""
-    log.info("\n=== CREATING FINAL COMPARISON PLOTS ===")
-    
-    fig, axes = plt.subplots(2, 2, figsize=(20, 12))
-    
-    symbols = list(symbols_analysis.keys())
-    colors = ['blue', 'orange']
-    
-    # 1. Coverage comparison
-    for i, (symbol, analysis) in enumerate(symbols_analysis.items()):
-        original_df = analysis['original_df']
-        filled_df = analysis['filled_df']
-        
-        # Calculate daily coverage
-        start_date = original_df.index.min()
-        end_date = original_df.index.max()
-        expected_timeline = pd.date_range(start=start_date, end=end_date, freq='1min')
-        
-        original_coverage = pd.Series(index=expected_timeline, data=False)
-        original_coverage.loc[original_df.index] = True
-        filled_coverage = pd.Series(index=expected_timeline, data=False)
-        filled_coverage.loc[filled_df.index] = True
-        
-        daily_original = original_coverage.resample('D').mean() * 100
-        daily_filled = filled_coverage.resample('D').mean() * 100
-        
-        axes[0, 0].plot(daily_original.index, daily_original.values, 
-                       label=f'{symbol} Original', alpha=0.7, color=colors[i], linestyle='--')
-        axes[0, 0].plot(daily_filled.index, daily_filled.values, 
-                       label=f'{symbol} Filled', alpha=0.8, color=colors[i], linewidth=2)
-    
-    axes[0, 0].set_title('Coverage Comparison: Before vs After Fill')
-    axes[0, 0].set_ylabel('Coverage %')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    axes[0, 0].set_ylim(0, 105)
-    
-    # 2. Synthetic data impact
-    synthetic_summary = {}
-    for symbol, analysis in symbols_analysis.items():
-        filled_df = analysis['filled_df']
-        total_records = len(filled_df)
-        synthetic_count = filled_df.get('is_synthetic', pd.Series(False, index=filled_df.index)).sum()
-        synthetic_pct = (synthetic_count / total_records) * 100 if total_records > 0 else 0
-        synthetic_summary[symbol] = synthetic_pct
-    
-    axes[0, 1].bar(synthetic_summary.keys(), synthetic_summary.values(), 
-                   color=colors, alpha=0.7)
-    axes[0, 1].set_title('Synthetic Data Percentage by Symbol')
-    axes[0, 1].set_ylabel('Synthetic Data %')
-    axes[0, 1].set_ylim(0, max(synthetic_summary.values()) * 1.2 if synthetic_summary.values() else 5)
-    
-    # Add value labels
-    for i, (symbol, pct) in enumerate(synthetic_summary.items()):
-        axes[0, 1].text(i, pct + 0.1, f'{pct:.1f}%', ha='center', va='bottom')
-    
-    # 3. Gap treatment comparison
-    gap_comparison = {}
-    for symbol, analysis in symbols_analysis.items():
-        gaps_filled = analysis['gaps_filled']
-        gaps_skipped = analysis['gaps_skipped']
-        
-        filled_minutes = sum(gap['duration'] for gap in gaps_filled)
-        skipped_minutes = sum(gap['duration'] for gap in gaps_skipped)
-        
-        gap_comparison[symbol] = {
-            'Filled': filled_minutes,
-            'Skipped': skipped_minutes
-        }
-    
-    # Create stacked bar chart
-    symbols_list = list(gap_comparison.keys())
-    filled_values = [gap_comparison[s]['Filled'] for s in symbols_list]
-    skipped_values = [gap_comparison[s]['Skipped'] for s in symbols_list]
-    
-    x_pos = range(len(symbols_list))
-    axes[1, 0].bar(x_pos, filled_values, label='Filled', alpha=0.7, color='green')
-    axes[1, 0].bar(x_pos, skipped_values, bottom=filled_values, label='Skipped', alpha=0.7, color='red')
-    
-    axes[1, 0].set_title('Gap Treatment Comparison (Minutes)')
-    axes[1, 0].set_ylabel('Minutes')
-    axes[1, 0].set_xticks(x_pos)
-    axes[1, 0].set_xticklabels([s.split('_')[-2] for s in symbols_list])  # Just the symbol part
-    axes[1, 0].legend()
-    axes[1, 0].set_yscale('log')
-    
-    # 4. Final quality assessment
-    quality_scores = {}
-    for symbol, analysis in symbols_analysis.items():
-        filled_df = analysis['filled_df']
-        
-        # Calculate quality score based on multiple factors
-        start_date = filled_df.index.min()
-        end_date = filled_df.index.max()
-        expected_timeline = pd.date_range(start=start_date, end=end_date, freq='1min')
-        
-        coverage = len(filled_df) / len(expected_timeline)
-        synthetic_ratio = filled_df.get('is_synthetic', pd.Series(False, index=filled_df.index)).mean()
-        
-        # Quality score: high coverage, low synthetic ratio
-        quality_score = coverage * (1 - synthetic_ratio * 0.5)  # Penalize synthetic data
-        quality_scores[symbol] = quality_score * 100
-    
-    axes[1, 1].bar(quality_scores.keys(), quality_scores.values(), 
-                   color=colors, alpha=0.7)
-    axes[1, 1].set_title('Final Data Quality Score')
-    axes[1, 1].set_ylabel('Quality Score')
-    axes[1, 1].set_ylim(0, 105)
-    
-    # Add value labels and quality assessment
-    for i, (symbol, score) in enumerate(quality_scores.items()):
-        axes[1, 1].text(i, score + 2, f'{score:.1f}', ha='center', va='bottom')
-        
-        # Add quality assessment text
-        if score >= 95:
-            quality_text = "EXCELLENT"
-            text_color = "green"
-        elif score >= 85:
-            quality_text = "GOOD"
-            text_color = "orange"
-        elif score >= 70:
-            quality_text = "FAIR"
-            text_color = "red"
-        else:
-            quality_text = "POOR"
-            text_color = "darkred"
-        
-        axes[1, 1].text(i, score - 10, quality_text, ha='center', va='center', 
-                       color=text_color, fontweight='bold')
-    
-    plt.tight_layout()
-    plt.savefig(plots_dir / 'symbols_comparison.png', dpi=300, bbox_inches='tight')
-    log.info(f"Saved symbols comparison to {plots_dir / 'symbols_comparison.png'}")
-    plt.close()
-
-def create_spread_regime_analysis(symbols_analysis):
-    """Create comprehensive spread regime analysis across symbols"""
-    log.info("\n=== CREATING SPREAD REGIME ANALYSIS ===")
-    
-    fig, axes = plt.subplots(2, 2, figsize=(20, 12))
-    
-    # Collect spread data for both symbols
-    spread_data = {}
-    strict_thresholds = {}
-    
-    for symbol, analysis in symbols_analysis.items():
-        orderbook_df = analysis.get('orderbook_df')
-        if orderbook_df is not None:
-            valid_quotes = orderbook_df.dropna(subset=['bid1_price', 'ask1_price'])
-            if len(valid_quotes) > 0:
-                spreads = valid_quotes['ask1_price'] - valid_quotes['bid1_price']
-                spread_pct = spreads / valid_quotes['bid1_price'] * 100
-                
-                # Daily spreads
-                daily_spreads = spread_pct.groupby(spread_pct.index.date).mean()
-                spread_data[symbol] = daily_spreads
-                
-                # Get strict threshold from analysis
-                strict_threshold = analysis.get('strict_threshold')
-                strict_thresholds[symbol] = strict_threshold
-    
-    # Plot 1: Overlay spread evolution for both symbols with strict thresholds
-    colors = ['blue', 'orange']
-    for i, (symbol, daily_spreads) in enumerate(spread_data.items()):
-        axes[0, 0].plot(daily_spreads.index, daily_spreads.values, 
-                       linewidth=2, alpha=0.8, color=colors[i], label=symbol.split('_')[-2])
-        
-        # Add strict threshold line
-        strict_threshold = strict_thresholds.get(symbol)
-        if strict_threshold:
-            axes[0, 0].axhline(y=strict_threshold, color=colors[i], linestyle='--', alpha=0.7, 
-                              label=f'{symbol.split("_")[-2]} Threshold: {strict_threshold:.4f}%')
-    
-    axes[0, 0].set_title('Spread Evolution with STRICT Filtering Thresholds')
-    axes[0, 0].set_ylabel('Daily Average Spread %')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    axes[0, 0].tick_params(axis='x', rotation=45)
-    
-    # Plot 2: Spread distribution comparison
-    for i, (symbol, daily_spreads) in enumerate(spread_data.items()):
-        axes[0, 1].hist(daily_spreads.values, bins=30, alpha=0.6, 
-                       color=colors[i], label=symbol.split('_')[-2], density=True)
-        
-        # Add strict threshold line
-        strict_threshold = strict_thresholds.get(symbol)
-        if strict_threshold:
-            axes[0, 1].axvline(strict_threshold, color=colors[i], linestyle='--', alpha=0.8,
-                              label=f'{symbol.split("_")[-2]} Threshold')
-    
-    axes[0, 1].set_title('Spread Distribution with STRICT Thresholds')
-    axes[0, 1].set_xlabel('Daily Average Spread %')
-    axes[0, 1].set_ylabel('Density')
-    axes[0, 1].legend()
-    axes[0, 1].set_yscale('log')
-    
-    # Plot 3: Filtering effectiveness comparison
-    effectiveness_data = {}
-    for symbol, daily_spreads in spread_data.items():
-        strict_threshold = strict_thresholds.get(symbol)
-        if strict_threshold:
-            effectiveness_data[symbol] = {
-                'Total_Days': len(daily_spreads),
-                'Good_Days': (daily_spreads <= strict_threshold).sum(),
-                'Good_Pct': (daily_spreads <= strict_threshold).mean() * 100,
-                'Avg_All': daily_spreads.mean(),
-                'Avg_Good': daily_spreads[daily_spreads <= strict_threshold].mean()
-            }
-    
-    if effectiveness_data:
-        symbols_short = [s.split('_')[-2] for s in effectiveness_data.keys()]
-        good_pcts = [effectiveness_data[s]['Good_Pct'] for s in effectiveness_data.keys()]
-        avg_all = [effectiveness_data[s]['Avg_All'] for s in effectiveness_data.keys()]
-        avg_good = [effectiveness_data[s]['Avg_Good'] for s in effectiveness_data.keys()]
-        
-        x_pos = range(len(symbols_short))
-        width = 0.35
-        
-        bars1 = axes[1, 0].bar([x - width/2 for x in x_pos], avg_all, width, 
-                              label='All Data Avg', alpha=0.7, color='lightcoral')
-        bars2 = axes[1, 0].bar([x + width/2 for x in x_pos], avg_good, width,
-                              label='Good Data Avg', alpha=0.7, color='lightgreen')
-        
-        axes[1, 0].set_title('Spread Quality: All vs Filtered Data')
-        axes[1, 0].set_ylabel('Average Spread %')
-        axes[1, 0].set_xticks(x_pos)
-        axes[1, 0].set_xticklabels(symbols_short)
-        axes[1, 0].legend()
-        axes[1, 0].set_yscale('log')
-        
-        # Add percentage labels
-        for i, (all_val, good_val, pct) in enumerate(zip(avg_all, avg_good, good_pcts)):
-            axes[1, 0].text(i, max(all_val, good_val) * 1.1, f'{pct:.1f}% good days', 
-                           ha='center', va='bottom', fontweight='bold')
-    
-    # Plot 4: Filtering summary table
-    axes[1, 1].axis('tight')
-    axes[1, 1].axis('off')
-    
-    table_data = []
-    for symbol, data in effectiveness_data.items():
-        symbol_short = symbol.split('_')[-2]
-        strict_threshold = strict_thresholds.get(symbol, 0)
-        
-        table_data.append([
-            symbol_short,
-            f"{strict_threshold:.4f}%",
-            f"{data['Good_Days']}/{data['Total_Days']}",
-            f"{data['Good_Pct']:.1f}%",
-            f"{data['Avg_All']:.4f}%",
-            f"{data['Avg_Good']:.4f}%"
-        ])
-    
-    table = axes[1, 1].table(cellText=table_data,
-                           colLabels=['Symbol', 'Threshold', 'Good Days', 'Good %', 'Avg All', 'Avg Good'],
-                           cellLoc='center',
-                           loc='center')
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1.2, 1.8)
-    
-    # Color code by quality
-    for i, row in enumerate(table_data):
-        good_pct = float(row[3].rstrip('%'))
-        if good_pct >= 50:
-            color = 'lightgreen'
-        elif good_pct >= 30:
-            color = 'lightyellow'
-        else:
-            color = 'lightcoral'
-        
-        # Color the whole row
-        for j in range(len(row)):
-            table[(i+1, j)].set_facecolor(color)
-    
-    axes[1, 1].set_title('STRICT Filtering Effectiveness Summary')
-    
-    plt.tight_layout()
-    plt.savefig(plots_dir / 'spread_regime_analysis.png', dpi=300, bbox_inches='tight')
-    log.info(f"Saved spread regime analysis to {plots_dir / 'spread_regime_analysis.png'}")
-    plt.close()
-    
-    # Return simple recommendations without complex period analysis
-    recommendations = []
-    for symbol, data in effectiveness_data.items():
-        symbol_short = symbol.split('_')[-2]
-        strict_threshold = strict_thresholds.get(symbol, 0)
-        
-        if data['Good_Pct'] >= 50:
-            quality = 'Good (Filter)'
-        elif data['Good_Pct'] >= 30:
-            quality = 'Fair (Filter)'
-        else:
-            quality = 'Poor'
-        
-        recommendations.append({
-            'Symbol': symbol_short,
-            'Start': 'Use filtering',
-            'End': f'<= {strict_threshold:.4f}%',
-            'Duration': f"{data['Good_Days']}d available",
-            'Avg_Spread': data['Avg_All'],
-            'Quality': quality,
-            'Threshold': strict_threshold
-        })
-    
-    return recommendations
-
-def create_cleaning_visualizations(symbols_analysis):
-    """Create comprehensive spread regime analysis across symbols"""
-    log.info("\n=== CREATING SPREAD REGIME ANALYSIS ===")
-    
-    fig, axes = plt.subplots(2, 2, figsize=(20, 12))
-    
-    # Collect spread data for both symbols
-    spread_data = {}
-    stable_periods = {}
-    
-    for symbol, analysis in symbols_analysis.items():
-        orderbook_df = analysis.get('orderbook_df')
-        if orderbook_df is not None:
-            valid_quotes = orderbook_df.dropna(subset=['bid1_price', 'ask1_price'])
-            if len(valid_quotes) > 0:
-                spreads = valid_quotes['ask1_price'] - valid_quotes['bid1_price']
-                spread_pct = spreads / valid_quotes['bid1_price'] * 100
-                
-                # Daily spreads
-                daily_spreads = spread_pct.groupby(spread_pct.index.date).mean()
-                spread_data[symbol] = daily_spreads
-                
-                # Get stable period from analysis
-                stable_period = analysis.get('stable_period')
-                stable_periods[symbol] = stable_period
-    
-    # Plot 1: Overlay spread evolution for both symbols
-    colors = ['blue', 'orange']
-    for i, (symbol, daily_spreads) in enumerate(spread_data.items()):
-        axes[0, 0].plot(daily_spreads.index, daily_spreads.values, 
-                       linewidth=2, alpha=0.8, color=colors[i], label=symbol.split('_')[-2])
-        
-        # Highlight stable periods
-        stable_period = stable_periods.get(symbol)
-        if stable_period:
-            stable_start, stable_end = stable_period
-            axes[0, 0].axvspan(stable_start, stable_end, alpha=0.2, color=colors[i])
-    
-    axes[0, 0].set_title('Spread Evolution Comparison with Stable Periods')
-    axes[0, 0].set_ylabel('Daily Average Spread %')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    axes[0, 0].tick_params(axis='x', rotation=45)
-    
-    # Plot 2: Spread distribution comparison
-    for i, (symbol, daily_spreads) in enumerate(spread_data.items()):
-        axes[0, 1].hist(daily_spreads.values, bins=30, alpha=0.6, 
-                       color=colors[i], label=symbol.split('_')[-2], density=True)
-    
-    axes[0, 1].set_title('Spread Distribution Comparison')
-    axes[0, 1].set_xlabel('Daily Average Spread %')
-    axes[0, 1].set_ylabel('Density')
-    axes[0, 1].legend()
-    axes[0, 1].set_yscale('log')
-    
-    # Plot 3: Stability metrics comparison
-    stability_metrics = {}
-    for symbol, daily_spreads in spread_data.items():
-        stability_metrics[symbol] = {
-            'Mean': daily_spreads.mean(),
-            'Std': daily_spreads.std(),
-            'CV': daily_spreads.std() / daily_spreads.mean(),  # Coefficient of variation
-            'P20': daily_spreads.quantile(0.2),
-            'P80': daily_spreads.quantile(0.8)
-        }
-    
-    metrics_df = pd.DataFrame(stability_metrics).T
-    symbols_short = [s.split('_')[-2] for s in metrics_df.index]
-    
-    x_pos = range(len(symbols_short))
-    width = 0.15
-    
-    for i, metric in enumerate(['Mean', 'Std', 'P20', 'P80']):
-        axes[1, 0].bar([x + i*width for x in x_pos], metrics_df[metric].values, 
-                      width, label=metric, alpha=0.7)
-    
-    axes[1, 0].set_title('Spread Stability Metrics Comparison')
-    axes[1, 0].set_ylabel('Spread %')
-    axes[1, 0].set_xticks([x + width*1.5 for x in x_pos])
-    axes[1, 0].set_xticklabels(symbols_short)
-    axes[1, 0].legend()
-    axes[1, 0].set_yscale('log')
-    
-    # Plot 4: Trading window recommendations
-    recommendations = []
-    for symbol, stable_period in stable_periods.items():
-        symbol_short = symbol.split('_')[-2]
-        if stable_period:
-            start, end = stable_period
-            duration = (pd.Timestamp(end) - pd.Timestamp(start)).days
-            avg_spread = spread_data[symbol][spread_data[symbol].index >= start].mean()
-            recommendations.append({
-                'Symbol': symbol_short,
-                'Start': start,
-                'End': end,
-                'Duration': duration,
-                'Avg_Spread': avg_spread,
-                'Quality': 'Excellent' if avg_spread < 0.05 else 'Good' if avg_spread < 0.1 else 'Fair'
-            })
-        else:
-            recommendations.append({
-                'Symbol': symbol_short,
-                'Start': 'None',
-                'End': 'None',
-                'Duration': 0,
-                'Avg_Spread': spread_data[symbol].mean(),
-                'Quality': 'Poor'
-            })
-    
-    # Create recommendation table
-    rec_df = pd.DataFrame(recommendations)
-    
-    # Plot as table
-    axes[1, 1].axis('tight')
-    axes[1, 1].axis('off')
-    
-    table_data = []
-    for _, row in rec_df.iterrows():
-        if row['Start'] != 'None':
-            table_data.append([
-                row['Symbol'],
-                str(row['Start']),
-                str(row['End']),
-                f"{row['Duration']} days",
-                f"{row['Avg_Spread']:.4f}%",
-                row['Quality']
-            ])
-        else:
-            table_data.append([
-                row['Symbol'],
-                'No stable period',
-                '-',
-                '-',
-                f"{row['Avg_Spread']:.4f}%",
-                row['Quality']
-            ])
-    
-    table = axes[1, 1].table(cellText=table_data,
-                           colLabels=['Symbol', 'Recommended Start', 'Recommended End', 'Duration', 'Avg Spread', 'Quality'],
-                           cellLoc='center',
-                           loc='center')
-    table.auto_set_font_size(False)
-    table.set_fontsize(9)
-    table.scale(1.2, 1.5)
-    
-    # Color code quality
-    for i, row in enumerate(table_data):
-        quality = row[5]
-        if quality == 'Excellent':
-            color = 'lightgreen'
-        elif quality == 'Good':
-            color = 'lightblue'
-        elif quality == 'Fair':
-            color = 'lightyellow'
-        else:
-            color = 'lightcoral'
-        
-        table[(i+1, 5)].set_facecolor(color)
-    
-    axes[1, 1].set_title('Trading Window Recommendations')
-    
-    plt.tight_layout()
-    plt.savefig(plots_dir / 'spread_regime_analysis.png', dpi=300, bbox_inches='tight')
-    log.info(f"Saved spread regime analysis to {plots_dir / 'spread_regime_analysis.png'}")
-    plt.close()
-    
-    return recommendations
-    """Create summary cleaning visualizations"""
-    log.info("\n=== CREATING SUMMARY CLEANING VISUALIZATIONS ===")
-    
-    fig, axes = plt.subplots(len(symbols_analysis), 2, figsize=(16, 6*len(symbols_analysis)))
-    if len(symbols_analysis) == 1:
-        axes = axes.reshape(1, -1)
-    
-    for i, (symbol, analysis) in enumerate(symbols_analysis.items()):
-        original_df = analysis['original_df']
-        filled_df = analysis.get('filled_df', original_df)
-        
-        # Coverage improvement
-        start_date = original_df.index.min()
-        end_date = original_df.index.max()
-        expected_timeline = pd.date_range(start=start_date, end=end_date, freq='1min')
-        
-        original_coverage = pd.Series(index=expected_timeline, data=False)
-        original_coverage.loc[original_df.index] = True
-        filled_coverage = pd.Series(index=expected_timeline, data=False)
-        filled_coverage.loc[filled_df.index] = True
-        
-        daily_original = original_coverage.resample('D').mean()
-        daily_filled = filled_coverage.resample('D').mean()
-        
-        axes[i, 0].plot(daily_original.index, daily_original.values * 100, 
-                       label='Original', alpha=0.7, linewidth=1)
-        axes[i, 0].plot(daily_filled.index, daily_filled.values * 100, 
-                       label='After Fill', alpha=0.7, linewidth=2)
-        axes[i, 0].set_title(f'{symbol} - Coverage Improvement')
-        axes[i, 0].set_ylabel('Coverage %')
-        axes[i, 0].legend()
-        axes[i, 0].grid(True, alpha=0.3)
-        axes[i, 0].set_ylim(0, 105)
-        
-        # Data composition (Fixed pie chart)
-        total_records = len(filled_df)
-        synthetic_count = filled_df.get('is_synthetic', pd.Series(False, index=filled_df.index)).sum()
-        real_count = total_records - synthetic_count
-        
-        composition = {'Real Data': real_count, 'Synthetic': synthetic_count}
-        colors = ['green', 'orange']
-        
-        # Create pie chart without alpha parameter
-        wedges, texts, autotexts = axes[i, 1].pie(composition.values(), labels=composition.keys(), 
-                                                  autopct='%1.1f%%', colors=colors)
-        
-        # Apply alpha manually to wedges
-        for wedge in wedges:
-            wedge.set_alpha(0.7)
-        
-        axes[i, 1].set_title(f'{symbol} - Final Data Composition')
-    
-    plt.tight_layout()
-    plt.savefig(plots_dir / 'data_cleaning_results.png', dpi=300, bbox_inches='tight')
-    log.info(f"Saved cleaning summary to {plots_dir / 'data_cleaning_results.png'}")
-    plt.close()
+    extreme_moves = (abs(price_changes) > 0.5).sum()
+    
+    log.info(f"{symbol} OHLCV Quality:")
+    log.info(f"  Total records: {total_records:,}")
+    log.info(f"  Invalid OHLC: {invalid_ohlc:,} ({invalid_ohlc/total_records*100:.3f}%)")
+    log.info(f"  Zero volume: {zero_volume:,} ({zero_volume/total_records*100:.3f}%)")
+    log.info(f"  Extreme moves: {extreme_moves:,} ({extreme_moves/len(price_changes)*100:.3f}%)")
 
 def main():
-    """Main data cleaning function with comprehensive analysis"""
-    log.info("Starting comprehensive data cleaning with detailed analysis")
+    """Función principal con P80 automático"""
+    log.info("Starting P80-based data analysis...")
+    
+    symbols = ['MEXCFTS_PERP_GIGA_USDT', 'MEXCFTS_PERP_SPX_USDT']
+    analyses = {}
     
     try:
-        # Add synthetic data columns to database
-        add_synthetic_data_columns()
+        # Preparar base de datos
+        add_database_columns()
         
-        # Define symbols to clean
-        symbols = ['MEXCFTS_PERP_GIGA_USDT', 'MEXCFTS_PERP_SPX_USDT']
-        symbols_analysis = {}
-        
+        # Analizar cada símbolo
         for symbol in symbols:
             log.info(f"\n{'='*60}")
-            log.info(f"PROCESSING {symbol}")
+            log.info(f"ANALYZING {symbol}")
             log.info(f"{'='*60}")
             
-            # Load and analyze data
-            ohlcv_df = load_and_analyze_ohlcv_data(symbol)
-            orderbook_df = load_and_analyze_orderbook_data(symbol)
+            # Verificar si ya fue procesado
+            already_processed = check_if_already_processed(symbol)
             
-            if ohlcv_df is None:
-                log.warning(f"Skipping {symbol} - no OHLCV data")
+            # Cargar datos
+            ohlcv_df, orderbook_df = load_data(symbol)
+            
+            if len(ohlcv_df) == 0 or len(orderbook_df) == 0:
+                log.warning(f"No data for {symbol}")
                 continue
             
-            # ===== PRE-FILL ANALYSIS =====
-            log.info(f"\n{'='*40}")
-            log.info("PRE-FILL COMPREHENSIVE ANALYSIS")
-            log.info(f"{'='*40}")
+            # Análisis básico OHLCV
+            analyze_ohlcv_quality(symbol, ohlcv_df)
             
-            # Create pre-fill visualizations
-            create_pre_fill_analysis(symbol, ohlcv_df, orderbook_df)
+            # Calcular threshold P80
+            p80_threshold = calculate_p80_threshold(orderbook_df)
+            log.info(f"Calculated P80 threshold: {p80_threshold:.4f}%")
             
-            # Detailed quality analysis
-            analyze_orderbook_quality(symbol, orderbook_df)
-            validate_ohlcv_coherence(symbol, ohlcv_df)
-            cross_validate_ohlcv_orderbook(symbol, ohlcv_df, orderbook_df)
+            # Análisis de spreads
+            analysis = analyze_spread_quality(symbol, orderbook_df, p80_threshold)
             
-            # ===== GAP IDENTIFICATION AND FILLING =====
-            log.info(f"\n{'='*40}")
-            log.info("GAP IDENTIFICATION AND FORWARD FILL")
-            log.info(f"{'='*40}")
-            
-            # Identify gaps for filling
-            gaps_to_fill, gaps_to_skip = identify_gaps_for_filling(symbol, ohlcv_df)
-            
-            # Perform forward fill
-            filled_records, filled_df = perform_forward_fill(symbol, ohlcv_df, gaps_to_fill)
-            
-            # Insert synthetic data into database
-            if filled_records:
-                insert_synthetic_data(symbol, filled_records)
-            
-            # ===== POST-FILL ANALYSIS =====
-            log.info(f"\n{'='*40}")
-            log.info("POST-FILL COMPREHENSIVE ANALYSIS")
-            log.info(f"{'='*40}")
-            
-            # Create post-fill visualizations
-            create_post_fill_analysis(symbol, ohlcv_df, filled_df, gaps_to_fill, gaps_to_skip)
-            
-            # Comprehensive orderbook analysis (with spread stability)
-            stable_period, daily_spread_stats = comprehensive_orderbook_analysis(symbol, orderbook_df)
-            
-            # Comprehensive OHLCV analysis (post-fill)
-            comprehensive_ohlcv_analysis(symbol, filled_df)
-            
-            # ===== FINAL VALIDATION =====
-            log.info(f"\n{'='*40}")
-            log.info("POST-FILL VALIDATION")
-            log.info(f"{'='*40}")
-            
-            # Re-validate data quality after fill
-            validate_ohlcv_coherence(symbol, filled_df)
-            
-            # Store analysis results with strict thresholds only
-            strict_threshold = None
-            if daily_spread_stats is not None:
-                sorted_spreads = daily_spread_stats['mean_spread'].sort_values()
-                strict_threshold = sorted_spreads.quantile(0.15)
-                q25_spread = sorted_spreads.quantile(0.25)
-                strict_threshold = min(strict_threshold, q25_spread)
-            
-            symbols_analysis[symbol] = {
-                'original_df': ohlcv_df,
-                'filled_df': filled_df,
-                'orderbook_df': orderbook_df,
-                'gaps_filled': gaps_to_fill,
-                'gaps_skipped': gaps_to_skip,
-                'filled_records': filled_records,
-                'stable_period': stable_period,
-                'daily_spread_stats': daily_spread_stats,
-                'strict_threshold': strict_threshold
-            }
+            if analysis:
+                analyses[symbol] = analysis
+                
+                # Crear gráficos
+                create_spread_analysis_plot(analysis)
+                create_ohlcv_analysis_plot(symbol, ohlcv_df)
+                
+                # Actualizar base de datos solo si no fue procesado antes
+                if not already_processed:
+                    update_database_quality(symbol, p80_threshold)
+                else:
+                    log.info(f"Skipping database update for {symbol} (already processed)")
         
-        # ===== FINAL SUMMARY =====
-        log.info(f"\n{'='*60}")
-        log.info("FINAL CLEANING AND ANALYSIS SUMMARY")
-        log.info(f"{'='*60}")
+        # Crear comparación
+        if len(analyses) > 1:
+            log.info("\n=== CREATING P80 COMPARISON ===")
+            create_comparison_plot(analyses)
         
-        # Generate comprehensive summary
-        if symbols_analysis:
-            generate_cleaning_summary(symbols_analysis)
-            
-            # Create spread regime analysis
-            spread_recommendations = create_spread_regime_analysis(symbols_analysis)
-            
-            # Create comparison visualizations
-            create_final_comparison_plots(symbols_analysis)
-            create_cleaning_visualizations(symbols_analysis)
+        # Reporte final
+        log.info(f"\n{'='*80}")
+        log.info("FINAL P80 ANALYSIS REPORT")
+        log.info(f"{'='*80}")
         
-        log.info("\n" + "="*80)
-        log.info("COMPREHENSIVE DATA CLEANING COMPLETED SUCCESSFULLY!")
-        log.info("="*80)
-        log.info("\nGenerated plots:")
-        
-        for symbol in symbols:
-            if symbol in symbols_analysis:
-                log.info(f"\n{symbol}:")
-                log.info(f"  - {symbol}_pre_fill_analysis.png")
-                log.info(f"  - {symbol}_post_fill_analysis.png") 
-                log.info(f"  - {symbol}_orderbook_analysis.png")
-                log.info(f"  - {symbol}_ohlcv_analysis.png")
-        
-        log.info(f"\nComparison:")
-        log.info(f"  - symbols_comparison.png")
-        log.info(f"  - data_cleaning_results.png")
-        log.info(f"  - spread_regime_analysis.png")
-        
-        # Print strict filtering recommendations
-        log.info(f"\n" + "="*80)
-        log.info("STRICT LIQUIDITY FILTERING RECOMMENDATIONS")
-        log.info("="*80)
-        
-        for symbol, analysis in symbols_analysis.items():
+        for symbol, analysis in analyses.items():
             symbol_short = symbol.split('_')[-2]
-            strict_threshold = analysis.get('strict_threshold')
-            orderbook_df = analysis.get('orderbook_df')
+            log.info(f"\n{symbol_short}:")
+            log.info(f"  P80 Threshold: {analysis['threshold']:.4f}%")
+            log.info(f"  Good Data (≤P80): {analysis['good_data_pct']:.1f}%")
+            log.info(f"  Average Spread: {analysis['basic_stats']['mean']:.4f}%")
+            log.info(f"  Median Spread: {analysis['basic_stats']['median']:.4f}%")
             
-            if strict_threshold and orderbook_df is not None and 'valid_for_trading' in orderbook_df.columns:
-                valid_count = orderbook_df['valid_for_trading'].sum()
-                total_count = len(orderbook_df)
-                valid_pct = valid_count / total_count * 100
-                
-                log.info(f"\n{symbol_short}:")
-                log.info(f"  STRICT threshold: {strict_threshold:.4f}%")
-                log.info(f"  Valid for trading: {valid_count:,}/{total_count:,} records ({valid_pct:.1f}%)")
-                
-                if 'liquidity_quality' in orderbook_df.columns:
-                    quality_dist = orderbook_df['liquidity_quality'].value_counts()
-                    log.info(f"  Quality distribution:")
-                    for quality, count in quality_dist.items():
-                        pct = count / total_count * 100
-                        log.info(f"    {quality}: {count:,} ({pct:.1f}%)")
-                
-                # Calculate daily good data availability
-                daily_stats = analysis.get('daily_spread_stats')
-                if daily_stats is not None:
-                    good_days = (daily_stats['mean_spread'] <= strict_threshold).sum()
-                    total_days = len(daily_stats)
-                    good_days_pct = good_days / total_days * 100
-                    log.info(f"  Good days (daily avg <= threshold): {good_days}/{total_days} ({good_days_pct:.1f}%)")
+            if analysis['good_data_pct'] >= 75:
+                recommendation = "EXCELLENT for trading"
+            elif analysis['good_data_pct'] >= 60:
+                recommendation = "GOOD for trading" 
+            else:
+                recommendation = "NEEDS REVIEW"
+            
+            log.info(f"  Recommendation: {recommendation}")
         
-        log.info(f"\n" + "="*80)
-        log.info("USAGE INSTRUCTIONS")
-        log.info("="*80)
-        log.info("For pair trading, filter your orderbook data using:")
-        log.info("WHERE valid_for_trading = TRUE")
-        log.info("This ensures you only trade during optimal liquidity conditions.")
-        
-        log.info(f"\nAll plots saved in: {plots_dir}")
+        log.info(f"\nUse this filter for optimal trading: WHERE valid_for_trading = TRUE")
+        log.info(f"This gives you data with spreads ≤ P80 threshold")
+        log.info(f"Plots saved in: plots/")
         
         return True
         
     except Exception as e:
-        log.error(f"Comprehensive data cleaning failed: {e}")
+        log.error(f"Analysis failed: {e}")
         import traceback
         log.error(traceback.format_exc())
         return False
