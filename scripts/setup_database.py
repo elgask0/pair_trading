@@ -9,7 +9,14 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.database.connection import db_manager
-from src.database.migrations import create_all_tables
+from src.database.migrations import (
+    create_all_tables, 
+    add_data_quality_columns, 
+    check_data_quality_schema, 
+    create_funding_rates_table, 
+    check_funding_rates_schema,
+    run_all_migrations
+)
 from src.database.models import Symbol, PairConfiguration
 from config.settings import settings
 from src.utils.logger import get_setup_logger
@@ -29,10 +36,19 @@ def setup_symbols():
             # Check if symbol already exists
             existing = session.query(Symbol).filter(Symbol.symbol == symbol).first()
             if not existing:
-                # Parse symbol (assuming format like "GIGA_USDT")
-                parts = symbol.split('_')
-                base_asset = parts[0] if len(parts) > 1 else symbol
-                quote_asset = parts[1] if len(parts) > 1 else "USDT"
+                # Parse symbol (assuming format like "MEXCFTS_PERP_SPX_USDT")
+                if "PERP_" in symbol:
+                    parts = symbol.split('_')
+                    if len(parts) >= 4:  # MEXCFTS_PERP_SPX_USDT
+                        base_asset = parts[2]
+                        quote_asset = parts[3]
+                    else:
+                        base_asset = symbol.split('_')[0]
+                        quote_asset = "USDT"
+                else:
+                    parts = symbol.split('_')
+                    base_asset = parts[0] if len(parts) > 1 else symbol
+                    quote_asset = parts[1] if len(parts) > 1 else "USDT"
                 
                 new_symbol = Symbol(
                     symbol=symbol,
@@ -74,6 +90,51 @@ def setup_pair_configurations():
             else:
                 log.info(f"Pair configuration already exists: {pair_config.pair_name}")
 
+def setup_database_schema():
+    """Setup complete database schema including all tables"""
+    log.info("Setting up database schema...")
+    
+    try:
+        # Run all migrations (this includes base tables, data quality, and funding rates)
+        success = run_all_migrations()
+        
+        if success:
+            log.info("Database schema setup completed successfully")
+            return True
+        else:
+            log.error("Database schema setup failed")
+            return False
+        
+    except Exception as e:
+        log.error(f"Database schema setup failed: {e}")
+        return False
+
+def verify_schema():
+    """Verify that all required tables and columns exist"""
+    log.info("Verifying database schema...")
+    
+    try:
+        # Check funding rates schema
+        funding_ok = check_funding_rates_schema()
+        
+        # Check data quality schema
+        quality_ok = check_data_quality_schema()
+        
+        if funding_ok and quality_ok:
+            log.info("✅ All schema components verified successfully")
+            return True
+        else:
+            log.warning("⚠️ Some schema components are missing")
+            if not funding_ok:
+                log.warning("  - Funding rates table/schema missing")
+            if not quality_ok:
+                log.warning("  - Data quality columns missing")
+            return False
+        
+    except Exception as e:
+        log.error(f"Schema verification failed: {e}")
+        return False
+
 def main():
     """Main setup function"""
     log.info("Starting database setup...")
@@ -81,23 +142,44 @@ def main():
     # Test connection
     if not db_manager.test_connection():
         log.error("Database connection failed. Check your configuration.")
+        log.error("Make sure PostgreSQL is running and .env file is configured correctly")
         return False
     
     try:
-        # Create tables
-        create_all_tables()
+        # Setup database schema
+        if not setup_database_schema():
+            log.error("Database schema setup failed")
+            return False
+        
+        # Verify schema
+        if not verify_schema():
+            log.error("Schema verification failed")
+            return False
         
         # Setup initial data
+        log.info("Setting up initial data...")
         setup_symbols()
         setup_pair_configurations()
         
-        log.info("Database setup completed successfully!")
+        log.info("✅ Database setup completed successfully!")
+        log.info("\nNext steps:")
+        log.info("  1. Run 'python scripts/ingest_data.py --funding-only' to ingest funding rates")
+        log.info("  2. Run 'python scripts/validate_data.py' to validate data quality")
+        log.info("  3. Run 'python scripts/clean_data.py' to clean data")
+        
         return True
         
     except Exception as e:
         log.error(f"Database setup failed: {e}")
+        import traceback
+        log.error(traceback.format_exc())
         return False
 
 if __name__ == "__main__":
     success = main()
+    if success:
+        print("\n🎉 Database setup completed successfully!")
+    else:
+        print("\n❌ Database setup failed. Check the logs above.")
+    
     sys.exit(0 if success else 1)

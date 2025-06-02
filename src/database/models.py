@@ -221,6 +221,22 @@ class Trade(Base):
         Index('idx_entry_time', 'entry_time'),
     )
 
+
+class FundingRate(Base):
+    __tablename__ = "funding_rates"
+    
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(50), nullable=False)
+    timestamp = Column(DateTime, nullable=False)
+    funding_rate = Column(Float, nullable=False)
+    collect_cycle = Column(Integer, nullable=False)  # en segundos
+    created_at = Column(DateTime, default=func.now())
+    
+    __table_args__ = (
+        Index('idx_funding_symbol_timestamp', 'symbol', 'timestamp', unique=True),
+        Index('idx_funding_timestamp', 'timestamp'),
+    )
+
 class SystemState(Base):
     __tablename__ = "system_state"
     
