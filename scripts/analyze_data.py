@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Data analysis script - FIXED VERSION
+Data analysis script - VERSION WITH IMPROVED PLOTS
 Analyzes cleaned data and generates comprehensive reports and visualizations
 """
 
@@ -9,6 +9,7 @@ import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from datetime import datetime, timedelta
 from sqlalchemy import text
 from pathlib import Path
@@ -20,6 +21,14 @@ from src.utils.logger import get_validation_logger
 from config.settings import settings
 
 log = get_validation_logger()
+
+# Set matplotlib style for better plots
+plt.style.use('default')
+plt.rcParams['figure.facecolor'] = 'white'
+plt.rcParams['axes.facecolor'] = 'white'
+plt.rcParams['font.size'] = 10
+plt.rcParams['axes.grid'] = True
+plt.rcParams['grid.alpha'] = 0.3
 
 def load_cleaned_data(symbol: str) -> Dict:
     """Load cleaned data for analysis"""
@@ -252,7 +261,7 @@ def analyze_ohlcv_patterns(symbol: str, data: Dict) -> Dict:
     return analysis
 
 def create_spread_analysis_plot(symbol: str, analysis: Dict, data: Dict):
-    """Create comprehensive spread analysis plots"""
+    """Create comprehensive spread analysis plots with IMPROVED FORMATTING"""
     log.info(f"Creating spread analysis plot for {symbol}...")
     
     orderbook_df = data['orderbook']
@@ -273,29 +282,44 @@ def create_spread_analysis_plot(symbol: str, analysis: Dict, data: Dict):
         return
     
     threshold = analysis['threshold_p80']
-    
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
     symbol_short = symbol.split('_')[-2] if '_' in symbol else symbol
     
-    # 1. Spread distribution with quality zones
-    axes[0, 0].hist(valid_spreads, bins=100, alpha=0.7, edgecolor='black', density=True)
+    # Create figure with improved layout
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(3, 2, height_ratios=[1, 1, 1], hspace=0.3, wspace=0.25)
     
-    # Mark quality zones
+    # 1. Spread distribution with quality zones (IMPROVED)
+    ax1 = fig.add_subplot(gs[0, 0])
+    
+    # Calculate smart bins and limits
+    spread_99 = valid_spreads.quantile(0.99)
+    spread_display = valid_spreads[valid_spreads <= spread_99]  # Remove extreme outliers for display
+    
+    bins = min(50, max(20, len(spread_display) // 100))
+    n, bins_edges, patches = ax1.hist(spread_display, bins=bins, alpha=0.7, 
+                                     edgecolor='black', density=True, color='skyblue')
+    
+    # Mark quality zones with better visibility
     if threshold > 0:
-        axes[0, 0].axvline(threshold * 0.5, color='green', linestyle='-', linewidth=2, 
-                          label=f'Excellent: ≤{threshold*0.5:.4f}%')
-        axes[0, 0].axvline(threshold, color='orange', linestyle='-', linewidth=2, 
-                          label=f'Good: ≤{threshold:.4f}% (P80)')
-        axes[0, 0].axvline(threshold * 1.5, color='red', linestyle='-', linewidth=2, 
-                          label=f'Fair: ≤{threshold*1.5:.4f}%')
+        ax1.axvline(threshold * 0.5, color='green', linestyle='-', linewidth=3, alpha=0.8,
+                   label=f'Excellent: ≤{threshold*0.5:.3f}%')
+        ax1.axvline(threshold, color='orange', linestyle='-', linewidth=3, alpha=0.8,
+                   label=f'Good: ≤{threshold:.3f}% (P80)')
+        ax1.axvline(threshold * 1.5, color='red', linestyle='-', linewidth=3, alpha=0.8,
+                   label=f'Fair: ≤{threshold*1.5:.3f}%')
     
-    axes[0, 0].set_title(f'{symbol_short} - Spread Distribution with Quality Zones')
-    axes[0, 0].set_xlabel('Spread %')
-    axes[0, 0].set_ylabel('Density')
-    axes[0, 0].legend()
-    axes[0, 0].set_yscale('log')
+    ax1.set_title(f'{symbol_short} - Spread Distribution with Quality Zones', fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Spread %', fontsize=11)
+    ax1.set_ylabel('Density', fontsize=11)
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
     
-    # 2. Quality pie chart
+    # Set smart y-axis limits
+    ax1.set_xlim(0, min(threshold * 2.5 if threshold > 0 else spread_99, spread_99))
+    
+    # 2. Quality pie chart (IMPROVED)
+    ax2 = fig.add_subplot(gs[0, 1])
+    
     quality_counts = [
         analysis['quality_breakdown']['excellent'],
         analysis['quality_breakdown']['good'], 
@@ -304,7 +328,7 @@ def create_spread_analysis_plot(symbol: str, analysis: Dict, data: Dict):
         analysis['quality_breakdown']['invalid']
     ]
     quality_labels = ['Excellent', 'Good', 'Fair', 'Poor', 'Invalid']
-    colors = ['green', 'lightgreen', 'yellow', 'red', 'gray']
+    colors = ['#2ecc71', '#27ae60', '#f39c12', '#e74c3c', '#95a5a6']
     
     # Only show non-zero categories
     non_zero_indices = [i for i, count in enumerate(quality_counts) if count > 0]
@@ -313,81 +337,147 @@ def create_spread_analysis_plot(symbol: str, analysis: Dict, data: Dict):
         filtered_labels = [quality_labels[i] for i in non_zero_indices]
         filtered_colors = [colors[i] for i in non_zero_indices]
         
-        axes[0, 1].pie(filtered_counts, labels=filtered_labels, colors=filtered_colors,
-                       autopct='%1.1f%%', startangle=90)
-        axes[0, 1].set_title(f'{symbol_short} - Data Quality Distribution')
+        wedges, texts, autotexts = ax2.pie(filtered_counts, labels=filtered_labels, colors=filtered_colors,
+                                          autopct='%1.1f%%', startangle=90, textprops={'fontsize': 9})
+        
+        # Improve text visibility
+        for autotext in autotexts:
+            autotext.set_color('white')
+            autotext.set_fontweight('bold')
     else:
-        axes[0, 1].text(0.5, 0.5, 'No quality data available', ha='center', va='center', transform=axes[0, 1].transAxes)
-        axes[0, 1].set_title(f'{symbol_short} - Data Quality Distribution')
+        ax2.text(0.5, 0.5, 'No quality data\navailable', ha='center', va='center', 
+                transform=ax2.transAxes, fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
     
-    # 3. Time series of spreads - sampled for visibility
+    ax2.set_title(f'{symbol_short} - Data Quality Distribution', fontsize=12, fontweight='bold')
+    
+    # 3. Time series of spreads (IMPROVED)
+    ax3 = fig.add_subplot(gs[1, :])  # Full width
+    
     if len(orderbook_df) > 0:
-        # Sample data for plotting if too large
-        sample_size = min(5000, len(orderbook_df))
-        if len(orderbook_df) > sample_size:
-            sample_indices = np.linspace(0, len(orderbook_df)-1, sample_size, dtype=int)
-            sampled_data = orderbook_df.iloc[sample_indices]
+        # Smart sampling for time series
+        max_points = 2000
+        if len(orderbook_df) > max_points:
+            step = len(orderbook_df) // max_points
+            sampled_data = orderbook_df.iloc[::step]
         else:
             sampled_data = orderbook_df
         
         spreads_to_plot = sampled_data[sampled_data['spread_pct'].notna()]
+        
         if len(spreads_to_plot) > 0:
-            axes[1, 0].plot(spreads_to_plot.index, spreads_to_plot['spread_pct'], 
-                           alpha=0.7, linewidth=0.5, marker='.', markersize=1)
-            if threshold > 0:
-                axes[1, 0].axhline(threshold, color='orange', linestyle='--', 
-                                  label=f'P80: {threshold:.4f}%')
-            axes[1, 0].set_title(f'{symbol_short} - Historical Spread Evolution')
-            axes[1, 0].set_xlabel('Time')
-            axes[1, 0].set_ylabel('Spread %')
-            axes[1, 0].legend()
-            axes[1, 0].grid(True, alpha=0.3)
+            # Plot with better formatting
+            ax3.plot(spreads_to_plot.index, spreads_to_plot['spread_pct'], 
+                    alpha=0.6, linewidth=0.8, color='steelblue', marker=None)
             
-            # Limit y-axis to reasonable values
-            y_max = min(threshold * 3 if threshold > 0 else valid_spreads.quantile(0.95), 
-                       valid_spreads.quantile(0.99))
-            axes[1, 0].set_ylim(0, y_max)
+            # Add quality zones as horizontal bands
+            if threshold > 0:
+                ax3.axhline(threshold, color='orange', linestyle='--', linewidth=2, alpha=0.8,
+                           label=f'P80: {threshold:.3f}%')
+                ax3.fill_between(spreads_to_plot.index, 0, threshold*0.5, alpha=0.1, color='green', label='Excellent Zone')
+                ax3.fill_between(spreads_to_plot.index, threshold*0.5, threshold, alpha=0.1, color='yellow', label='Good Zone')
+            
+            ax3.set_title(f'{symbol_short} - Historical Spread Evolution', fontsize=12, fontweight='bold')
+            ax3.set_xlabel('Time', fontsize=11)
+            ax3.set_ylabel('Spread %', fontsize=11)
+            ax3.legend(fontsize=9, loc='upper right')
+            ax3.grid(True, alpha=0.3)
+            
+            # Smart y-axis limits
+            y_max = min(threshold * 4 if threshold > 0 else valid_spreads.quantile(0.95), 
+                       valid_spreads.quantile(0.98))
+            ax3.set_ylim(0, y_max)
+            
+            # Format x-axis dates
+            if len(spreads_to_plot) > 0:
+                ax3.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+                ax3.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+                plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45)
     
-    # 4. Trading readiness over time (daily aggregation)
+    # 4. Trading readiness over time (IMPROVED)
+    ax4 = fig.add_subplot(gs[2, 0])
+    
     if len(orderbook_df) > 0 and 'valid_for_trading' in orderbook_df.columns:
-        # Daily aggregation
+        # Daily aggregation with better sampling
         daily_readiness = orderbook_df.groupby(orderbook_df.index.date).agg({
             'valid_for_trading': 'mean'
         })['valid_for_trading'] * 100
         
-        # Sample if too many days
-        if len(daily_readiness) > 100:
-            sample_indices = np.linspace(0, len(daily_readiness)-1, 100, dtype=int)
-            daily_readiness = daily_readiness.iloc[sample_indices]
+        # Smart sampling for display
+        if len(daily_readiness) > 60:
+            step = len(daily_readiness) // 60
+            daily_readiness = daily_readiness.iloc[::step]
         
         if len(daily_readiness) > 0:
-            axes[1, 1].plot(daily_readiness.index, daily_readiness.values, linewidth=1, marker='o', markersize=2)
-            axes[1, 1].set_title(f'{symbol_short} - Trading Readiness Over Time')
-            axes[1, 1].set_xlabel('Date')
-            axes[1, 1].set_ylabel('Trading Ready %')
-            axes[1, 1].grid(True, alpha=0.3)
-            axes[1, 1].tick_params(axis='x', rotation=45)
+            ax4.plot(daily_readiness.index, daily_readiness.values, 
+                    linewidth=2, marker='o', markersize=3, color='steelblue', alpha=0.8)
             
-            # Add horizontal line at 80%
-            axes[1, 1].axhline(80, color='red', linestyle='--', alpha=0.7, label='80% Target')
-            axes[1, 1].legend()
-        else:
-            axes[1, 1].text(0.5, 0.5, 'No trading readiness data', ha='center', va='center', transform=axes[1, 1].transAxes)
+            # Add target lines
+            ax4.axhline(80, color='red', linestyle='--', alpha=0.7, linewidth=2, label='80% Target')
+            ax4.axhline(60, color='orange', linestyle=':', alpha=0.7, linewidth=1, label='60% Minimum')
+            
+            ax4.set_title(f'{symbol_short} - Trading Readiness Over Time', fontsize=12, fontweight='bold')
+            ax4.set_xlabel('Date', fontsize=11)
+            ax4.set_ylabel('Trading Ready %', fontsize=11)
+            ax4.set_ylim(0, 105)
+            ax4.legend(fontsize=9)
+            ax4.grid(True, alpha=0.3)
+            
+            # Format dates
+            ax4.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+            plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45)
     else:
-        axes[1, 1].text(0.5, 0.5, 'No trading readiness data', ha='center', va='center', transform=axes[1, 1].transAxes)
+        ax4.text(0.5, 0.5, 'No trading readiness\ndata available', ha='center', va='center', 
+                transform=ax4.transAxes, fontsize=11, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+        ax4.set_title(f'{symbol_short} - Trading Readiness', fontsize=12, fontweight='bold')
     
-    plt.tight_layout()
+    # 5. Spread statistics summary (NEW)
+    ax5 = fig.add_subplot(gs[2, 1])
+    ax5.axis('off')
     
-    # Save plot
+    # Create statistics table
+    stats = analysis['spread_stats']['all_valid']
+    stats_text = [
+        ['Metric', 'Value'],
+        ['Mean Spread', f"{stats['mean']:.4f}%"],
+        ['Median Spread', f"{stats['median']:.4f}%"],
+        ['P80 Threshold', f"{threshold:.4f}%"],
+        ['P95 Spread', f"{stats['p95']:.4f}%"],
+        ['Min Spread', f"{stats['min']:.4f}%"],
+        ['Max Spread', f"{stats['max']:.4f}%"],
+        ['Trading Ready', f"{analysis['trading_ready_pct']:.1f}%"],
+        ['Total Records', f"{analysis['total_records']:,}"]
+    ]
+    
+    # Create table with better formatting
+    table = ax5.table(cellText=stats_text[1:], colLabels=stats_text[0],
+                     cellLoc='center', loc='center',
+                     colWidths=[0.6, 0.4])
+    
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 2.0)
+    
+    # Style the table
+    table[(0, 0)].set_facecolor('#3498db')
+    table[(0, 1)].set_facecolor('#3498db')
+    table[(0, 0)].set_text_props(weight='bold', color='white')
+    table[(0, 1)].set_text_props(weight='bold', color='white')
+    
+    ax5.set_title(f'{symbol_short} - Spread Statistics', fontsize=12, fontweight='bold')
+    
+    plt.suptitle(f'{symbol_short} - Comprehensive Spread Analysis', fontsize=14, fontweight='bold', y=0.98)
+    
+    # Save plot with high quality
     plots_dir = Path("plots")
     plots_dir.mkdir(exist_ok=True)
-    plt.savefig(plots_dir / f'{symbol_short}_spread_analysis.png', dpi=300, bbox_inches='tight')
+    plt.savefig(plots_dir / f'{symbol_short}_spread_analysis.png', dpi=300, bbox_inches='tight', 
+                facecolor='white', edgecolor='none')
     plt.close()
     
-    log.info(f"Spread analysis plot saved: plots/{symbol_short}_spread_analysis.png")
+    log.info(f"Improved spread analysis plot saved: plots/{symbol_short}_spread_analysis.png")
 
 def create_ohlcv_analysis_plot(symbol: str, analysis: Dict, data: Dict):
-    """Create OHLCV analysis plots"""
+    """Create OHLCV analysis plots with IMPROVED FORMATTING"""
     log.info(f"Creating OHLCV analysis plot for {symbol}...")
     
     ohlcv_df = data['ohlcv'].copy()
@@ -396,92 +486,188 @@ def create_ohlcv_analysis_plot(symbol: str, analysis: Dict, data: Dict):
         log.warning(f"No OHLCV data to plot for {symbol}")
         return
     
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
     symbol_short = symbol.split('_')[-2] if '_' in symbol else symbol
     
-    # 1. Price evolution - daily aggregation for readability
-    daily_prices = ohlcv_df.groupby(ohlcv_df.index.date)['close'].last()
+    # Create figure with improved layout
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(3, 2, height_ratios=[1.2, 1, 1], hspace=0.3, wspace=0.25)
     
-    # Sample if too many days
-    if len(daily_prices) > 200:
-        sample_indices = np.linspace(0, len(daily_prices)-1, 200, dtype=int)
-        daily_prices = daily_prices.iloc[sample_indices]
+    # 1. Price evolution with volume (IMPROVED)
+    ax1 = fig.add_subplot(gs[0, :])  # Full width
     
-    axes[0, 0].plot(daily_prices.index, daily_prices.values, linewidth=1, alpha=0.8)
-    axes[0, 0].set_title(f'{symbol_short} - Price Evolution ({analysis["data_period"]["total_days"]} days)')
-    axes[0, 0].set_ylabel('Price')
-    axes[0, 0].grid(True, alpha=0.3)
-    axes[0, 0].tick_params(axis='x', rotation=45)
+    # Daily aggregation for better readability
+    daily_data = ohlcv_df.groupby(ohlcv_df.index.date).agg({
+        'close': 'last',
+        'volume': 'sum'
+    })
     
-    # 2. Return distribution
+    # Smart sampling
+    if len(daily_data) > 365:
+        step = len(daily_data) // 365
+        daily_data = daily_data.iloc[::step]
+    
+    # Price plot
+    ax1_twin = ax1.twinx()
+    
+    price_line = ax1.plot(daily_data.index, daily_data['close'], 
+                         linewidth=2, color='steelblue', alpha=0.8, label='Price')
+    ax1.set_ylabel('Price (USDT)', fontsize=11, color='steelblue')
+    ax1.tick_params(axis='y', labelcolor='steelblue')
+    
+    # Volume bars (only show non-zero volume)
+    volume_data = daily_data[daily_data['volume'] > 0]
+    if len(volume_data) > 0:
+        volume_bars = ax1_twin.bar(volume_data.index, volume_data['volume'], 
+                                  alpha=0.3, color='orange', width=1, label='Volume')
+        ax1_twin.set_ylabel('Daily Volume', fontsize=11, color='orange')
+        ax1_twin.tick_params(axis='y', labelcolor='orange')
+    
+    ax1.set_title(f'{symbol_short} - Price Evolution with Volume ({analysis["data_period"]["total_days"]} days)', 
+                 fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Date', fontsize=11)
+    ax1.grid(True, alpha=0.3)
+    
+    # Format dates
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=max(1, len(daily_data)//12)))
+    plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+    
+    # 2. Return distribution (IMPROVED)
+    ax2 = fig.add_subplot(gs[1, 0])
+    
     returns = ohlcv_df['close'].pct_change().dropna() * 100
     if len(returns) > 0:
-        axes[0, 1].hist(returns, bins=50, alpha=0.7, edgecolor='black')
-        axes[0, 1].axvline(0, color='red', linestyle='--', alpha=0.7)
-        axes[0, 1].set_title(f'{symbol_short} - Return Distribution')
-        axes[0, 1].set_xlabel('1-minute Returns %')
-        axes[0, 1].set_ylabel('Frequency')
+        # Remove extreme outliers for better visualization
+        returns_display = returns[(returns >= returns.quantile(0.01)) & (returns <= returns.quantile(0.99))]
+        
+        n, bins, patches = ax2.hist(returns_display, bins=50, alpha=0.7, edgecolor='black', 
+                                   color='lightcoral', density=True)
+        
+        # Add normal distribution overlay
+        mu, sigma = returns_display.mean(), returns_display.std()
+        x = np.linspace(returns_display.min(), returns_display.max(), 100)
+        normal_curve = ((1/(sigma * np.sqrt(2 * np.pi))) * 
+                       np.exp(-0.5 * ((x - mu) / sigma) ** 2))
+        ax2.plot(x, normal_curve, 'k--', linewidth=2, alpha=0.8, label='Normal Distribution')
+        
+        ax2.axvline(0, color='red', linestyle='-', linewidth=2, alpha=0.8, label='Zero Return')
+        ax2.set_title(f'{symbol_short} - Return Distribution', fontsize=12, fontweight='bold')
+        ax2.set_xlabel('1-minute Returns %', fontsize=11)
+        ax2.set_ylabel('Density', fontsize=11)
+        ax2.legend(fontsize=9)
         
         # Add statistics text
         vol = returns.std()
         skew = returns.skew()
-        axes[0, 1].text(0.7, 0.9, f'Volatility: {vol:.3f}%\nSkew: {skew:.2f}\nKurtosis: {returns.kurtosis():.1f}', 
-                       transform=axes[0, 1].transAxes, 
-                       bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.7))
+        kurtosis = returns.kurtosis()
+        
+        stats_text = f'Volatility: {vol:.3f}%\nSkewness: {skew:.2f}\nKurtosis: {kurtosis:.1f}\nSharpe*: {analysis["price_analysis"]["returns"]["sharpe_approx"]:.3f}'
+        ax2.text(0.02, 0.98, stats_text, transform=ax2.transAxes, fontsize=9,
+                verticalalignment='top', bbox=dict(boxstyle="round,pad=0.4", facecolor="lightyellow", alpha=0.8))
     
-    # 3. Volume patterns by hour
+    # 3. Volume patterns by hour (IMPROVED)
+    ax3 = fig.add_subplot(gs[1, 1])
+    
     if 'hourly_volume' in analysis['patterns']:
         hourly_vol = pd.Series(analysis['patterns']['hourly_volume'])
-        bars = axes[1, 0].bar(hourly_vol.index, hourly_vol.values, alpha=0.7)
+        
+        bars = ax3.bar(hourly_vol.index, hourly_vol.values, alpha=0.7, color='steelblue', edgecolor='black')
         
         # Highlight peak hour
         peak_hour = analysis['patterns'].get('peak_volume_hour')
         if peak_hour is not None and peak_hour in hourly_vol.index:
             peak_idx = list(hourly_vol.index).index(peak_hour)
             bars[peak_idx].set_color('red')
+            bars[peak_idx].set_alpha(0.9)
         
-        axes[1, 0].set_title(f'{symbol_short} - Average Volume by Hour (Peak: {peak_hour}:00 UTC)')
-        axes[1, 0].set_xlabel('Hour (UTC)')
-        axes[1, 0].set_ylabel('Average Volume')
-        axes[1, 0].set_xticks(range(0, 24, 2))
-        axes[1, 0].grid(True, alpha=0.3)
+        ax3.set_title(f'{symbol_short} - Average Volume by Hour\n(Peak: {peak_hour}:00 UTC)', 
+                     fontsize=12, fontweight='bold')
+        ax3.set_xlabel('Hour (UTC)', fontsize=11)
+        ax3.set_ylabel('Average Volume', fontsize=11)
+        ax3.set_xticks(range(0, 24, 2))
+        ax3.grid(True, alpha=0.3, axis='y')
+        
+        # Add value labels on bars
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:
+                ax3.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{height:.0f}', ha='center', va='bottom', fontsize=8, rotation=90)
     
-    # 4. Volume distribution (non-zero only)
+    # 4. Volume distribution (IMPROVED)
+    ax4 = fig.add_subplot(gs[2, 0])
+    
     volume_positive = ohlcv_df[ohlcv_df['volume'] > 0]['volume']
     if len(volume_positive) > 0:
-        axes[1, 1].hist(volume_positive, bins=50, alpha=0.7, edgecolor='black')
-        axes[1, 1].set_title(f'{symbol_short} - Volume Distribution')
-        axes[1, 1].set_xlabel('Volume')
-        axes[1, 1].set_ylabel('Frequency')
-        axes[1, 1].set_xscale('log')
-        axes[1, 1].set_yscale('log')
+        # Use log scale for better visualization
+        log_volumes = np.log10(volume_positive)
+        
+        n, bins, patches = ax4.hist(log_volumes, bins=40, alpha=0.7, edgecolor='black', color='lightgreen')
+        
+        ax4.set_title(f'{symbol_short} - Volume Distribution (Log Scale)', fontsize=12, fontweight='bold')
+        ax4.set_xlabel('Log10(Volume)', fontsize=11)
+        ax4.set_ylabel('Frequency', fontsize=11)
+        ax4.grid(True, alpha=0.3)
         
         # Add volume statistics
         mean_vol = volume_positive.mean()
         median_vol = volume_positive.median()
-        axes[1, 1].text(0.7, 0.9, f'Mean: {mean_vol:.0f}\nMedian: {median_vol:.0f}', 
-                       transform=axes[1, 1].transAxes, 
-                       bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.7))
+        max_vol = volume_positive.max()
+        
+        stats_text = f'Mean: {mean_vol:.0f}\nMedian: {median_vol:.0f}\nMax: {max_vol:.0f}\nZero Vol: {analysis["price_analysis"]["volume"]["zero_volume_pct"]:.1f}%'
+        ax4.text(0.02, 0.98, stats_text, transform=ax4.transAxes, fontsize=9,
+                verticalalignment='top', bbox=dict(boxstyle="round,pad=0.4", facecolor="lightblue", alpha=0.8))
     
-    plt.tight_layout()
+    # 5. Price range analysis (NEW)
+    ax5 = fig.add_subplot(gs[2, 1])
     
-    # Save plot
+    # Calculate daily price ranges
+    daily_ranges = ohlcv_df.groupby(ohlcv_df.index.date).agg({
+        'high': 'max',
+        'low': 'min',
+        'close': 'last'
+    })
+    daily_ranges['range_pct'] = (daily_ranges['high'] - daily_ranges['low']) / daily_ranges['close'] * 100
+    
+    # Remove outliers for better visualization
+    range_display = daily_ranges['range_pct']
+    range_clean = range_display[range_display <= range_display.quantile(0.95)]
+    
+    if len(range_clean) > 0:
+        n, bins, patches = ax5.hist(range_clean, bins=30, alpha=0.7, edgecolor='black', color='wheat')
+        
+        mean_range = range_clean.mean()
+        ax5.axvline(mean_range, color='red', linestyle='--', linewidth=2, 
+                   label=f'Mean: {mean_range:.2f}%')
+        
+        ax5.set_title(f'{symbol_short} - Daily Price Range Distribution', fontsize=12, fontweight='bold')
+        ax5.set_xlabel('Daily Range %', fontsize=11)
+        ax5.set_ylabel('Frequency', fontsize=11)
+        ax5.legend(fontsize=9)
+        ax5.grid(True, alpha=0.3)
+    
+    plt.suptitle(f'{symbol_short} - Comprehensive OHLCV Analysis', fontsize=14, fontweight='bold', y=0.98)
+    
+    # Save plot with high quality
     plots_dir = Path("plots")
     plots_dir.mkdir(exist_ok=True)
-    plt.savefig(plots_dir / f'{symbol_short}_ohlcv_analysis.png', dpi=300, bbox_inches='tight')
+    plt.savefig(plots_dir / f'{symbol_short}_ohlcv_analysis.png', dpi=300, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
     plt.close()
     
-    log.info(f"OHLCV analysis plot saved: plots/{symbol_short}_ohlcv_analysis.png")
+    log.info(f"Improved OHLCV analysis plot saved: plots/{symbol_short}_ohlcv_analysis.png")
 
 def create_comparison_report(analyses: Dict):
-    """Create comparison report across all symbols"""
+    """Create IMPROVED comparison report across all symbols"""
     log.info("Creating cross-symbol comparison report...")
     
     if len(analyses) < 2:
         log.warning("Need at least 2 symbols for comparison")
         return
     
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    # Create figure with improved layout
+    fig = plt.figure(figsize=(18, 12))
+    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
     
     # Extract data for comparison
     symbols = []
@@ -490,6 +676,7 @@ def create_comparison_report(analyses: Dict):
     avg_spreads = []
     total_records = []
     data_periods = []
+    volatilities = []
     
     for symbol, data in analyses.items():
         if data and 'spread_analysis' in data and data['spread_analysis']:
@@ -503,80 +690,167 @@ def create_comparison_report(analyses: Dict):
             
             if 'ohlcv_analysis' in data and data['ohlcv_analysis']:
                 data_periods.append(data['ohlcv_analysis']['data_period']['total_days'])
+                volatilities.append(data['ohlcv_analysis']['price_analysis']['returns']['std'])
             else:
                 data_periods.append(0)
+                volatilities.append(0)
     
     if len(symbols) == 0:
         log.warning("No valid data for comparison")
         return
     
-    colors = ['blue', 'orange', 'green', 'red', 'purple', 'brown'][:len(symbols)]
+    # Use distinct colors
+    colors = ['#3498db', '#e74c3c', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c'][:len(symbols)]
     
-    # 1. P80 Thresholds comparison
-    bars1 = axes[0, 0].bar(symbols, thresholds, color=colors, alpha=0.7)
-    axes[0, 0].set_title('P80 Thresholds Comparison')
-    axes[0, 0].set_ylabel('Threshold %')
-    axes[0, 0].tick_params(axis='x', rotation=45)
+    # 1. P80 Thresholds comparison (IMPROVED)
+    ax1 = fig.add_subplot(gs[0, 0])
+    bars1 = ax1.bar(symbols, thresholds, color=colors, alpha=0.8, edgecolor='black')
+    ax1.set_title('P80 Thresholds Comparison', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Threshold %', fontsize=11)
+    ax1.tick_params(axis='x', rotation=45)
+    ax1.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels on bars
     for bar, value in zip(bars1, thresholds):
         height = bar.get_height()
-        axes[0, 0].text(bar.get_x() + bar.get_width()/2., height + height*0.01,
-                       f'{value:.4f}%', ha='center', va='bottom', fontsize=9)
+        ax1.text(bar.get_x() + bar.get_width()/2., height + height*0.02,
+                f'{value:.4f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
     
-    # 2. Trading readiness comparison
-    bars2 = axes[0, 1].bar(symbols, trading_ready_pcts, color=colors, alpha=0.7)
-    axes[0, 1].set_title('Trading Readiness Comparison')
-    axes[0, 1].set_ylabel('Trading Ready %')
-    axes[0, 1].tick_params(axis='x', rotation=45)
-    axes[0, 1].axhline(y=80, color='red', linestyle='--', alpha=0.7, label='80% Target')
-    axes[0, 1].legend()
+    # 2. Trading readiness comparison (IMPROVED)
+    ax2 = fig.add_subplot(gs[0, 1])
+    bars2 = ax2.bar(symbols, trading_ready_pcts, color=colors, alpha=0.8, edgecolor='black')
+    ax2.set_title('Trading Readiness Comparison', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('Trading Ready %', fontsize=11)
+    ax2.tick_params(axis='x', rotation=45)
+    ax2.axhline(y=80, color='red', linestyle='--', alpha=0.8, linewidth=2, label='80% Target')
+    ax2.axhline(y=60, color='orange', linestyle=':', alpha=0.8, linewidth=1, label='60% Minimum')
+    ax2.legend(fontsize=9)
+    ax2.set_ylim(0, 105)
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels
     for bar, value in zip(bars2, trading_ready_pcts):
         height = bar.get_height()
-        axes[0, 1].text(bar.get_x() + bar.get_width()/2., height + 1,
-                       f'{value:.1f}%', ha='center', va='bottom', fontsize=9)
+        ax2.text(bar.get_x() + bar.get_width()/2., height + 2,
+                f'{value:.1f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
     
-    # 3. Data coverage comparison
-    bars3 = axes[1, 0].bar(symbols, data_periods, color=colors, alpha=0.7)
-    axes[1, 0].set_title('Historical Data Coverage')
-    axes[1, 0].set_ylabel('Days of Data')
-    axes[1, 0].tick_params(axis='x', rotation=45)
+    # 3. Data coverage comparison (IMPROVED)
+    ax3 = fig.add_subplot(gs[0, 2])
+    bars3 = ax3.bar(symbols, data_periods, color=colors, alpha=0.8, edgecolor='black')
+    ax3.set_title('Historical Data Coverage', fontsize=12, fontweight='bold')
+    ax3.set_ylabel('Days of Data', fontsize=11)
+    ax3.tick_params(axis='x', rotation=45)
+    ax3.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels
     for bar, value in zip(bars3, data_periods):
         height = bar.get_height()
-        axes[1, 0].text(bar.get_x() + bar.get_width()/2., height + height*0.01,
-                       f'{value}d', ha='center', va='bottom', fontsize=9)
+        ax3.text(bar.get_x() + bar.get_width()/2., height + height*0.02,
+                f'{value}d', ha='center', va='bottom', fontsize=9, fontweight='bold')
     
-    # 4. Summary table
-    axes[1, 1].axis('tight')
-    axes[1, 1].axis('off')
+    # 4. Spread vs Volatility scatter (NEW)
+    ax4 = fig.add_subplot(gs[1, 0])
+    scatter = ax4.scatter(avg_spreads, volatilities, c=colors, s=100, alpha=0.8, edgecolors='black')
     
+    for i, symbol in enumerate(symbols):
+        ax4.annotate(symbol, (avg_spreads[i], volatilities[i]), 
+                    xytext=(5, 5), textcoords='offset points', fontsize=9)
+    
+    ax4.set_title('Spread vs Volatility', fontsize=12, fontweight='bold')
+    ax4.set_xlabel('Average Spread %', fontsize=11)
+    ax4.set_ylabel('Volatility %', fontsize=11)
+    ax4.grid(True, alpha=0.3)
+    
+    # 5. Trading efficiency radar-like comparison (NEW)
+    ax5 = fig.add_subplot(gs[1, 1])
+    
+    # Normalize metrics for comparison (0-100 scale)
+    norm_readiness = np.array(trading_ready_pcts)
+    norm_coverage = np.array(data_periods) / max(data_periods) * 100 if max(data_periods) > 0 else np.zeros(len(symbols))
+    norm_records = np.array(total_records) / max(total_records) * 100 if max(total_records) > 0 else np.zeros(len(symbols))
+    
+    x = np.arange(len(symbols))
+    width = 0.25
+    
+    bars_readiness = ax5.bar(x - width, norm_readiness, width, label='Trading Ready %', color='steelblue', alpha=0.8)
+    bars_coverage = ax5.bar(x, norm_coverage, width, label='Coverage (normalized)', color='orange', alpha=0.8)
+    bars_records = ax5.bar(x + width, norm_records, width, label='Records (normalized)', color='green', alpha=0.8)
+    
+    ax5.set_title('Trading Efficiency Comparison', fontsize=12, fontweight='bold')
+    ax5.set_ylabel('Normalized Score (0-100)', fontsize=11)
+    ax5.set_xticks(x)
+    ax5.set_xticklabels(symbols, rotation=45)
+    ax5.legend(fontsize=9)
+    ax5.grid(True, alpha=0.3, axis='y')
+    
+    # 6. Enhanced summary table (IMPROVED)
+    ax6 = fig.add_subplot(gs[1, 2])
+    ax6.axis('tight')
+    ax6.axis('off')
+    
+    # Create comprehensive table data
     table_data = []
     for i, symbol in enumerate(symbols):
+        # Determine status based on trading readiness
+        if trading_ready_pcts[i] >= 75:
+            status = "🟢 Excellent"
+        elif trading_ready_pcts[i] >= 60:
+            status = "🟡 Good"
+        elif trading_ready_pcts[i] >= 40:
+            status = "🟠 Fair"
+        else:
+            status = "🔴 Poor"
+        
         table_data.append([
             symbol,
             f"{thresholds[i]:.4f}%",
             f"{trading_ready_pcts[i]:.1f}%",
             f"{avg_spreads[i]:.4f}%",
-            f"{total_records[i]:,}",
-            f"{data_periods[i]}d"
+            f"{data_periods[i]}d",
+            status
         ])
     
-    table = axes[1, 1].table(cellText=table_data,
-                           colLabels=['Symbol', 'P80 Threshold', 'Trading Ready', 'Avg Spread', 'Records', 'Days'],
-                           cellLoc='center',
-                           loc='center')
+    table = ax6.table(cellText=table_data,
+                     colLabels=['Symbol', 'P80 Threshold', 'Ready %', 'Avg Spread', 'Days', 'Status'],
+                     cellLoc='center',
+                     loc='center')
+    
     table.auto_set_font_size(False)
-    table.set_fontsize(8)
-    table.scale(1.2, 1.5)
-    axes[1, 1].set_title('Analysis Summary')
+    table.set_fontsize(9)
+    table.scale(1.0, 2.0)
     
-    plt.tight_layout()
+    # Style the table header
+    for i in range(6):
+        table[(0, i)].set_facecolor('#3498db')
+        table[(0, i)].set_text_props(weight='bold', color='white')
     
-    # Save comparison plot
+    # Style rows based on status
+    for i, row in enumerate(table_data):
+        status = row[5]
+        if "Excellent" in status:
+            color = '#d5f4e6'
+        elif "Good" in status:
+            color = '#fff3cd'
+        elif "Fair" in status:
+            color = '#f8d7da'
+        else:
+            color = '#f5c6cb'
+        
+        for j in range(6):
+            table[(i+1, j)].set_facecolor(color)
+    
+    ax6.set_title('Analysis Summary', fontsize=12, fontweight='bold')
+    
+    plt.suptitle('Cross-Symbol Trading Analysis Comparison', fontsize=16, fontweight='bold', y=0.98)
+    
+    # Save plot with high quality
     plots_dir = Path("plots")
     plots_dir.mkdir(exist_ok=True)
-    plt.savefig(plots_dir / 'symbols_comparison.png', dpi=300, bbox_inches='tight')
+    plt.savefig(plots_dir / 'symbols_comparison.png', dpi=300, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
     plt.close()
     
-    log.info("Comparison plot saved: plots/symbols_comparison.png")
+    log.info("Improved comparison plot saved: plots/symbols_comparison.png")
 
 def generate_comprehensive_report(analyses: Dict):
     """Generate comprehensive analysis report"""
@@ -745,17 +1019,17 @@ def generate_comprehensive_report(analyses: Dict):
     log.info(f"\nFINAL RECOMMENDATIONS:")
     log.info("-" * 50)
     if avg_trading_ready_pct >= 75:
-        log.info(f"EXCELLENT data quality across symbols - Ready for production trading")
+        log.info(f"✅ EXCELLENT data quality across symbols - Ready for production trading")
     elif avg_trading_ready_pct >= 60:
-        log.info(f"GOOD data quality - Suitable for trading with standard risk management")
+        log.info(f"✅ GOOD data quality - Suitable for trading with standard risk management")
     elif avg_trading_ready_pct >= 40:
-        log.info(f"FAIR data quality - Consider additional filtering or risk controls")
+        log.info(f"⚠️  FAIR data quality - Consider additional filtering or risk controls")
     else:
-        log.info(f"POOR data quality - Review data sources and improve filtering")
+        log.info(f"❌ POOR data quality - Review data sources and improve filtering")
     
-    log.info(f"Use P80-based quality filtering for optimal results")
-    log.info(f"Monitor real-time spread quality during live trading")
-    log.info(f"Regular re-analysis recommended as new data arrives")
+    log.info(f"📊 Use P80-based quality filtering for optimal results")
+    log.info(f"📈 Monitor real-time spread quality during live trading")
+    log.info(f"🔄 Regular re-analysis recommended as new data arrives")
 
 def main():
     """Main analysis function"""
