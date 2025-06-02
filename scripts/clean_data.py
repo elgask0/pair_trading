@@ -2,6 +2,7 @@
 """
 Data cleaning script - FIXED VERSION
 Calculates P80 thresholds and marks data quality without deleting any data
+FIXED: NumPy data type conversion issue
 """
 
 import sys
@@ -86,6 +87,9 @@ def calculate_p80_threshold(symbol: str) -> float:
         # Calculate P80 (80th percentile)
         p80_threshold = np.percentile(clean_spreads, 80)
         
+        # FIXED: Convert NumPy type to native Python float
+        p80_threshold = float(p80_threshold)
+        
         # Ensure minimum threshold of 0.001% to avoid zero
         p80_threshold = max(p80_threshold, 0.001)
         
@@ -101,6 +105,9 @@ def calculate_p80_threshold(symbol: str) -> float:
 def mark_data_quality(symbol: str, threshold: float):
     """Mark data quality based on P80 threshold - IMPROVED VERSION"""
     log.info(f"Marking data quality for {symbol} with P80 threshold {threshold:.4f}%...")
+    
+    # FIXED: Ensure threshold is native Python float
+    threshold = float(threshold)
     
     with db_manager.get_session() as session:
         # 1. Reset all quality fields first
@@ -141,8 +148,9 @@ def mark_data_quality(symbol: str, threshold: float):
         """), {'symbol': symbol})
         
         # 4. Classify valid spreads based on P80 thresholds
-        excellent_threshold = threshold * 0.5  # 50% of P80
-        fair_threshold = threshold * 1.5       # 150% of P80
+        # FIXED: Convert all thresholds to native Python float
+        excellent_threshold = float(threshold * 0.5)  # 50% of P80
+        fair_threshold = float(threshold * 1.5)       # 150% of P80
         
         # Excellent (≤50% of P80)
         session.execute(text("""
