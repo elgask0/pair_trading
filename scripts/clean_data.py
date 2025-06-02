@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Data cleaning script
+Data cleaning script - FIXED VERSION
 Calculates P80 thresholds and marks data quality without deleting any data
 """
 
@@ -47,11 +47,11 @@ def check_if_already_processed(symbol: str) -> bool:
         return False
 
 def calculate_p80_threshold(symbol: str) -> float:
-    """Calculate P80 threshold for spread quality"""
+    """Calculate P80 threshold for spread quality - FIXED VERSION"""
     log.info(f"Calculating P80 threshold for {symbol}...")
     
     with db_manager.get_session() as session:
-        # Get spread data for valid quotes only
+        # Get ALL valid spread data - not ordered to save memory
         result = session.execute(text("""
             SELECT (ask1_price - bid1_price) / bid1_price * 100 as spread_pct
             FROM orderbook 
@@ -61,59 +61,86 @@ def calculate_p80_threshold(symbol: str) -> float:
             AND bid1_price > 0 
             AND ask1_price > 0
             AND bid1_price < ask1_price
-            ORDER BY spread_pct
+            AND ask1_price > bid1_price * 1.00001
         """), {'symbol': symbol}).fetchall()
         
         if not result:
             log.warning(f"No valid spread data for {symbol}")
             return 0.1  # Default fallback
         
-        spreads = [row.spread_pct for row in result]
+        spreads = [row.spread_pct for row in result if row.spread_pct is not None]
+        
+        if len(spreads) == 0:
+            log.warning(f"No valid spread calculations for {symbol}")
+            return 0.1
+        
         spreads_array = np.array(spreads)
         
+        # Remove potential outliers (>10% spread is unrealistic)
+        clean_spreads = spreads_array[spreads_array <= 10.0]
+        
+        if len(clean_spreads) == 0:
+            log.warning(f"No reasonable spreads for {symbol} after filtering")
+            return 0.1
+        
         # Calculate P80 (80th percentile)
-        p80_threshold = np.percentile(spreads_array, 80)
+        p80_threshold = np.percentile(clean_spreads, 80)
+        
+        # Ensure minimum threshold of 0.001% to avoid zero
+        p80_threshold = max(p80_threshold, 0.001)
         
         log.info(f"P80 threshold for {symbol}: {p80_threshold:.4f}%")
-        log.info(f"  Based on {len(spreads):,} valid spread observations")
-        log.info(f"  Min spread: {spreads_array.min():.4f}%")
-        log.info(f"  Median spread: {np.median(spreads_array):.4f}%")
-        log.info(f"  Max spread: {spreads_array.max():.4f}%")
+        log.info(f"  Based on {len(clean_spreads):,} valid spread observations")
+        log.info(f"  Min spread: {clean_spreads.min():.4f}%")
+        log.info(f"  Median spread: {np.median(clean_spreads):.4f}%")
+        log.info(f"  P90 spread: {np.percentile(clean_spreads, 90):.4f}%")
+        log.info(f"  Max reasonable spread: {clean_spreads.max():.4f}%")
         
         return p80_threshold
 
 def mark_data_quality(symbol: str, threshold: float):
-    """Mark data quality based on P80 threshold - NON-DESTRUCTIVE"""
+    """Mark data quality based on P80 threshold - IMPROVED VERSION"""
     log.info(f"Marking data quality for {symbol} with P80 threshold {threshold:.4f}%...")
     
     with db_manager.get_session() as session:
-        # 1. First, calculate spread_pct for all records and set threshold
+        # 1. Reset all quality fields first
         session.execute(text("""
             UPDATE orderbook 
-            SET spread_pct = ((ask1_price - bid1_price) / bid1_price * 100),
+            SET liquidity_quality = NULL,
+                valid_for_trading = FALSE,
+                spread_pct = NULL,
                 threshold_p80 = :threshold
+            WHERE symbol = :symbol
+        """), {'symbol': symbol, 'threshold': threshold})
+        
+        # 2. Calculate spread_pct for valid quotes only
+        session.execute(text("""
+            UPDATE orderbook 
+            SET spread_pct = ((ask1_price - bid1_price) / bid1_price * 100)
             WHERE symbol = :symbol 
             AND bid1_price IS NOT NULL 
             AND ask1_price IS NOT NULL
-            AND bid1_price > 0
+            AND bid1_price > 0 
             AND ask1_price > 0
-        """), {'symbol': symbol, 'threshold': threshold})
+            AND bid1_price < ask1_price
+        """), {'symbol': symbol})
         
-        # 2. Mark records with invalid spreads (crossed or null)
+        # 3. Mark records with invalid spreads
         session.execute(text("""
             UPDATE orderbook 
             SET liquidity_quality = 'Invalid',
-                valid_for_trading = FALSE,
-                spread_pct = NULL
+                valid_for_trading = FALSE
             WHERE symbol = :symbol 
             AND (bid1_price IS NULL 
                  OR ask1_price IS NULL 
                  OR bid1_price <= 0 
                  OR ask1_price <= 0
-                 OR bid1_price >= ask1_price)
+                 OR bid1_price >= ask1_price
+                 OR spread_pct IS NULL
+                 OR spread_pct > 10.0)
         """), {'symbol': symbol})
         
-        # 3. Classify valid spreads based on P80 thresholds
+        # 4. Classify valid spreads based on P80 thresholds
         excellent_threshold = threshold * 0.5  # 50% of P80
         fair_threshold = threshold * 1.5       # 150% of P80
         
@@ -124,6 +151,7 @@ def mark_data_quality(symbol: str, threshold: float):
             WHERE symbol = :symbol 
             AND spread_pct IS NOT NULL
             AND spread_pct <= :excellent_threshold
+            AND liquidity_quality IS NULL
         """), {'symbol': symbol, 'excellent_threshold': excellent_threshold})
         
         # Good (50% < spread ≤ P80)
@@ -134,6 +162,7 @@ def mark_data_quality(symbol: str, threshold: float):
             AND spread_pct IS NOT NULL
             AND spread_pct > :excellent_threshold 
             AND spread_pct <= :threshold
+            AND liquidity_quality IS NULL
         """), {'symbol': symbol, 'excellent_threshold': excellent_threshold, 'threshold': threshold})
         
         # Fair (P80 < spread ≤ 150% of P80)
@@ -144,6 +173,7 @@ def mark_data_quality(symbol: str, threshold: float):
             AND spread_pct IS NOT NULL
             AND spread_pct > :threshold 
             AND spread_pct <= :fair_threshold
+            AND liquidity_quality IS NULL
         """), {'symbol': symbol, 'threshold': threshold, 'fair_threshold': fair_threshold})
         
         # Poor (>150% of P80)
@@ -153,9 +183,10 @@ def mark_data_quality(symbol: str, threshold: float):
             WHERE symbol = :symbol 
             AND spread_pct IS NOT NULL
             AND spread_pct > :fair_threshold
+            AND liquidity_quality IS NULL
         """), {'symbol': symbol, 'fair_threshold': fair_threshold})
         
-        # 4. Verify results and log summary
+        # 5. Verify results and log summary
         result = session.execute(text("""
             SELECT 
                 COUNT(*) as total,
@@ -165,7 +196,8 @@ def mark_data_quality(symbol: str, threshold: float):
                 COUNT(CASE WHEN liquidity_quality = 'Fair' THEN 1 END) as fair,
                 COUNT(CASE WHEN liquidity_quality = 'Poor' THEN 1 END) as poor,
                 COUNT(CASE WHEN liquidity_quality = 'Invalid' THEN 1 END) as invalid,
-                AVG(CASE WHEN spread_pct IS NOT NULL THEN spread_pct END) as avg_valid_spread
+                COUNT(CASE WHEN liquidity_quality IS NULL THEN 1 END) as unprocessed,
+                AVG(CASE WHEN spread_pct IS NOT NULL AND spread_pct <= 10.0 THEN spread_pct END) as avg_valid_spread
             FROM orderbook 
             WHERE symbol = :symbol
         """), {'symbol': symbol}).fetchone()
@@ -179,6 +211,8 @@ def mark_data_quality(symbol: str, threshold: float):
         log.info(f"    Fair: {result.fair:,} ({result.fair/result.total*100:.1f}%)")
         log.info(f"    Poor: {result.poor:,} ({result.poor/result.total*100:.1f}%)")
         log.info(f"    Invalid: {result.invalid:,} ({result.invalid/result.total*100:.1f}%)")
+        if result.unprocessed > 0:
+            log.warning(f"    Unprocessed: {result.unprocessed:,} ({result.unprocessed/result.total*100:.1f}%)")
         log.info(f"  Average valid spread: {result.avg_valid_spread:.4f}%")
         
         return {
@@ -192,9 +226,10 @@ def mark_data_quality(symbol: str, threshold: float):
                 'good': result.good,
                 'fair': result.fair,
                 'poor': result.poor,
-                'invalid': result.invalid
+                'invalid': result.invalid,
+                'unprocessed': result.unprocessed
             },
-            'avg_valid_spread': result.avg_valid_spread
+            'avg_valid_spread': result.avg_valid_spread or 0
         }
 
 def clean_symbol_data(symbol: str, force_recalculate: bool = False) -> Dict:
