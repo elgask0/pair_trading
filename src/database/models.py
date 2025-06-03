@@ -237,6 +237,39 @@ class FundingRate(Base):
         Index('idx_funding_timestamp', 'timestamp'),
     )
 
+class MarkPrice(Base):
+    __tablename__ = "mark_prices"
+    
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(50), nullable=False)
+    timestamp = Column(DateTime, nullable=False)
+    
+    # VWAP Mark price calculado
+    mark_price = Column(Float, nullable=False)
+    
+    # Componentes del cálculo
+    orderbook_mid = Column(Float)  # Simple (bid1 + ask1) / 2 para comparación
+    ohlcv_close = Column(Float)    # Precio de OHLCV para validación
+    
+    # Métricas de calidad del VWAP
+    bid_ask_spread_pct = Column(Float)     # Spread VWAP weighted
+    price_deviation_pct = Column(Float)    # Diferencia VWAP vs OHLCV close
+    liquidity_score = Column(Float)        # Score combinado de calidad
+    
+    # Flags de validación
+    is_valid = Column(Boolean, default=True)
+    validation_source = Column(String(30))  # 'vwap_validated', 'vwap_minor_deviation', etc.
+    
+    # Metadatos
+    created_at = Column(DateTime, default=func.now())
+    
+    __table_args__ = (
+        Index('idx_markprice_symbol_timestamp', 'symbol', 'timestamp', unique=True),
+        Index('idx_markprice_timestamp', 'timestamp'),
+        Index('idx_markprice_valid', 'symbol', 'is_valid', 'timestamp'),
+        Index('idx_markprice_quality', 'symbol', 'liquidity_score', 'timestamp'),
+    )
+
 class SystemState(Base):
     __tablename__ = "system_state"
     

@@ -220,8 +220,47 @@ def migrate_funding_rates_data():
         log.error(f"Funding rates data migration failed: {e}")
         return False
 
+# REEMPLAZAR la función run_all_migrations() existente por esta:
+
+def run_all_migrations():
+    """Run all necessary migrations to bring schema up to date - UPDATED"""
+    log.info("Running all database migrations...")
+    
+    try:
+        # 1. Create base tables
+        create_all_tables()
+        
+        # 2. Add data quality columns if needed
+        if not check_data_quality_schema():
+            add_data_quality_columns()
+        
+        # 3. Create funding rates table if needed  
+        if not check_funding_rates_schema():
+            create_funding_rates_table()
+        
+        # 4. Create mark prices table if needed (NEW)
+        if not check_mark_prices_schema():
+            create_mark_prices_table()
+        
+        # 5. Run any data migrations
+        migrate_funding_rates_data()
+        
+        log.info("All migrations completed successfully")
+        
+        # Log final schema state
+        schema_info = get_schema_version()
+        log.info(f"Final schema state: {schema_info}")
+        
+        return True
+        
+    except Exception as e:
+        log.error(f"Migration failed: {e}")
+        return False
+
+# REEMPLAZAR la función get_schema_version() existente por esta:
+
 def get_schema_version():
-    """Get current schema version"""
+    """Get current schema version - UPDATED"""
     try:
         with db_manager.get_session() as session:
             # Check what tables exist to determine schema version
@@ -238,6 +277,7 @@ def get_schema_version():
                 'has_base_tables': 'symbols' in existing_tables and 'ohlcv' in existing_tables,
                 'has_orderbook': 'orderbook' in existing_tables,
                 'has_funding_rates': 'funding_rates' in existing_tables,
+                'has_mark_prices': 'mark_prices' in existing_tables,  # NEW
                 'has_data_quality': check_data_quality_schema(),
                 'total_tables': len(existing_tables),
                 'table_list': existing_tables
@@ -248,34 +288,100 @@ def get_schema_version():
     except Exception as e:
         log.error(f"Failed to get schema version: {e}")
         return {'error': str(e)}
-
-def run_all_migrations():
-    """Run all necessary migrations to bring schema up to date"""
-    log.info("Running all database migrations...")
-    
+        
+def create_mark_prices_table():
+    """Create mark prices table if it doesn't exist"""
     try:
-        # 1. Create base tables
-        create_all_tables()
-        
-        # 2. Add data quality columns if needed
-        if not check_data_quality_schema():
-            add_data_quality_columns()
-        
-        # 3. Create funding rates table if needed  
-        if not check_funding_rates_schema():
-            create_funding_rates_table()
-        
-        # 4. Run any data migrations
-        migrate_funding_rates_data()
-        
-        log.info("All migrations completed successfully")
-        
-        # Log final schema state
-        schema_info = get_schema_version()
-        log.info(f"Final schema state: {schema_info}")
-        
-        return True
-        
+        with db_manager.get_session() as session:
+            # Check if table already exists
+            result = session.execute(text("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_name = 'mark_prices'
+            """)).fetchone()
+            
+            if result:
+                log.info("Mark prices table already exists")
+                return True
+            
+            # Create the table
+            session.execute(text("""
+                CREATE TABLE mark_prices (
+                    id SERIAL PRIMARY KEY,
+                    symbol VARCHAR(50) NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    mark_price FLOAT NOT NULL,
+                    orderbook_mid FLOAT,
+                    ohlcv_close FLOAT,
+                    bid_ask_spread_pct FLOAT,
+                    price_deviation_pct FLOAT,
+                    liquidity_score FLOAT,
+                    is_valid BOOLEAN DEFAULT TRUE,
+                    validation_source VARCHAR(30),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, timestamp)
+                );
+            """))
+            
+            # Create indexes
+            session.execute(text("""
+                CREATE INDEX idx_markprice_symbol_timestamp 
+                ON mark_prices(symbol, timestamp);
+            """))
+            session.execute(text("""
+                CREATE INDEX idx_markprice_timestamp 
+                ON mark_prices(timestamp);
+            """))
+            session.execute(text("""
+                CREATE INDEX idx_markprice_valid 
+                ON mark_prices(symbol, is_valid, timestamp);
+            """))
+            session.execute(text("""
+                CREATE INDEX idx_markprice_quality 
+                ON mark_prices(symbol, liquidity_score, timestamp);
+            """))
+            
+            log.info("Mark prices table created successfully")
+            return True
+            
     except Exception as e:
-        log.error(f"Migration failed: {e}")
-        return False
+        log.error(f"Failed to create mark prices table: {e}")
+        raise DatabaseError(f"Mark prices table creation failed: {e}")
+
+def check_mark_prices_schema():
+    """Check if mark prices table exists and has correct schema"""
+    with db_manager.get_session() as session:
+        try:
+            # Check if table exists
+            result = session.execute(text("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_name = 'mark_prices'
+            """)).fetchone()
+            
+            if not result:
+                log.info("Mark prices table does not exist")
+                return False
+            
+            # Check if all required columns exist
+            columns_result = session.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'mark_prices'
+                AND column_name IN ('symbol', 'timestamp', 'mark_price', 'is_valid')
+            """)).fetchall()
+            
+            existing_columns = [row[0] for row in columns_result]
+            required_columns = ['symbol', 'timestamp', 'mark_price', 'is_valid']
+            missing_columns = [col for col in required_columns if col not in existing_columns]
+            
+            if missing_columns:
+                log.warning(f"Mark prices table exists but missing columns: {missing_columns}")
+                return False
+            
+            log.info("Mark prices table schema is correct")
+            return True
+                
+        except Exception as e:
+            log.error(f"Failed to check mark prices schema: {e}")
+            return False
