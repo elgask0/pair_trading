@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Liquidity analysis script - SIMPLIFIED VERSION
-Analyzes market liquidity using orderbook data with focus on practical metrics
+Enhanced liquidity analysis script - IMPROVED VERSION
+Analyzes market liquidity using ALL available orderbook data with comprehensive slippage analysis
 """
 
 import sys
@@ -9,7 +9,7 @@ import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+import seaborn as sns
 from datetime import datetime, timedelta
 from sqlalchemy import text
 from pathlib import Path
@@ -22,30 +22,56 @@ from config.settings import settings
 
 log = get_validation_logger()
 
-# Set matplotlib style
+# Enhanced matplotlib settings
 plt.style.use('default')
 plt.rcParams['figure.facecolor'] = 'white'
 plt.rcParams['axes.facecolor'] = 'white'
 plt.rcParams['font.size'] = 10
 plt.rcParams['axes.grid'] = True
 plt.rcParams['grid.alpha'] = 0.3
+sns.set_palette("husl")
 
-def load_orderbook_data(symbol: str, days: int = 7) -> pd.DataFrame:
-    """Load recent orderbook data for analysis"""
-    log.info(f"Loading orderbook data for {symbol} (last {days} days)...")
+def get_data_range(symbol: str) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """Get full data range for symbol"""
+    with db_manager.get_session() as session:
+        result = session.execute(text("""
+            SELECT MIN(timestamp) as min_ts, MAX(timestamp) as max_ts, COUNT(*) as total_records
+            FROM orderbook 
+            WHERE symbol = :symbol
+            AND bid1_price IS NOT NULL 
+            AND ask1_price IS NOT NULL
+        """), {'symbol': symbol}).fetchone()
+        
+        return result.min_ts, result.max_ts, result.total_records
+
+def load_all_orderbook_data(symbol: str, max_records: int = 100000) -> pd.DataFrame:
+    """Load ALL available orderbook data for comprehensive analysis"""
+    min_date, max_date, total_records = get_data_range(symbol)
     
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=days)
+    if not min_date or not max_date:
+        log.warning(f"No orderbook data found for {symbol}")
+        return pd.DataFrame()
+    
+    log.info(f"Loading orderbook data for {symbol}:")
+    log.info(f"  Period: {min_date} to {max_date}")
+    log.info(f"  Total records available: {total_records:,}")
+    
+    # If too much data, sample intelligently
+    sample_clause = ""
+    if total_records > max_records:
+        sample_rate = max_records / total_records
+        sample_clause = f"TABLESAMPLE SYSTEM ({sample_rate * 100:.2f})"
+        log.info(f"  Sampling {sample_rate:.1%} of data ({max_records:,} records)")
     
     with db_manager.get_session() as session:
-        query = text("""
+        query = text(f"""
             SELECT 
                 timestamp,
                 bid1_price, bid1_size, bid2_price, bid2_size, bid3_price, bid3_size,
                 bid4_price, bid4_size, bid5_price, bid5_size,
                 ask1_price, ask1_size, ask2_price, ask2_size, ask3_price, ask3_size,
                 ask4_price, ask4_size, ask5_price, ask5_size
-            FROM orderbook 
+            FROM orderbook {sample_clause}
             WHERE symbol = :symbol 
             AND timestamp >= :start_date 
             AND timestamp <= :end_date
@@ -56,23 +82,20 @@ def load_orderbook_data(symbol: str, days: int = 7) -> pd.DataFrame:
         
         df = pd.read_sql(query, session.bind, params={
             'symbol': symbol,
-            'start_date': start_date,
-            'end_date': end_date
+            'start_date': min_date,
+            'end_date': max_date
         }, index_col='timestamp')
         
-        log.info(f"Loaded {len(df):,} orderbook snapshots")
+        log.info(f"  Loaded: {len(df):,} orderbook snapshots")
         return df
 
-def calculate_simple_slippage(row: pd.Series, order_size_usd: float, side: str = 'buy') -> Dict:
-    """
-    Calculate slippage for a given order size using top 5 levels
-    Simplified version focusing on practical order sizes
-    """
+def calculate_enhanced_slippage(row: pd.Series, order_size_usd: float, side: str = 'buy') -> Dict:
+    """Enhanced slippage calculation with more detailed metrics"""
     
     levels = []
     prefix = 'ask' if side == 'buy' else 'bid'
     
-    # Extract top 5 levels only
+    # Extract top 5 levels
     for i in range(1, 6):
         price = row.get(f'{prefix}{i}_price')
         size = row.get(f'{prefix}{i}_size')
@@ -81,11 +104,20 @@ def calculate_simple_slippage(row: pd.Series, order_size_usd: float, side: str =
             levels.append({
                 'price': price,
                 'size': size,
-                'value_usd': price * size
+                'value_usd': price * size,
+                'level': i
             })
     
     if not levels:
-        return {'can_execute': False, 'slippage_pct': None, 'levels_used': 0}
+        return {
+            'can_execute': False,
+            'slippage_pct': np.nan,
+            'slippage_bps': np.nan,
+            'levels_used': 0,
+            'liquidity_consumed_pct': 0,
+            'worst_price': np.nan,
+            'price_impact': np.nan
+        }
     
     # Sort by price (best first)
     levels.sort(key=lambda x: x['price'], reverse=(side == 'sell'))
@@ -95,6 +127,7 @@ def calculate_simple_slippage(row: pd.Series, order_size_usd: float, side: str =
     total_value = 0
     total_coins = 0
     levels_used = 0
+    total_liquidity = sum(level['value_usd'] for level in levels)
     
     for level in levels:
         if remaining_usd <= 0:
@@ -117,428 +150,606 @@ def calculate_simple_slippage(row: pd.Series, order_size_usd: float, side: str =
             remaining_usd -= available_usd
     
     if remaining_usd > 0:
-        return {'can_execute': False, 'slippage_pct': None, 'levels_used': levels_used}
+        return {
+            'can_execute': False,
+            'slippage_pct': np.nan,
+            'slippage_bps': np.nan,
+            'levels_used': levels_used,
+            'liquidity_consumed_pct': 100,  # Not enough liquidity
+            'worst_price': levels[-1]['price'] if levels else np.nan,
+            'price_impact': np.nan
+        }
     
-    # Calculate slippage
+    # Calculate enhanced metrics
     avg_price = total_value / total_coins
     best_price = levels[0]['price']
+    worst_price = levels[levels_used-1]['price'] if levels_used > 0 else best_price
+    
     slippage_pct = abs(avg_price - best_price) / best_price * 100
+    slippage_bps = slippage_pct * 100  # basis points
+    liquidity_consumed_pct = (order_size_usd / total_liquidity) * 100 if total_liquidity > 0 else 100
+    price_impact = abs(worst_price - best_price) / best_price * 100
     
     return {
         'can_execute': True,
         'slippage_pct': slippage_pct,
+        'slippage_bps': slippage_bps,
+        'levels_used': levels_used,
+        'liquidity_consumed_pct': liquidity_consumed_pct,
+        'worst_price': worst_price,
+        'price_impact': price_impact,
         'avg_price': avg_price,
-        'best_price': best_price,
-        'levels_used': levels_used
+        'best_price': best_price
     }
 
-def analyze_liquidity_metrics(symbol: str, orderbook_df: pd.DataFrame) -> Dict:
-    """Analyze key liquidity metrics"""
-    log.info(f"Analyzing liquidity metrics for {symbol}...")
+def analyze_comprehensive_slippage(symbol: str, orderbook_df: pd.DataFrame) -> Dict:
+    """Comprehensive slippage analysis with detailed statistics"""
+    log.info(f"Analyzing comprehensive slippage metrics for {symbol}...")
     
-    # Standard order sizes to test
-    order_sizes = [100, 500, 1000, 2000, 5000]  # USD
+    # Extended order sizes for better analysis
+    order_sizes = [100, 200, 500, 1000, 2000, 5000, 10000]  # USD
     
     results = {
         'timestamps': orderbook_df.index.tolist(),
-        'slippage_analysis': {},
-        'spread_analysis': {},
-        'depth_analysis': {}
+        'detailed_slippage': {},
+        'distribution_stats': {},
+        'execution_reliability': {}
     }
     
-    # Calculate slippage for different order sizes
     for size in order_sizes:
-        buy_slippages = []
-        sell_slippages = []
-        execution_rates = []
+        log.info(f"  Processing ${size} orders...")
         
-        for idx, row in orderbook_df.iterrows():
-            # Buy side
-            buy_result = calculate_simple_slippage(row, size, 'buy')
-            if buy_result['can_execute']:
-                buy_slippages.append(buy_result['slippage_pct'])
-            
-            # Sell side  
-            sell_result = calculate_simple_slippage(row, size, 'sell')
-            if sell_result['can_execute']:
-                sell_slippages.append(sell_result['slippage_pct'])
-            
-            # Execution rate (can execute both sides)
-            can_execute_both = buy_result['can_execute'] and sell_result['can_execute']
-            execution_rates.append(can_execute_both)
-        
-        results['slippage_analysis'][size] = {
-            'buy_slippage_mean': np.mean(buy_slippages) if buy_slippages else None,
-            'buy_slippage_p95': np.percentile(buy_slippages, 95) if buy_slippages else None,
-            'sell_slippage_mean': np.mean(sell_slippages) if sell_slippages else None,
-            'sell_slippage_p95': np.percentile(sell_slippages, 95) if sell_slippages else None,
-            'execution_rate': np.mean(execution_rates) * 100
+        buy_data = {
+            'slippage_pct': [],
+            'slippage_bps': [],
+            'levels_used': [],
+            'liquidity_consumed': [],
+            'price_impact': [],
+            'execution_success': []
         }
-    
-    # Calculate spreads
-    valid_spreads = []
-    for idx, row in orderbook_df.iterrows():
-        bid = row.get('bid1_price')
-        ask = row.get('ask1_price')
-        if pd.notna(bid) and pd.notna(ask) and bid > 0 and ask > 0:
-            spread_pct = (ask - bid) / bid * 100
-            if spread_pct < 10:  # Reasonable spread
-                valid_spreads.append(spread_pct)
-    
-    results['spread_analysis'] = {
-        'mean_spread': np.mean(valid_spreads) if valid_spreads else None,
-        'median_spread': np.median(valid_spreads) if valid_spreads else None,
-        'p95_spread': np.percentile(valid_spreads, 95) if valid_spreads else None
-    }
-    
-    # Calculate depth (top 5 levels)
-    total_depths = []
-    for idx, row in orderbook_df.iterrows():
-        bid_depth = 0
-        ask_depth = 0
         
-        for i in range(1, 6):
-            # Bid depth
-            bid_price = row.get(f'bid{i}_price')
-            bid_size = row.get(f'bid{i}_size')
-            if pd.notna(bid_price) and pd.notna(bid_size) and bid_price > 0 and bid_size > 0:
-                bid_depth += bid_price * bid_size
+        sell_data = {
+            'slippage_pct': [],
+            'slippage_bps': [],
+            'levels_used': [],
+            'liquidity_consumed': [],
+            'price_impact': [],
+            'execution_success': []
+        }
+        
+        # Process each orderbook snapshot
+        for idx, row in orderbook_df.iterrows():
+            # Buy side analysis
+            buy_result = calculate_enhanced_slippage(row, size, 'buy')
+            sell_result = calculate_enhanced_slippage(row, size, 'sell')
             
-            # Ask depth
-            ask_price = row.get(f'ask{i}_price')
-            ask_size = row.get(f'ask{i}_size')
-            if pd.notna(ask_price) and pd.notna(ask_size) and ask_price > 0 and ask_size > 0:
-                ask_depth += ask_price * ask_size
+            for data, result in [(buy_data, buy_result), (sell_data, sell_result)]:
+                data['execution_success'].append(result['can_execute'])
+                
+                if result['can_execute']:
+                    data['slippage_pct'].append(result['slippage_pct'])
+                    data['slippage_bps'].append(result['slippage_bps'])
+                    data['levels_used'].append(result['levels_used'])
+                    data['liquidity_consumed'].append(result['liquidity_consumed_pct'])
+                    data['price_impact'].append(result['price_impact'])
         
-        total_depths.append(bid_depth + ask_depth)
-    
-    results['depth_analysis'] = {
-        'mean_depth_usd': np.mean(total_depths) if total_depths else 0,
-        'median_depth_usd': np.median(total_depths) if total_depths else 0,
-        'min_depth_usd': np.min(total_depths) if total_depths else 0
-    }
+        # Calculate comprehensive statistics
+        def calc_stats(data_list):
+            if not data_list:
+                return {
+                    'mean': np.nan, 'median': np.nan, 'std': np.nan,
+                    'p75': np.nan, 'p90': np.nan, 'p95': np.nan, 'p99': np.nan,
+                    'min': np.nan, 'max': np.nan
+                }
+            
+            arr = np.array(data_list)
+            return {
+                'mean': np.mean(arr),
+                'median': np.median(arr),
+                'std': np.std(arr),
+                'p75': np.percentile(arr, 75),
+                'p90': np.percentile(arr, 90),
+                'p95': np.percentile(arr, 95),
+                'p99': np.percentile(arr, 99),
+                'min': np.min(arr),
+                'max': np.max(arr)
+            }
+        
+        results['detailed_slippage'][size] = {
+            'buy': {
+                'slippage_pct_stats': calc_stats(buy_data['slippage_pct']),
+                'slippage_bps_stats': calc_stats(buy_data['slippage_bps']),
+                'levels_used_stats': calc_stats(buy_data['levels_used']),
+                'liquidity_consumed_stats': calc_stats(buy_data['liquidity_consumed']),
+                'execution_rate': np.mean(buy_data['execution_success']) * 100,
+                'raw_data': buy_data  # For box plots
+            },
+            'sell': {
+                'slippage_pct_stats': calc_stats(sell_data['slippage_pct']),
+                'slippage_bps_stats': calc_stats(sell_data['slippage_bps']),
+                'levels_used_stats': calc_stats(sell_data['levels_used']),
+                'liquidity_consumed_stats': calc_stats(sell_data['liquidity_consumed']),
+                'execution_rate': np.mean(sell_data['execution_success']) * 100,
+                'raw_data': sell_data  # For box plots
+            }
+        }
     
     return results
 
-def create_liquidity_summary_plot(symbol: str, analysis_results: Dict):
-    """Create a focused liquidity analysis plot"""
-    log.info(f"Creating liquidity summary plot for {symbol}...")
+def create_enhanced_visualization(symbol: str, analysis_results: Dict):
+    """Create comprehensive visualization with box plots and detailed metrics"""
+    log.info(f"Creating enhanced visualization for {symbol}...")
     
     symbol_short = symbol.split('_')[-2] if '_' in symbol else symbol
     
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle(f'{symbol_short} - Liquidity Analysis Summary', fontsize=16, fontweight='bold')
+    # Create larger figure with more subplots
+    fig = plt.figure(figsize=(20, 15))
+    gs = fig.add_gridspec(3, 4, hspace=0.3, wspace=0.3)
     
-    # 1. Slippage by Order Size
-    order_sizes = list(analysis_results['slippage_analysis'].keys())
-    buy_slippages = [analysis_results['slippage_analysis'][size]['buy_slippage_mean'] 
-                    for size in order_sizes]
-    sell_slippages = [analysis_results['slippage_analysis'][size]['sell_slippage_mean'] 
-                     for size in order_sizes]
+    fig.suptitle(f'{symbol_short} - Comprehensive Liquidity Analysis', fontsize=20, fontweight='bold')
     
-    # Filter out None values
-    valid_sizes = []
-    valid_buy_slippages = []
-    valid_sell_slippages = []
+    # 1. Slippage Box Plots - Buy Side (Top Left)
+    ax1 = fig.add_subplot(gs[0, 0])
+    plot_slippage_boxplots(ax1, analysis_results, 'buy', 'Slippage %')
     
-    for i, size in enumerate(order_sizes):
-        if buy_slippages[i] is not None and sell_slippages[i] is not None:
-            valid_sizes.append(size)
-            valid_buy_slippages.append(buy_slippages[i])
-            valid_sell_slippages.append(sell_slippages[i])
+    # 2. Slippage Box Plots - Sell Side (Top Right)
+    ax2 = fig.add_subplot(gs[0, 1])
+    plot_slippage_boxplots(ax2, analysis_results, 'sell', 'Slippage %')
     
-    if valid_sizes:
-        ax1.plot(valid_sizes, valid_buy_slippages, 'o-', label='Buy', color='green', linewidth=2)
-        ax1.plot(valid_sizes, valid_sell_slippages, 's-', label='Sell', color='red', linewidth=2)
-        ax1.set_xlabel('Order Size (USD)')
-        ax1.set_ylabel('Average Slippage %')
-        ax1.set_title('Slippage vs Order Size')
-        ax1.set_xscale('log')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
+    # 3. Execution Success Rates (Top Center-Right)
+    ax3 = fig.add_subplot(gs[0, 2])
+    plot_execution_rates(ax3, analysis_results)
     
-    # 2. Execution Success Rate
-    execution_rates = [analysis_results['slippage_analysis'][size]['execution_rate'] 
-                      for size in order_sizes]
+    # 4. Levels Used Distribution (Top Far-Right)
+    ax4 = fig.add_subplot(gs[0, 3])
+    plot_levels_used(ax4, analysis_results)
     
-    valid_execution = [rate for rate in execution_rates if rate is not None]
-    if valid_execution and len(valid_execution) == len(order_sizes):
-        colors = ['green' if rate >= 95 else 'orange' if rate >= 80 else 'red' 
-                 for rate in execution_rates]
-        bars = ax2.bar([f'${s}' for s in order_sizes], execution_rates, color=colors, alpha=0.7)
-        ax2.set_ylabel('Success Rate %')
-        ax2.set_title('Order Execution Success Rate')
-        ax2.set_ylim(0, 105)
-        
-        # Add value labels
-        for bar, rate in zip(bars, execution_rates):
-            if rate is not None:
-                ax2.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 1,
-                        f'{rate:.1f}%', ha='center', va='bottom', fontsize=9)
+    # 5. Slippage vs Order Size - Mean (Middle Left)
+    ax5 = fig.add_subplot(gs[1, 0])
+    plot_slippage_vs_size(ax5, analysis_results, 'mean')
     
-    # 3. Spread Statistics
-    spread_stats = analysis_results['spread_analysis']
-    if spread_stats['mean_spread'] is not None:
-        metrics = ['Mean', 'Median', 'P95']
-        values = [spread_stats['mean_spread'], spread_stats['median_spread'], spread_stats['p95_spread']]
-        
-        bars = ax3.bar(metrics, values, color=['blue', 'orange', 'red'], alpha=0.7)
-        ax3.set_ylabel('Spread %')
-        ax3.set_title('Bid-Ask Spread Statistics')
-        
-        # Add value labels
-        for bar, value in zip(bars, values):
-            ax3.text(bar.get_x() + bar.get_width()/2., bar.get_height() + bar.get_height()*0.01,
-                    f'{value:.4f}%', ha='center', va='bottom', fontsize=9)
+    # 6. Slippage vs Order Size - P95 (Middle Center-Left)
+    ax6 = fig.add_subplot(gs[1, 1])
+    plot_slippage_vs_size(ax6, analysis_results, 'p95')
     
-    # 4. Liquidity Summary Table
-    ax4.axis('off')
+    # 7. Price Impact Analysis (Middle Center-Right)
+    ax7 = fig.add_subplot(gs[1, 2])
+    plot_price_impact(ax7, analysis_results)
     
-    # Create summary data
-    depth_stats = analysis_results['depth_analysis']
+    # 8. Liquidity Consumption (Middle Right)
+    ax8 = fig.add_subplot(gs[1, 3])
+    plot_liquidity_consumption(ax8, analysis_results)
     
-    summary_data = [
-        ['Metric', 'Value'],
-        ['Avg Spread', f"{spread_stats['mean_spread']:.4f}%" if spread_stats['mean_spread'] else 'N/A'],
-        ['P95 Spread', f"{spread_stats['p95_spread']:.4f}%" if spread_stats['p95_spread'] else 'N/A'],
-        ['Avg Depth', f"${depth_stats['mean_depth_usd']:,.0f}" if depth_stats['mean_depth_usd'] else 'N/A'],
-        ['Min Depth', f"${depth_stats['min_depth_usd']:,.0f}" if depth_stats['min_depth_usd'] else 'N/A'],
-    ]
-    
-    # Add slippage for $1000 orders
-    if 1000 in analysis_results['slippage_analysis']:
-        slippage_1k = analysis_results['slippage_analysis'][1000]
-        if slippage_1k['buy_slippage_mean'] is not None:
-            summary_data.append(['$1K Buy Slippage', f"{slippage_1k['buy_slippage_mean']:.4f}%"])
-        if slippage_1k['execution_rate'] is not None:
-            summary_data.append(['$1K Success Rate', f"{slippage_1k['execution_rate']:.1f}%"])
-    
-    # Create table
-    table = ax4.table(cellText=summary_data[1:], colLabels=summary_data[0],
-                     cellLoc='center', loc='center')
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1.2, 2.0)
-    
-    # Style table
-    table[(0, 0)].set_facecolor('#3498db')
-    table[(0, 1)].set_facecolor('#3498db')
-    table[(0, 0)].set_text_props(weight='bold', color='white')
-    table[(0, 1)].set_text_props(weight='bold', color='white')
-    
-    ax4.set_title('Liquidity Summary', fontsize=12, fontweight='bold')
-    
-    plt.tight_layout()
+    # 9. Trading Quality Summary Table (Bottom)
+    ax9 = fig.add_subplot(gs[2, :])
+    create_quality_summary_table(ax9, symbol_short, analysis_results)
     
     # Save plot
     plots_dir = Path("plots")
     plots_dir.mkdir(exist_ok=True)
-    plt.savefig(plots_dir / f'{symbol_short}_liquidity_summary.png', dpi=300, bbox_inches='tight',
-                facecolor='white', edgecolor='none')
+    plt.savefig(plots_dir / f'{symbol_short}_enhanced_liquidity_analysis.png', 
+                dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
     plt.close()
     
-    log.info(f"Liquidity summary plot saved: plots/{symbol_short}_liquidity_summary.png")
+    log.info(f"Enhanced visualization saved: plots/{symbol_short}_enhanced_liquidity_analysis.png")
 
-def generate_liquidity_report(symbol: str, analysis_results: Dict):
-    """Generate concise liquidity report"""
-    log.info(f"\n{'='*60}")
-    log.info(f"LIQUIDITY ANALYSIS REPORT - {symbol}")
-    log.info(f"{'='*60}")
+def plot_slippage_boxplots(ax, analysis_results: Dict, side: str, metric: str):
+    """Create box plots for slippage distribution"""
+    order_sizes = list(analysis_results['detailed_slippage'].keys())
+    slippage_data = []
+    labels = []
+    
+    for size in order_sizes:
+        data = analysis_results['detailed_slippage'][size][side]['raw_data']['slippage_pct']
+        if data:  # Only include if we have data
+            slippage_data.append(data)
+            labels.append(f'${size}')
+    
+    if slippage_data:
+        bp = ax.boxplot(slippage_data, labels=labels, patch_artist=True, showfliers=False)
+        
+        # Color the boxes
+        colors = ['lightblue' if side == 'buy' else 'lightcoral' for _ in bp['boxes']]
+        for patch, color in zip(bp['boxes'], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+        
+        ax.set_ylabel('Slippage %')
+        ax.set_title(f'{side.title()} Side Slippage Distribution')
+        ax.grid(True, alpha=0.3)
+        
+        # Add mean markers
+        for i, data in enumerate(slippage_data):
+            mean_val = np.mean(data)
+            ax.plot(i+1, mean_val, 'ro' if side == 'sell' else 'bo', markersize=8, label='Mean' if i == 0 else "")
+        
+        if len(slippage_data) > 0:
+            ax.legend()
+        # Ajustar ejes: usar rangos de bigotes para límites
+        caps = bp['caps']
+        cap_vals = [cap.get_ydata()[0] for cap in caps]
+        if cap_vals:
+            ymin = min(cap_vals)
+            ymax = max(cap_vals)
+            margin = (ymax - ymin) * 0.1 if (ymax - ymin) > 0 else 0.1
+            ax.set_ylim(max(0, ymin - margin), ymax + margin)
+
+def plot_execution_rates(ax, analysis_results: Dict):
+    """Plot execution success rates"""
+    order_sizes = list(analysis_results['detailed_slippage'].keys())
+    buy_rates = [analysis_results['detailed_slippage'][size]['buy']['execution_rate'] for size in order_sizes]
+    sell_rates = [analysis_results['detailed_slippage'][size]['sell']['execution_rate'] for size in order_sizes]
+    
+    x = np.arange(len(order_sizes))
+    width = 0.35
+    
+    bars1 = ax.bar(x - width/2, buy_rates, width, label='Buy', color='lightblue', alpha=0.8)
+    bars2 = ax.bar(x + width/2, sell_rates, width, label='Sell', color='lightcoral', alpha=0.8)
+    
+    ax.set_ylabel('Success Rate %')
+    ax.set_title('Order Execution Success Rate')
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'${size}' for size in order_sizes])
+    ax.legend()
+    ax.set_ylim(0, 105)
+    
+    # Add value labels on bars
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.1f}%',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),  # 3 points vertical offset
+                       textcoords="offset points",
+                       ha='center', va='bottom', fontsize=8)
+
+def plot_levels_used(ax, analysis_results: Dict):
+    """Plot distribution of orderbook levels used"""
+    order_sizes = list(analysis_results['detailed_slippage'].keys())
+    
+    # Get average levels used for each size
+    buy_levels = []
+    sell_levels = []
+    
+    for size in order_sizes:
+        buy_data = analysis_results['detailed_slippage'][size]['buy']['raw_data']['levels_used']
+        sell_data = analysis_results['detailed_slippage'][size]['sell']['raw_data']['levels_used']
+        
+        buy_levels.append(np.mean(buy_data) if buy_data else 0)
+        sell_levels.append(np.mean(sell_data) if sell_data else 0)
+    
+    x = np.arange(len(order_sizes))
+    width = 0.35
+    
+    ax.bar(x - width/2, buy_levels, width, label='Buy', color='lightblue', alpha=0.8)
+    ax.bar(x + width/2, sell_levels, width, label='Sell', color='lightcoral', alpha=0.8)
+    
+    ax.set_ylabel('Avg Levels Used')
+    ax.set_title('Orderbook Depth Consumption')
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'${size}' for size in order_sizes])
+    ax.legend()
+
+def plot_slippage_vs_size(ax, analysis_results: Dict, stat_type: str):
+    """Plot slippage vs order size for specific statistic"""
+    order_sizes = list(analysis_results['detailed_slippage'].keys())
+    
+    buy_slippages = []
+    sell_slippages = []
+    
+    for size in order_sizes:
+        buy_stat = analysis_results['detailed_slippage'][size]['buy']['slippage_pct_stats'][stat_type]
+        sell_stat = analysis_results['detailed_slippage'][size]['sell']['slippage_pct_stats'][stat_type]
+        
+        buy_slippages.append(buy_stat if not np.isnan(buy_stat) else 0)
+        sell_slippages.append(sell_stat if not np.isnan(sell_stat) else 0)
+    
+    ax.plot(order_sizes, buy_slippages, 'o-', label='Buy', color='blue', linewidth=2, markersize=6)
+    ax.plot(order_sizes, sell_slippages, 's-', label='Sell', color='red', linewidth=2, markersize=6)
+    
+    ax.set_xlabel('Order Size (USD)')
+    ax.set_ylabel(f'{stat_type.upper()} Slippage %')
+    ax.set_title(f'Slippage vs Order Size ({stat_type.upper()})')
+    ax.set_xscale('log')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+def plot_price_impact(ax, analysis_results: Dict):
+    """Plot price impact analysis"""
+    order_sizes = list(analysis_results['detailed_slippage'].keys())
+    
+    # Calculate combined price impact
+    price_impacts = []
+    for size in order_sizes:
+        buy_impact = analysis_results['detailed_slippage'][size]['buy']['raw_data']['price_impact']
+        sell_impact = analysis_results['detailed_slippage'][size]['sell']['raw_data']['price_impact']
+        
+        combined_impact = buy_impact + sell_impact
+        avg_impact = np.mean(combined_impact) if combined_impact else 0
+        price_impacts.append(avg_impact)
+    
+    bars = ax.bar([f'${size}' for size in order_sizes], price_impacts, 
+                  color='orange', alpha=0.7)
+    
+    ax.set_ylabel('Avg Price Impact %')
+    ax.set_title('Market Price Impact by Order Size')
+    
+    # Add value labels
+    for bar, impact in zip(bars, price_impacts):
+        ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.001,
+                f'{impact:.3f}%', ha='center', va='bottom', fontsize=9)
+
+def plot_liquidity_consumption(ax, analysis_results: Dict):
+    """Plot liquidity consumption analysis"""
+    order_sizes = list(analysis_results['detailed_slippage'].keys())
+    
+    # Get P95 liquidity consumption
+    consumption_p95 = []
+    for size in order_sizes:
+        buy_consumption = analysis_results['detailed_slippage'][size]['buy']['liquidity_consumed_stats']['p95']
+        sell_consumption = analysis_results['detailed_slippage'][size]['sell']['liquidity_consumed_stats']['p95']
+        
+        avg_consumption = np.mean([buy_consumption, sell_consumption])
+        consumption_p95.append(avg_consumption if not np.isnan(avg_consumption) else 0)
+    
+    colors = ['green' if x < 20 else 'orange' if x < 50 else 'red' for x in consumption_p95]
+    bars = ax.bar([f'${size}' for size in order_sizes], consumption_p95, color=colors, alpha=0.7)
+    
+    ax.set_ylabel('P95 Liquidity Consumed %')
+    ax.set_title('Liquidity Consumption (P95)')
+    ax.axhline(y=50, color='red', linestyle='--', alpha=0.5, label='High consumption')
+    ax.axhline(y=20, color='orange', linestyle='--', alpha=0.5, label='Medium consumption')
+    ax.legend()
+
+def create_quality_summary_table(ax, symbol_short: str, analysis_results: Dict):
+    """Create comprehensive quality summary table"""
+    ax.axis('off')
+    
+    order_sizes = list(analysis_results['detailed_slippage'].keys())
+    
+    # Prepare table data
+    table_data = [['Order Size', 'Buy Exec %', 'Sell Exec %', 'Avg Slippage %', 'P95 Slippage %', 'Quality Grade']]
+    
+    for size in order_sizes:
+        buy_exec = analysis_results['detailed_slippage'][size]['buy']['execution_rate']
+        sell_exec = analysis_results['detailed_slippage'][size]['sell']['execution_rate']
+        
+        buy_slippage = analysis_results['detailed_slippage'][size]['buy']['slippage_pct_stats']['mean']
+        sell_slippage = analysis_results['detailed_slippage'][size]['sell']['slippage_pct_stats']['mean']
+        avg_slippage = np.mean([buy_slippage, sell_slippage]) if not np.isnan(buy_slippage) and not np.isnan(sell_slippage) else np.nan
+        
+        buy_p95 = analysis_results['detailed_slippage'][size]['buy']['slippage_pct_stats']['p95']
+        sell_p95 = analysis_results['detailed_slippage'][size]['sell']['slippage_pct_stats']['p95']
+        p95_slippage = np.mean([buy_p95, sell_p95]) if not np.isnan(buy_p95) and not np.isnan(sell_p95) else np.nan
+        
+        # Calculate quality grade
+        if min(buy_exec, sell_exec) >= 95 and avg_slippage <= 0.1:
+            grade = "A"
+        elif min(buy_exec, sell_exec) >= 90 and avg_slippage <= 0.2:
+            grade = "B"
+        elif min(buy_exec, sell_exec) >= 80 and avg_slippage <= 0.5:
+            grade = "C"
+        else:
+            grade = "D"
+        
+        table_data.append([
+            f'${size}',
+            f'{buy_exec:.1f}%' if not np.isnan(buy_exec) else 'N/A',
+            f'{sell_exec:.1f}%' if not np.isnan(sell_exec) else 'N/A',
+            f'{avg_slippage:.3f}%' if not np.isnan(avg_slippage) else 'N/A',
+            f'{p95_slippage:.3f}%' if not np.isnan(p95_slippage) else 'N/A',
+            grade
+        ])
+    
+    # Create table
+    table = ax.table(cellText=table_data[1:], colLabels=table_data[0],
+                     cellLoc='center', loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.5, 2.0)
+    
+    # Style table header
+    for i in range(len(table_data[0])):
+        table[(0, i)].set_facecolor('#3498db')
+        table[(0, i)].set_text_props(weight='bold', color='white')
+    
+    # Color code quality grades
+    grade_colors = {'A': '#2ecc71', 'B': '#f39c12', 'C': '#e67e22', 'D': '#e74c3c'}
+    for i in range(1, len(table_data)):
+        grade = table_data[i][-1]
+        if grade in grade_colors:
+            table[(i, len(table_data[0])-1)].set_facecolor(grade_colors[grade])
+            table[(i, len(table_data[0])-1)].set_text_props(weight='bold', color='white')
+    
+    ax.set_title(f'{symbol_short} - Trading Quality Summary', fontsize=14, fontweight='bold', pad=20)
+
+def generate_enhanced_report(symbol: str, analysis_results: Dict):
+    """Generate enhanced analysis report"""
+    log.info(f"\n{'='*80}")
+    log.info(f"ENHANCED LIQUIDITY ANALYSIS REPORT - {symbol}")
+    log.info(f"{'='*80}")
     
     symbol_short = symbol.split('_')[-2] if '_' in symbol else symbol
     
-    # Spread analysis
-    spread_stats = analysis_results['spread_analysis']
-    log.info(f"\n📊 SPREAD ANALYSIS:")
-    if spread_stats['mean_spread'] is not None:
-        log.info(f"  Average Spread: {spread_stats['mean_spread']:.4f}%")
-        log.info(f"  Median Spread: {spread_stats['median_spread']:.4f}%")
-        log.info(f"  P95 Spread: {spread_stats['p95_spread']:.4f}%")
-    else:
-        log.warning("  No valid spread data found")
+    # Overall statistics
+    order_sizes = list(analysis_results['detailed_slippage'].keys())
+    log.info(f"\n📊 ANALYSIS COVERAGE:")
+    log.info(f"  Symbol: {symbol_short}")
+    log.info(f"  Data points analyzed: {len(analysis_results['timestamps']):,}")
+    log.info(f"  Order sizes tested: {order_sizes}")
+    log.info(f"  Analysis period: {min(analysis_results['timestamps'])} to {max(analysis_results['timestamps'])}")
     
-    # Slippage analysis
-    log.info(f"\n💹 SLIPPAGE ANALYSIS:")
-    log.info(f"{'Size':<8} {'Buy Slip %':<12} {'Sell Slip %':<12} {'Success %':<10}")
-    log.info("-" * 45)
+    # Detailed metrics table
+    log.info(f"\n💹 DETAILED SLIPPAGE METRICS:")
+    log.info(f"{'Size':<8} {'Side':<4} {'Exec %':<8} {'Mean':<8} {'P95':<8} {'P99':<8} {'Levels':<7}")
+    log.info("-" * 60)
     
-    for size, stats in analysis_results['slippage_analysis'].items():
-        buy_slip = f"{stats['buy_slippage_mean']:.4f}" if stats['buy_slippage_mean'] else "N/A"
-        sell_slip = f"{stats['sell_slippage_mean']:.4f}" if stats['sell_slippage_mean'] else "N/A"
-        success = f"{stats['execution_rate']:.1f}" if stats['execution_rate'] else "N/A"
-        
-        log.info(f"${size:<7} {buy_slip:<12} {sell_slip:<12} {success:<10}")
-    
-    # Depth analysis
-    depth_stats = analysis_results['depth_analysis']
-    log.info(f"\n📈 MARKET DEPTH:")
-    log.info(f"  Average Depth (top 5 levels): ${depth_stats['mean_depth_usd']:,.0f}")
-    log.info(f"  Median Depth: ${depth_stats['median_depth_usd']:,.0f}")
-    log.info(f"  Minimum Depth: ${depth_stats['min_depth_usd']:,.0f}")
-    
-    # Overall assessment
-    log.info(f"\n🏆 LIQUIDITY ASSESSMENT:")
-    
-    # Simple scoring based on key metrics
-    score = 0
-    max_score = 4
-    
-    # Spread quality (25%)
-    if spread_stats['mean_spread'] and spread_stats['mean_spread'] < 0.1:
-        score += 1
-        spread_grade = "Excellent"
-    elif spread_stats['mean_spread'] and spread_stats['mean_spread'] < 0.2:
-        score += 0.5
-        spread_grade = "Good"
-    else:
-        spread_grade = "Poor"
-    
-    # $1000 order execution (25%)
-    if 1000 in analysis_results['slippage_analysis']:
-        success_rate = analysis_results['slippage_analysis'][1000]['execution_rate']
-        if success_rate and success_rate >= 95:
-            score += 1
-            execution_grade = "Excellent"
-        elif success_rate and success_rate >= 80:
-            score += 0.5
-            execution_grade = "Good"
-        else:
-            execution_grade = "Poor"
-    else:
-        execution_grade = "Unknown"
-    
-    # $1000 slippage quality (25%)
-    if 1000 in analysis_results['slippage_analysis']:
-        slippage = analysis_results['slippage_analysis'][1000]['buy_slippage_mean']
-        if slippage and slippage < 0.1:
-            score += 1
-            slippage_grade = "Excellent"
-        elif slippage and slippage < 0.3:
-            score += 0.5
-            slippage_grade = "Good"
-        else:
-            slippage_grade = "Poor"
-    else:
-        slippage_grade = "Unknown"
-    
-    # Depth quality (25%)
-    if depth_stats['mean_depth_usd'] >= 10000:
-        score += 1
-        depth_grade = "Excellent"
-    elif depth_stats['mean_depth_usd'] >= 5000:
-        score += 0.5
-        depth_grade = "Good"
-    else:
-        depth_grade = "Poor"
-    
-    final_score = (score / max_score) * 100
-    
-    if final_score >= 80:
-        overall_grade = "A (Excellent for trading)"
-    elif final_score >= 60:
-        overall_grade = "B (Good for trading)"
-    elif final_score >= 40:
-        overall_grade = "C (Fair - use caution)"
-    else:
-        overall_grade = "D (Poor - not recommended)"
-    
-    log.info(f"  Overall Liquidity Grade: {overall_grade}")
-    log.info(f"  Component Grades:")
-    log.info(f"    Spread Quality: {spread_grade}")
-    log.info(f"    Execution Success: {execution_grade}")
-    log.info(f"    Slippage Quality: {slippage_grade}")
-    log.info(f"    Market Depth: {depth_grade}")
+    for size in order_sizes:
+        for side in ['buy', 'sell']:
+            stats = analysis_results['detailed_slippage'][size][side]
+            exec_rate = stats['execution_rate']
+            slippage_mean = stats['slippage_pct_stats']['mean']
+            slippage_p95 = stats['slippage_pct_stats']['p95']
+            slippage_p99 = stats['slippage_pct_stats']['p99']
+            levels_mean = stats['levels_used_stats']['mean']
+            
+            log.info(f"${size:<7} {side:<4} "
+                    f"{exec_rate:>7.1f} "
+                    f"{slippage_mean:>7.3f} "
+                    f"{slippage_p95:>7.3f} "
+                    f"{slippage_p99:>7.3f} "
+                    f"{levels_mean:>6.2f}")
     
     # Trading recommendations
-    log.info(f"\n📋 TRADING RECOMMENDATIONS:")
-    if final_score >= 80:
-        log.info(f"  ✅ {symbol_short} is excellent for algorithmic trading")
-        log.info(f"  ✅ Can handle orders up to $1000+ with minimal slippage")
-        log.info(f"  ✅ Suitable for high-frequency strategies")
-    elif final_score >= 60:
-        log.info(f"  ✅ {symbol_short} is suitable for most trading strategies")
-        log.info(f"  ⚠️ Consider limiting order sizes to $500-1000")
-        log.info(f"  ⚠️ Monitor slippage during execution")
-    elif final_score >= 40:
-        log.info(f"  ⚠️ {symbol_short} requires careful order management")
-        log.info(f"  ⚠️ Limit orders to $200-500 range")
-        log.info(f"  ⚠️ Use limit orders instead of market orders")
+    log.info(f"\n📋 ENHANCED TRADING RECOMMENDATIONS:")
+    
+    # Find optimal order sizes
+    viable_sizes = []
+    for size in order_sizes:
+        buy_exec = analysis_results['detailed_slippage'][size]['buy']['execution_rate']
+        sell_exec = analysis_results['detailed_slippage'][size]['sell']['execution_rate']
+        avg_slippage = np.mean([
+            analysis_results['detailed_slippage'][size]['buy']['slippage_pct_stats']['mean'],
+            analysis_results['detailed_slippage'][size]['sell']['slippage_pct_stats']['mean']
+        ])
+        if min(buy_exec, sell_exec) >= 90 and avg_slippage <= 0.5:
+            viable_sizes.append((size, min(buy_exec, sell_exec), avg_slippage))
+
+    if viable_sizes:
+        optimal_size = max(viable_sizes, key=lambda x: x[0])  # Largest viable size
+        log.info(f"  ✅ Optimal order size: ${optimal_size[0]} (Exec: {optimal_size[1]:.1f}%, Slippage: {optimal_size[2]:.3f}%)")
+        log.info(f"  ✅ Viable sizes: {[f'${s[0]}' for s in viable_sizes]}")
     else:
-        log.info(f"  ❌ {symbol_short} has poor liquidity")
-        log.info(f"  ❌ High slippage risk for any meaningful size")
-        log.info(f"  ❌ Consider alternative instruments")
+        log.warning(f"  ⚠️ No order sizes meet quality criteria (90% exec, <0.5% slippage)")
+
+    # Risk warnings
+    high_slippage_sizes = []
+    for size in order_sizes:
+        p95_slippage = np.mean([
+            analysis_results['detailed_slippage'][size]['buy']['slippage_pct_stats']['p95'],
+            analysis_results['detailed_slippage'][size]['sell']['slippage_pct_stats']['p95']
+        ])
+        if p95_slippage > 1.0:  # P95 slippage > 1%
+            high_slippage_sizes.append(size)
+
+    if high_slippage_sizes:
+        log.warning(f"  ⚠️ High slippage risk for sizes: {[f'${s}' for s in high_slippage_sizes]}")
+
+    # Market structure insights
+    log.info(f"\n🏗️ MARKET STRUCTURE INSIGHTS:")
+
+    # Calculate average levels used across all sizes
+    total_levels_data = []
+    for size in order_sizes:
+        for side in ['buy', 'sell']:
+            levels_data = analysis_results['detailed_slippage'][size][side]['raw_data']['levels_used']
+            total_levels_data.extend(levels_data)
+
+    if total_levels_data:
+        avg_levels = np.mean(total_levels_data)
+        log.info(f"  Average orderbook levels consumed: {avg_levels:.2f}")
+
+        if avg_levels < 1.5:
+            log.info(f"  ✅ Excellent depth - most orders fill in top level")
+        elif avg_levels < 2.5:
+            log.info(f"  ✅ Good depth - orders typically use 2-3 levels")
+        else:
+            log.warning(f"  ⚠️ Fragmented liquidity - orders spread across many levels")
+
+    # Asymmetry analysis
+    log.info(f"\n⚖️ BUY/SELL ASYMMETRY ANALYSIS:")
+    for size in [500, 1000, 2000]:  # Key sizes
+        if size in order_sizes:
+            buy_slippage = analysis_results['detailed_slippage'][size]['buy']['slippage_pct_stats']['mean']
+            sell_slippage = analysis_results['detailed_slippage'][size]['sell']['slippage_pct_stats']['mean']
+
+            if not (np.isnan(buy_slippage) or np.isnan(sell_slippage)):
+                asymmetry = abs(buy_slippage - sell_slippage) / max(buy_slippage, sell_slippage) * 100
+                bias = "buy" if buy_slippage > sell_slippage else "sell"
+
+                log.info(f"  ${size}: {asymmetry:.1f}% asymmetry (higher {bias} slippage)")
+
+                if asymmetry > 20:
+                    log.warning(f"    ⚠️ Significant bias toward {bias} side")
 
 def main():
-    """Main simplified liquidity analysis function"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Analyze market liquidity (simplified version)")
-    parser.add_argument("--symbol", type=str, help="Specific symbol to analyze")
-    parser.add_argument("--days", type=int, default=7, help="Number of days to analyze (default: 7)")
-    parser.add_argument("--no-plots", action="store_true", help="Skip plot generation")
-    
-    args = parser.parse_args()
-    
-    log.info("Starting simplified liquidity analysis...")
-    
-    # Get symbols to analyze
-    if args.symbol:
-        symbols = [args.symbol]
-    else:
-        try:
-            active_pairs = settings.get_active_pairs()
-            symbols = []
-            for pair in active_pairs:
-                symbols.extend([pair.symbol1, pair.symbol2])
-            symbols = list(set(symbols))
-        except Exception as e:
-            log.error(f"Could not load symbols from config: {e}")
-            symbols = ['MEXCFTS_PERP_GIGA_USDT', 'MEXCFTS_PERP_SPX_USDT']
-    
-    if not symbols:
-        log.error("No symbols to analyze")
-        return False
-    
-    log.info(f"Analyzing liquidity for {len(symbols)} symbols (last {args.days} days)")
-    
-    # Create plots directory
-    plots_dir = Path("plots")
-    plots_dir.mkdir(exist_ok=True)
-    
-    try:
-        for symbol in symbols:
-            log.info(f"\n{'='*60}")
-            log.info(f"ANALYZING {symbol}")
-            log.info(f"{'='*60}")
-            
-            # Load data
-            orderbook_df = load_orderbook_data(symbol, args.days)
-            
-            if len(orderbook_df) == 0:
-                log.warning(f"No orderbook data for {symbol}")
-                continue
-            
-            # Analyze liquidity
-            analysis_results = analyze_liquidity_metrics(symbol, orderbook_df)
-            
-            # Generate plots
-            if not args.no_plots:
-                create_liquidity_summary_plot(symbol, analysis_results)
-            
-            # Generate report
-            generate_liquidity_report(symbol, analysis_results)
-        
-        log.info(f"\n🎉 Liquidity analysis completed!")
-        log.info(f"Check plots/ directory for visual summaries")
-        
-        return True
-        
-    except Exception as e:
-        log.error(f"Liquidity analysis failed: {e}")
-        import traceback
-        log.error(traceback.format_exc())
-        return False
+   """Main enhanced analysis function"""
+   import argparse
+   
+   parser = argparse.ArgumentParser(description="Enhanced liquidity analysis with comprehensive slippage metrics")
+   parser.add_argument("--symbol", type=str, help="Specific symbol to analyze")
+   parser.add_argument("--max-records", type=int, default=100000, help="Maximum records to analyze (default: 100k)")
+   parser.add_argument("--no-plots", action="store_true", help="Skip plot generation")
+   
+   args = parser.parse_args()
+   
+   log.info("Starting enhanced liquidity analysis...")
+   
+   # Get symbols to analyze
+   if args.symbol:
+       symbols = [args.symbol]
+   else:
+       try:
+           active_pairs = settings.get_active_pairs()
+           symbols = []
+           for pair in active_pairs:
+               symbols.extend([pair.symbol1, pair.symbol2])
+           symbols = list(set(symbols))
+       except Exception as e:
+           log.error(f"Could not load symbols from config: {e}")
+           symbols = ['MEXCFTS_PERP_GIGA_USDT', 'MEXCFTS_PERP_SPX_USDT']
+   
+   if not symbols:
+       log.error("No symbols to analyze")
+       return False
+   
+   log.info(f"Analyzing enhanced liquidity for {len(symbols)} symbols")
+   
+   # Create plots directory
+   plots_dir = Path("plots")
+   plots_dir.mkdir(exist_ok=True)
+   
+   try:
+       for symbol in symbols:
+           log.info(f"\n{'='*80}")
+           log.info(f"ENHANCED ANALYSIS: {symbol}")
+           log.info(f"{'='*80}")
+           
+           # Load ALL available data
+           orderbook_df = load_all_orderbook_data(symbol, args.max_records)
+           
+           if len(orderbook_df) == 0:
+               log.warning(f"No orderbook data for {symbol}")
+               continue
+           
+           # Enhanced slippage analysis
+           analysis_results = analyze_comprehensive_slippage(symbol, orderbook_df)
+           
+           # Generate enhanced visualizations
+           if not args.no_plots:
+               create_enhanced_visualization(symbol, analysis_results)
+           
+           # Generate enhanced report
+           generate_enhanced_report(symbol, analysis_results)
+       
+       log.info(f"\n🎉 Enhanced liquidity analysis completed!")
+       log.info(f"Key improvements:")
+       log.info(f"  ✅ Analyzed ALL available data (not just 7 days)")
+       log.info(f"  ✅ Box plots show slippage distributions")
+       log.info(f"  ✅ Bidirectional analysis (buy vs sell)")
+       log.info(f"  ✅ Extended order sizes (100-10000 USD)")
+       log.info(f"  ✅ Comprehensive quality grading")
+       log.info(f"  ✅ Market structure insights")
+       log.info(f"Check plots/ directory for enhanced visualizations")
+       
+       return True
+       
+   except Exception as e:
+       log.error(f"Enhanced liquidity analysis failed: {e}")
+       import traceback
+       log.error(traceback.format_exc())
+       return False
 
 if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)
+   success = main()
+   sys.exit(0 if success else 1)
