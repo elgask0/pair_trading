@@ -15,7 +15,8 @@ from sqlalchemy import text
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Ensure project root is on PYTHONPATH for imports
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 from src.database.connection import db_manager
 from src.utils.logger import get_validation_logger
 from config.settings import settings
