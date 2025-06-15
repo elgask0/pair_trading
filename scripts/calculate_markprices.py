@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-FINAL Mark price calculation script - ESQUEMA VERIFICADO
-Funciona con el esquema existente que tiene valid_for_trading
+ULTRA FAST Mark price calculation script - FULLY AUTOMATED VERSION
+Sin intervención manual, modo automático completo
 """
 
 import sys
@@ -20,309 +20,195 @@ from config.settings import settings
 
 log = get_validation_logger()
 
-def calculate_simple_vwap(row: pd.Series) -> Dict:
-    """Cálculo VWAP simple SIN FILTROS ADICIONALES"""
+def calculate_mark_prices_ultrafast(symbol: str) -> int:
+    """Calcular mark prices usando SQL directo - ULTRA RÁPIDO"""
     
-    bid_levels = []
-    ask_levels = []
-    
-    for i in range(1, 11):
-        # Bid levels
-        bid_price = row.get(f'bid{i}_price')
-        bid_size = row.get(f'bid{i}_size')
-        
-        if (pd.notna(bid_price) and pd.notna(bid_size) and 
-            bid_price > 0 and bid_size > 0):
-            bid_levels.append({
-                'price': float(bid_price), 
-                'size': float(bid_size)
-            })
-        
-        # Ask levels
-        ask_price = row.get(f'ask{i}_price')
-        ask_size = row.get(f'ask{i}_size')
-        
-        if (pd.notna(ask_price) and pd.notna(ask_size) and 
-            ask_price > 0 and ask_size > 0):
-            ask_levels.append({
-                'price': float(ask_price), 
-                'size': float(ask_size)
-            })
-    
-    if len(bid_levels) == 0 or len(ask_levels) == 0:
-        return {'mark_price': None, 'liquidity_score': 0.0}
-    
-    # Verificar spread no cruzado
-    best_bid = max(level['price'] for level in bid_levels)
-    best_ask = min(level['price'] for level in ask_levels)
-    
-    if best_bid >= best_ask:
-        return {'mark_price': None, 'liquidity_score': 0.0}
-    
-    try:
-        # Calcular VWAP
-        total_bid_value = sum(level['price'] * level['size'] for level in bid_levels)
-        total_bid_size = sum(level['size'] for level in bid_levels)
-        bid_vwap = total_bid_value / total_bid_size
-        
-        total_ask_value = sum(level['price'] * level['size'] for level in ask_levels)
-        total_ask_size = sum(level['size'] for level in ask_levels)
-        ask_vwap = total_ask_value / total_ask_size
-        
-        mark_price = (bid_vwap + ask_vwap) / 2
-        
-        # Liquidity score simple
-        max_levels = 10
-        available_levels = len(bid_levels) + len(ask_levels)
-        levels_score = min(1.0, available_levels / max_levels)
-        balance_score = min(len(bid_levels), len(ask_levels)) / max(len(bid_levels), len(ask_levels))
-        liquidity_score = (levels_score * 0.7 + balance_score * 0.3)
-        
-        return {
-            'mark_price': float(mark_price),
-            'liquidity_score': float(liquidity_score)
-        }
-        
-    except Exception as e:
-        log.warning(f"Error calculando VWAP: {e}")
-        return {'mark_price': None, 'liquidity_score': 0.0}
-
-def check_orderbook_quality_column(symbol: str) -> str:
-    """Verificar qué columna de calidad usar"""
-    with db_manager.get_session() as session:
-        result = session.execute(text("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'orderbook' 
-            AND column_name = 'valid_for_trading'
-        """)).fetchone()
-        
-        if result:
-            log.info("Usando columna 'valid_for_trading' para filtrar")
-            return "valid_for_trading"
-        
-        result = session.execute(text("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'orderbook' 
-            AND column_name = 'liquidity_quality'
-        """)).fetchone()
-        
-        if result:
-            log.info("Usando columna 'liquidity_quality' para filtrar")
-            return "liquidity_quality"
-        
-        log.info("No se encontraron columnas de calidad - procesando todos los registros")
-        return None
-
-def get_orderbook_stats(symbol: str, quality_column: str) -> Dict:
-    """Obtener estadísticas de orderbook"""
-    with db_manager.get_session() as session:
-        if quality_column == "valid_for_trading":
-            stats_query = text("""
-                SELECT 
-                    COUNT(*) as total,
-                    COUNT(CASE WHEN valid_for_trading = TRUE THEN 1 END) as valid,
-                    MIN(timestamp) as min_date,
-                    MAX(timestamp) as max_date
-                FROM orderbook 
-                WHERE symbol = :symbol
-                AND bid1_price IS NOT NULL 
-                AND ask1_price IS NOT NULL
-            """)
-        elif quality_column == "liquidity_quality":
-            stats_query = text("""
-                SELECT 
-                    COUNT(*) as total,
-                    COUNT(CASE WHEN liquidity_quality IN ('Excellent', 'Good') THEN 1 END) as valid,
-                    MIN(timestamp) as min_date,
-                    MAX(timestamp) as max_date
-                FROM orderbook 
-                WHERE symbol = :symbol
-                AND bid1_price IS NOT NULL 
-                AND ask1_price IS NOT NULL
-            """)
-        else:
-            stats_query = text("""
-                SELECT 
-                    COUNT(*) as total,
-                    COUNT(*) as valid,
-                    MIN(timestamp) as min_date,
-                    MAX(timestamp) as max_date
-                FROM orderbook 
-                WHERE symbol = :symbol
-                AND bid1_price IS NOT NULL 
-                AND ask1_price IS NOT NULL
-            """)
-        
-        result = session.execute(stats_query, {'symbol': symbol}).fetchone()
-        
-        return {
-            'total': result.total,
-            'valid': result.valid,
-            'min_date': result.min_date,
-            'max_date': result.max_date,
-            'valid_pct': (result.valid / max(1, result.total)) * 100
-        }
-
-def calculate_mark_prices_simple(symbol: str) -> int:
-    """Calcular mark prices usando SOLO el filtro valid_for_trading"""
-    
-    quality_column = check_orderbook_quality_column(symbol)
-    stats = get_orderbook_stats(symbol, quality_column)
-    
-    log.info(f"Estadísticas de orderbook para {symbol}:")
-    log.info(f"  Total registros: {stats['total']:,}")
-    log.info(f"  Registros válidos: {stats['valid']:,} ({stats['valid_pct']:.1f}%)")
-    log.info(f"  Período: {stats['min_date']} a {stats['max_date']}")
-    
-    if stats['valid'] == 0:
-        log.warning(f"No hay registros válidos para {symbol}")
-        return 0
-    
-    # Construir filtro de calidad
-    if quality_column == "valid_for_trading":
-        quality_filter = "AND ob.valid_for_trading = TRUE"
-    elif quality_column == "liquidity_quality":
-        quality_filter = "AND ob.liquidity_quality IN ('Excellent', 'Good')"
-    else:
-        quality_filter = ""
+    log.info(f"Iniciando cálculo ULTRA RÁPIDO para {symbol}...")
     
     with db_manager.get_session() as session:
-        batch_size = 5000
-        total_processed = 0
-        offset = 0
-        
-        while True:
-            orderbook_query = text(f"""
-                SELECT 
-                    ob.timestamp,
-                    ob.bid1_price, ob.bid1_size, ob.bid2_price, ob.bid2_size, 
-                    ob.bid3_price, ob.bid3_size, ob.bid4_price, ob.bid4_size,
-                    ob.bid5_price, ob.bid5_size, ob.bid6_price, ob.bid6_size,
-                    ob.bid7_price, ob.bid7_size, ob.bid8_price, ob.bid8_size,
-                    ob.bid9_price, ob.bid9_size, ob.bid10_price, ob.bid10_size,
-                    ob.ask1_price, ob.ask1_size, ob.ask2_price, ob.ask2_size,
-                    ob.ask3_price, ob.ask3_size, ob.ask4_price, ob.ask4_size,
-                    ob.ask5_price, ob.ask5_size, ob.ask6_price, ob.ask6_size,
-                    ob.ask7_price, ob.ask7_size, ob.ask8_price, ob.ask8_size,
-                    ob.ask9_price, ob.ask9_size, ob.ask10_price, ob.ask10_size
-                FROM orderbook ob
-                WHERE ob.symbol = :symbol 
-                AND ob.bid1_price IS NOT NULL 
-                AND ob.ask1_price IS NOT NULL
-                AND ob.bid1_price > 0 
-                AND ob.ask1_price > 0
-                AND ob.bid1_price < ob.ask1_price
-                {quality_filter}
-                ORDER BY ob.timestamp
-                LIMIT :batch_size OFFSET :offset
-            """)
-            
-            orderbook_df = pd.read_sql(orderbook_query, session.bind, params={
-                'symbol': symbol,
-                'batch_size': batch_size,
-                'offset': offset
-            })
-            
-            if orderbook_df.empty:
-                break
-            
-            mark_prices = []
-            
-            for idx, row in orderbook_df.iterrows():
-                vwap_result = calculate_simple_vwap(row)
-                
-                if vwap_result['mark_price'] is None:
-                    continue
-                
-                timestamp = row['timestamp']
-                orderbook_mid = (row['bid1_price'] + row['ask1_price']) / 2
-                
-                mark_prices.append({
-                    'symbol': symbol,
-                    'timestamp': timestamp,
-                    'mark_price': vwap_result['mark_price'],
-                    'orderbook_mid': float(orderbook_mid),
-                    'ohlcv_close': None,
-                    'ohlcv_volume': None,  # Agregar esta columna que existe en el esquema
-                    'liquidity_score': vwap_result['liquidity_score'],
-                    'valid_for_trading': True
-                })
-            
-            if mark_prices:
-                # INSERT que coincide exactamente con el esquema existente
-                insert_query = text("""
-                    INSERT INTO mark_prices (
-                        symbol, timestamp, mark_price, orderbook_mid, 
-                        ohlcv_close, ohlcv_volume, liquidity_score, valid_for_trading
-                    ) VALUES (
-                        :symbol, :timestamp, :mark_price, :orderbook_mid,
-                        :ohlcv_close, :ohlcv_volume, :liquidity_score, :valid_for_trading
-                    ) ON CONFLICT (symbol, timestamp) 
-                    DO UPDATE SET
-                        mark_price = EXCLUDED.mark_price,
-                        orderbook_mid = EXCLUDED.orderbook_mid,
-                        ohlcv_close = EXCLUDED.ohlcv_close,
-                        ohlcv_volume = EXCLUDED.ohlcv_volume,
-                        liquidity_score = EXCLUDED.liquidity_score,
-                        valid_for_trading = EXCLUDED.valid_for_trading
-                """)
-                
-                session.execute(insert_query, mark_prices)
-                total_processed += len(mark_prices)
-            
-            offset += batch_size
-            
-            if offset % 25000 == 0:
-                log.info(f"  Procesados: {total_processed:,} mark prices")
-        
-        return total_processed
-
-def update_ohlcv_data(symbol: str):
-    """Actualizar datos OHLCV en mark prices"""
-    with db_manager.get_session() as session:
-        # Actualizar close price
-        update_close_query = text("""
-            UPDATE mark_prices mp
-            SET ohlcv_close = o.close
-            FROM ohlcv o
-            WHERE mp.symbol = o.symbol
-            AND mp.timestamp = o.timestamp
-            AND mp.symbol = :symbol
-            AND mp.ohlcv_close IS NULL
+        # Primero obtener estadísticas
+        stats_query = text("""
+            SELECT 
+                COUNT(*) as valid
+            FROM orderbook 
+            WHERE symbol = :symbol
+            AND bid1_price IS NOT NULL 
+            AND ask1_price IS NOT NULL
+            AND valid_for_trading = TRUE
+            AND bid1_price > 0 
+            AND ask1_price > 0
+            AND bid1_price < ask1_price
         """)
         
-        close_result = session.execute(update_close_query, {'symbol': symbol})
+        stats = session.execute(stats_query, {'symbol': symbol}).fetchone()
+        log.info(f"Registros a procesar: {stats.valid:,}")
         
-        # Actualizar volume
-        update_volume_query = text("""
-            UPDATE mark_prices mp
-            SET ohlcv_volume = o.volume
-            FROM ohlcv o
-            WHERE mp.symbol = o.symbol
-            AND mp.timestamp = o.timestamp
-            AND mp.symbol = :symbol
-            AND mp.ohlcv_volume IS NULL
+        if stats.valid == 0:
+            return 0
+        
+        # CALCULAR TODO EN UNA SOLA QUERY SQL - ULTRA RÁPIDO
+        log.info("Ejecutando cálculo masivo en SQL...")
+        
+        insert_query = text("""
+            INSERT INTO mark_prices (
+                symbol, timestamp, mark_price, orderbook_mid, 
+                ohlcv_close, ohlcv_volume, liquidity_score, valid_for_trading
+            )
+            SELECT 
+                :symbol as symbol,
+                timestamp,
+                
+                -- Mark price = promedio de VWAP bid y ask
+                (
+                    -- VWAP BID (usando niveles disponibles)
+                    CASE WHEN 
+                        COALESCE(bid1_size, 0) + COALESCE(bid2_size, 0) + COALESCE(bid3_size, 0) + 
+                        COALESCE(bid4_size, 0) + COALESCE(bid5_size, 0) > 0
+                    THEN
+                        (COALESCE(bid1_price * bid1_size, 0) + COALESCE(bid2_price * bid2_size, 0) + 
+                         COALESCE(bid3_price * bid3_size, 0) + COALESCE(bid4_price * bid4_size, 0) + 
+                         COALESCE(bid5_price * bid5_size, 0)) /
+                        (COALESCE(bid1_size, 0) + COALESCE(bid2_size, 0) + COALESCE(bid3_size, 0) + 
+                         COALESCE(bid4_size, 0) + COALESCE(bid5_size, 0))
+                    ELSE bid1_price
+                    END
+                    +
+                    -- VWAP ASK (usando niveles disponibles)
+                    CASE WHEN 
+                        COALESCE(ask1_size, 0) + COALESCE(ask2_size, 0) + COALESCE(ask3_size, 0) + 
+                        COALESCE(ask4_size, 0) + COALESCE(ask5_size, 0) > 0
+                    THEN
+                        (COALESCE(ask1_price * ask1_size, 0) + COALESCE(ask2_price * ask2_size, 0) + 
+                         COALESCE(ask3_price * ask3_size, 0) + COALESCE(ask4_price * ask4_size, 0) + 
+                         COALESCE(ask5_price * ask5_size, 0)) /
+                        (COALESCE(ask1_size, 0) + COALESCE(ask2_size, 0) + COALESCE(ask3_size, 0) + 
+                         COALESCE(ask4_size, 0) + COALESCE(ask5_size, 0))
+                    ELSE ask1_price
+                    END
+                ) / 2.0 as mark_price,
+                
+                -- Orderbook mid simple
+                (bid1_price + ask1_price) / 2.0 as orderbook_mid,
+                
+                -- OHLCV inicialmente NULL
+                NULL as ohlcv_close,
+                NULL as ohlcv_volume,
+                
+                -- Liquidity score basado en niveles disponibles
+                LEAST(1.0, 
+                    (CASE WHEN bid1_size IS NOT NULL AND bid1_size > 0 THEN 1 ELSE 0 END +
+                     CASE WHEN bid2_size IS NOT NULL AND bid2_size > 0 THEN 1 ELSE 0 END +
+                     CASE WHEN bid3_size IS NOT NULL AND bid3_size > 0 THEN 1 ELSE 0 END +
+                     CASE WHEN bid4_size IS NOT NULL AND bid4_size > 0 THEN 1 ELSE 0 END +
+                     CASE WHEN bid5_size IS NOT NULL AND bid5_size > 0 THEN 1 ELSE 0 END +
+                     CASE WHEN ask1_size IS NOT NULL AND ask1_size > 0 THEN 1 ELSE 0 END +
+                     CASE WHEN ask2_size IS NOT NULL AND ask2_size > 0 THEN 1 ELSE 0 END +
+                     CASE WHEN ask3_size IS NOT NULL AND ask3_size > 0 THEN 1 ELSE 0 END +
+                     CASE WHEN ask4_size IS NOT NULL AND ask4_size > 0 THEN 1 ELSE 0 END +
+                     CASE WHEN ask5_size IS NOT NULL AND ask5_size > 0 THEN 1 ELSE 0 END) / 8.0
+                ) as liquidity_score,
+                
+                TRUE as valid_for_trading
+                
+            FROM orderbook 
+            WHERE symbol = :symbol
+            AND bid1_price IS NOT NULL 
+            AND ask1_price IS NOT NULL
+            AND valid_for_trading = TRUE
+            AND bid1_price > 0 
+            AND ask1_price > 0
+            AND bid1_price < ask1_price
+            AND bid1_size > 0
+            AND ask1_size > 0
+            
+            ON CONFLICT (symbol, timestamp) DO NOTHING
         """)
         
-        volume_result = session.execute(update_volume_query, {'symbol': symbol})
+        start_time = datetime.now()
+        result = session.execute(insert_query, {'symbol': symbol})
+        end_time = datetime.now()
         
-        log.info(f"  Actualizadas {close_result.rowcount} referencias OHLCV close")
-        log.info(f"  Actualizadas {volume_result.rowcount} referencias OHLCV volume")
+        duration = (end_time - start_time).total_seconds()
+        log.info(f"Cálculo SQL completado en {duration:.1f} segundos")
+        log.info(f"Registros procesados: {result.rowcount:,}")
+        
+        return result.rowcount
+
+def update_ohlcv_ultrafast(symbol: str):
+    """Actualización ultra rápida de OHLCV en una sola query"""
+    with db_manager.get_session() as session:
+        start_time = datetime.now()
+        
+        update_query = text("""
+            UPDATE mark_prices 
+            SET 
+                ohlcv_close = subq.close,
+                ohlcv_volume = subq.volume
+            FROM (
+                SELECT 
+                    timestamp,
+                    close,
+                    volume
+                FROM ohlcv 
+                WHERE symbol = :symbol
+            ) subq
+            WHERE mark_prices.symbol = :symbol
+            AND mark_prices.timestamp = subq.timestamp
+            AND (mark_prices.ohlcv_close IS NULL OR mark_prices.ohlcv_volume IS NULL)
+        """)
+        
+        result = session.execute(update_query, {'symbol': symbol})
+        end_time = datetime.now()
+        
+        duration = (end_time - start_time).total_seconds()
+        log.info(f"OHLCV actualizado en {duration:.1f}s - {result.rowcount:,} registros")
+
+def get_progress_estimate(symbol: str) -> Dict:
+    """Estimar progreso si hay datos existentes"""
+    with db_manager.get_session() as session:
+        # Total registros en orderbook válidos
+        total_query = text("""
+            SELECT COUNT(*) as total
+            FROM orderbook 
+            WHERE symbol = :symbol
+            AND bid1_price IS NOT NULL 
+            AND ask1_price IS NOT NULL
+            AND valid_for_trading = TRUE
+            AND bid1_price > 0 
+            AND ask1_price > 0
+            AND bid1_price < ask1_price
+            AND bid1_size > 0
+            AND ask1_size > 0
+        """)
+        total = session.execute(total_query, {'symbol': symbol}).fetchone().total
+        
+        # Registros ya procesados en mark_prices
+        processed_query = text("""
+            SELECT COUNT(*) as processed
+            FROM mark_prices 
+            WHERE symbol = :symbol
+        """)
+        processed = session.execute(processed_query, {'symbol': symbol}).fetchone().processed
+        
+        return {
+            'total': total,
+            'processed': processed,
+            'remaining': total - processed,
+            'progress_pct': (processed / max(1, total)) * 100
+        }
 
 def main():
-    """Función principal final"""
+    """Función principal ULTRA RÁPIDA - MODO COMPLETAMENTE AUTOMÁTICO"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Calculate mark prices - ESQUEMA VERIFICADO")
+    parser = argparse.ArgumentParser(description="Calculate mark prices - ULTRA FAST & FULLY AUTOMATED")
     parser.add_argument("--symbol", type=str, help="Specific symbol to process")
     parser.add_argument("--force", action="store_true", help="Force recalculation")
     
     args = parser.parse_args()
     
-    log.info("Iniciando cálculo FINAL de mark prices...")
-    log.info("Esquema verificado: usando valid_for_trading y ohlcv_volume")
+    log.info("Iniciando cálculo ULTRA RÁPIDO de mark prices...")
+    log.info("🤖 MODO COMPLETAMENTE AUTOMÁTICO: Sin intervención manual")
     
     # Obtener símbolos
     if args.symbol:
@@ -342,38 +228,63 @@ def main():
         log.error("No hay símbolos para procesar")
         return False
     
-    log.info(f"Procesando {len(symbols)} símbolos con esquema verificado")
+    log.info(f"Procesando {len(symbols)} símbolos con método ULTRA RÁPIDO")
     
     try:
         total_processed = 0
         
         for symbol in symbols:
             log.info(f"\n{'='*60}")
-            log.info(f"PROCESANDO {symbol} - FINAL")
+            log.info(f"PROCESANDO {symbol} - ULTRA FAST & AUTOMATED")
             log.info(f"{'='*60}")
             
-            if args.force:
-                with db_manager.get_session() as session:
-                    result = session.execute(text("DELETE FROM mark_prices WHERE symbol = :symbol"), 
-                                          {'symbol': symbol})
-                    log.info(f"Eliminados {result.rowcount} mark prices existentes")
+            # MODO COMPLETAMENTE AUTOMÁTICO: Verificar progreso sin preguntar
+            if not args.force:
+                progress = get_progress_estimate(symbol)
+                if progress['processed'] > 0:
+                    log.info(f"Progreso existente: {progress['processed']:,}/{progress['total']:,} ({progress['progress_pct']:.1f}%)")
+                    
+                    if progress['progress_pct'] >= 99:
+                        log.info(f"✅ {symbol} ya está 99%+ completo - saltando procesamiento")
+                        continue
+                    elif progress['progress_pct'] >= 95:
+                        log.info(f"✅ {symbol} está {progress['progress_pct']:.1f}% completo - procesando solo registros faltantes")
+                    elif progress['progress_pct'] >= 50:
+                        log.info(f"🔄 {symbol} está {progress['progress_pct']:.1f}% completo - continuando automáticamente")
+                    else:
+                        log.info(f"🔄 {symbol} está {progress['progress_pct']:.1f}% completo - procesando incrementalmente")
+                else:
+                    log.info(f"🆕 {symbol} - iniciando cálculo desde cero")
             
-            processed_count = calculate_mark_prices_simple(symbol)
+            if args.force:
+                try:
+                    with db_manager.get_session() as session:
+                        result = session.execute(text("DELETE FROM mark_prices WHERE symbol = :symbol"), 
+                                              {'symbol': symbol})
+                        log.info(f"🗑️ Eliminados {result.rowcount} mark prices existentes")
+                except Exception as e:
+                    log.warning(f"Error eliminando datos existentes: {e}")
+            
+            start_time = datetime.now()
+            processed_count = calculate_mark_prices_ultrafast(symbol)
             
             if processed_count > 0:
-                update_ohlcv_data(symbol)
+                update_ohlcv_ultrafast(symbol)
                 total_processed += processed_count
+                
+                end_time = datetime.now()
+                duration = (end_time - start_time).total_seconds()
+                rate = processed_count / duration if duration > 0 else 0
+                
                 log.info(f"✅ {processed_count:,} mark prices calculados para {symbol}")
+                log.info(f"   Tiempo total: {duration:.1f}s ({rate:.0f} records/sec)")
             else:
-                log.warning(f"⚠️ No se calcularon mark prices para {symbol}")
+                log.info(f"ℹ️ No se agregaron nuevos mark prices para {symbol} (ya existían)")
         
-        log.info(f"\n🎉 Cálculo FINAL completado!")
+        log.info(f"\n🎉 Cálculo ULTRA RÁPIDO completado!")
         log.info(f"Total procesados: {total_processed:,} mark prices")
-        log.info(f"Características:")
-        log.info(f"  - Usa SOLO valid_for_trading del orderbook")
-        log.info(f"  - Incluye ohlcv_volume en el esquema")
-        log.info(f"  - VWAP de todos los niveles disponibles")
-        log.info(f"  - Máxima cobertura temporal")
+        if total_processed > 0:
+            log.info(f"Velocidad promedio: ~{total_processed//60:.0f}k records/min")
         
         return True
         
