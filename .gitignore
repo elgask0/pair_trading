@@ -132,7 +132,6 @@ dmypy.json
 # Trading system specific
 logs/
 *.log
-data/
 backups/
 temp/
 tmp/
