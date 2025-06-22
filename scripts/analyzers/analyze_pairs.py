@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-📊 Professional Pair Trading Analysis - DYNAMIC SPREAD VERSION
-Análisis con spreads dinámicos calculados con OLS rolling
+📊 Pair Analysis - DEBUG ALIGNMENT ISSUES
+Análisis completo con logs detallados para entender el problema de alineamiento
 """
 
 import sys
@@ -14,13 +14,10 @@ from datetime import datetime, timedelta
 from sqlalchemy import text
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from scipy import stats
-from statsmodels.tsa.stattools import coint, adfuller, kpss
-from statsmodels.regression.linear_model import OLS
-from statsmodels.stats.diagnostic import het_arch
-from statsmodels.tsa.stattools import acf, pacf
 import argparse
 import warnings
+from scipy import stats
+from sklearn.linear_model import LinearRegression
 warnings.filterwarnings('ignore')
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
@@ -29,516 +26,512 @@ from src.utils.logger import get_validation_logger
 
 log = get_validation_logger()
 
-# Configuración mejorada de matplotlib
-plt.style.use('seaborn-v0_8-darkgrid')
+plt.style.use('default')
 plt.rcParams['figure.facecolor'] = 'white'
 plt.rcParams['font.size'] = 10
 plt.rcParams['axes.grid'] = True
 plt.rcParams['grid.alpha'] = 0.3
-plt.rcParams['figure.dpi'] = 100
 
-def _infer_samples_per_day(index: pd.DatetimeIndex) -> float:
-    """Return the mean number of observations per calendar day."""
-    if len(index) < 2:
-        return 1440.0  # Default: minute data
-    
-    # Calculate actual frequency
-    total_days = (index[-1] - index[0]).total_seconds() / 86400
-    if total_days <= 0:
-        return 1440.0
-    
-    return len(index) / total_days
-
-def load_mark_prices_data(symbol1: str, symbol2: str) -> Tuple[pd.Series, pd.Series]:
-    """Cargar mark prices de la base de datos (como en analyze_markprices.py)"""
-    log.info(f"Loading mark prices for {symbol1} / {symbol2}")
-    
+def check_table_columns(table_name: str) -> dict:
+    """EXACTAMENTE la misma función que analyze_markprices.py"""
     with db_manager.get_session() as session:
-        # Cargar mark prices directamente
-        query = text("""
+        try:
+            result = session.execute(text(f"""
+                SELECT column_name, data_type 
+                FROM information_schema.columns 
+                WHERE table_name = '{table_name}'
+                ORDER BY column_name
+            """)).fetchall()
+            
+            columns = {row.column_name: row.data_type for row in result}
+            log.info(f"Table {table_name}: {len(columns)} columns found")
+            return columns
+            
+        except Exception as e:
+            log.error(f"Error checking table {table_name}: {e}")
+            return {}
+
+def load_mark_prices_data(symbol: str, sample_rate: int = 10) -> pd.DataFrame:
+    """EXACTAMENTE la misma función que analyze_markprices.py"""
+    with db_manager.get_session() as session:
+        # Verificar qué columnas existen primero
+        mp_columns = check_table_columns('mark_prices')
+        
+        # Primero verificar cuántos registros hay
+        count_result = session.execute(text("""
+            SELECT COUNT(*) as total FROM mark_prices WHERE symbol = :symbol
+        """), {'symbol': symbol}).fetchone()
+        
+        total_records = count_result.total
+        
+        # Determinar sampling
+        if total_records > 100000:
+            sample_clause = f"WHERE rn % {sample_rate} = 1"
+            log.info(f"Sampling 1 of every {sample_rate} records ({total_records:,} total)")
+        else:
+            sample_clause = ""
+            log.info(f"Loading all {total_records:,} records")
+        
+        # Construir SELECT basado en columnas disponibles
+        select_columns = ['timestamp', 'mark_price', 'orderbook_mid']
+        
+        if 'ohlcv_volume' in mp_columns:
+            select_columns.append('ohlcv_volume')
+        
+        if 'liquidity_score' in mp_columns:
+            select_columns.append('liquidity_score')
+        
+        if 'valid_for_trading' in mp_columns:
+            select_columns.append('valid_for_trading')
+        elif 'is_valid' in mp_columns:
+            select_columns.append('is_valid as valid_for_trading')
+        
+        query = text(f"""
             SELECT 
-                m1.timestamp,
-                m1.mark_price as price1,
-                m2.mark_price as price2
-            FROM mark_prices m1
-            JOIN mark_prices m2 ON m1.timestamp = m2.timestamp
-            WHERE m1.symbol = :symbol1
-            AND m2.symbol = :symbol2
-            AND m1.mark_price > 0
-            AND m2.mark_price > 0
-            AND m1.valid_for_trading = TRUE
-            AND m2.valid_for_trading = TRUE
-            ORDER BY m1.timestamp
+                {', '.join(select_columns)}
+            FROM (
+                SELECT 
+                    *,
+                    ROW_NUMBER() OVER (ORDER BY timestamp) as rn
+                FROM mark_prices 
+                WHERE symbol = :symbol
+            ) t
+            {sample_clause}
+            ORDER BY timestamp
         """)
         
-        df = pd.read_sql(query, session.bind, params={
-            'symbol1': symbol1, 'symbol2': symbol2
-        }, parse_dates=['timestamp'])
-        
-        if df.empty:
-            log.error("No aligned mark prices data found")
-            return pd.Series(), pd.Series()
-        
-        # Set timestamp as index
-        df.set_index('timestamp', inplace=True)
-        
-        # Resample to regular intervals
-        df_resampled = df.resample('1T').last()
-        df_aligned = df_resampled.dropna()
-        
-        prices1 = df_aligned['price1']
-        prices2 = df_aligned['price2']
-        
-        log.info(f"Loaded {len(df_aligned):,} aligned mark price observations")
-        log.info(f"Price ranges - {symbol1}: ${prices1.min():.2f} to ${prices1.max():.2f}")
-        log.info(f"Price ranges - {symbol2}: ${prices2.min():.2f} to ${prices2.max():.2f}")
-        
-        return prices1, prices2
+        df = pd.read_sql(query, session.bind, params={'symbol': symbol}, index_col='timestamp')
+        return df
 
-def calculate_dynamic_spread(log_p1: pd.Series, log_p2: pd.Series, window: int) -> Dict:
-    """Calculate spread using rolling OLS parameters"""
-    log.info(f"Calculating dynamic spread with {window}-sample window...")
+def debug_timestamp_analysis(df1: pd.DataFrame, df2: pd.DataFrame, s1: str, s2: str):
+    """Análisis detallado de timestamps para debug"""
+    log.info(f"\n🔍 DEBUG TIMESTAMP ANALYSIS:")
     
-    # Initialize arrays
-    spreads = []
-    alphas = []
-    betas = []
-    r_squareds = []
-    timestamps = []
+    # Análisis de timestamps originales
+    ts1 = df1.index
+    ts2 = df2.index
     
-    # Rolling calculation
-    for i in range(window, len(log_p1)):
-        window_p1 = log_p1.iloc[i-window:i]
-        window_p2 = log_p2.iloc[i-window:i]
-        
-        # OLS regression for this window
-        X = np.column_stack([np.ones(len(window_p2)), window_p2.values])
-        model = OLS(window_p1.values, X).fit()
-        
-        alpha = model.params[0]
-        beta = model.params[1]
-        r_squared = model.rsquared
-        
-        # Calculate spread for current point using window's parameters
-        spread_value = log_p1.iloc[i] - (beta * log_p2.iloc[i] + alpha)
-        
-        spreads.append(spread_value)
-        alphas.append(alpha)
-        betas.append(beta)
-        r_squareds.append(r_squared)
-        timestamps.append(log_p1.index[i])
+    log.info(f"  {s1} timestamps:")
+    log.info(f"    Count: {len(ts1):,}")
+    log.info(f"    Range: {ts1.min()} to {ts1.max()}")
+    log.info(f"    Sample timestamps:")
+    for i in range(min(5, len(ts1))):
+        log.info(f"      {i+1}: {ts1[i]}")
     
-    # Convert to Series
-    spread_series = pd.Series(spreads, index=timestamps)
-    alpha_series = pd.Series(alphas, index=timestamps)
-    beta_series = pd.Series(betas, index=timestamps)
-    r_squared_series = pd.Series(r_squareds, index=timestamps)
+    log.info(f"  {s2} timestamps:")
+    log.info(f"    Count: {len(ts2):,}")
+    log.info(f"    Range: {ts2.min()} to {ts2.max()}")
+    log.info(f"    Sample timestamps:")
+    for i in range(min(5, len(ts2))):
+        log.info(f"      {i+1}: {ts2[i]}")
     
-    return {
-        'spread': spread_series,
-        'alpha': alpha_series,
-        'beta': beta_series,
-        'r_squared': r_squared_series
-    }
+    # Análisis de intervalos
+    if len(ts1) > 1:
+        intervals1 = ts1.to_series().diff().dropna()
+        log.info(f"  {s1} intervals:")
+        log.info(f"    Mean: {intervals1.mean()}")
+        log.info(f"    Median: {intervals1.median()}")
+        log.info(f"    Min: {intervals1.min()}")
+        log.info(f"    Max: {intervals1.max()}")
+    
+    if len(ts2) > 1:
+        intervals2 = ts2.to_series().diff().dropna()
+        log.info(f"  {s2} intervals:")
+        log.info(f"    Mean: {intervals2.mean()}")
+        log.info(f"    Median: {intervals2.median()}")
+        log.info(f"    Min: {intervals2.min()}")
+        log.info(f"    Max: {intervals2.max()}")
+    
+    # Buscar timestamps exactos comunes
+    exact_common = ts1.intersection(ts2)
+    log.info(f"  Exact common timestamps: {len(exact_common):,}")
+    
+    if len(exact_common) > 0:
+        log.info(f"    Sample common timestamps:")
+        for i in range(min(5, len(exact_common))):
+            log.info(f"      {i+1}: {exact_common[i]}")
 
-def calculate_rolling_stationarity_dynamic(dynamic_spread: pd.Series, name: str,
-                                         test_window_days: int = 30,
-                                         step_days: int = 1) -> Dict:
-    """Calculate stationarity tests on dynamic spread"""
-    log.info(f"Running rolling stationarity tests on dynamic spread ({test_window_days}-day test window)")
+def align_price_data_improved(df1: pd.DataFrame, df2: pd.DataFrame, s1: str, s2: str) -> Tuple[pd.Series, pd.Series]:
+    """Alineamiento mejorado de datos de precios con debug detallado"""
+    log.info(f"\n🔄 IMPROVED PRICE ALIGNMENT: {s1} vs {s2}")
     
-    samples_per_day = _infer_samples_per_day(dynamic_spread.index)
-    test_window_points = int(test_window_days * samples_per_day)
-    step_points = max(int(step_days * samples_per_day), 1)
+    # Debug inicial
+    debug_timestamp_analysis(df1, df2, s1, s2)
     
-    if len(dynamic_spread) < test_window_points + step_points:
-        log.warning("Insufficient data for rolling stationarity tests")
-        return {'error': 'Insufficient data'}
+    prices1 = df1['mark_price']
+    prices2 = df2['mark_price']
     
-    results = {
-        'test_window_days': test_window_days,
-        'adf_pvalues': [],
-        'kpss_pvalues': [],
-        'timestamps': []
-    }
+    # PASO 1: Intentar timestamps exactos
+    log.info(f"\n📊 STEP 1: Exact timestamp alignment")
+    exact_common = prices1.index.intersection(prices2.index)
+    log.info(f"  Exact matches: {len(exact_common):,}")
     
-    # Rolling tests
-    for i in range(test_window_points, len(dynamic_spread), step_points):
-        test_data = dynamic_spread.iloc[i-test_window_points:i]
-        timestamp = dynamic_spread.index[i-1]
+    if len(exact_common) > 100:  # Si tenemos suficientes matches exactos
+        log.info(f"  ✅ Using exact timestamp alignment")
+        return prices1.loc[exact_common], prices2.loc[exact_common]
+    
+    # PASO 2: Redondear a minutos
+    log.info(f"\n📊 STEP 2: Rounding to minutes")
+    
+    # Crear copias para redondeo
+    df1_rounded = df1.copy()
+    df2_rounded = df2.copy()
+    
+    # Redondear índices a minutos
+    df1_rounded.index = df1_rounded.index.round('T')
+    df2_rounded.index = df2_rounded.index.round('T')
+    
+    log.info(f"  After rounding:")
+    log.info(f"    {s1}: {len(df1_rounded):,} records")
+    log.info(f"    {s2}: {len(df2_rounded):,} records")
+    
+    # Agrupar por minuto (tomar último valor si hay múltiples)
+    df1_grouped = df1_rounded.groupby(df1_rounded.index).last()
+    df2_grouped = df2_rounded.groupby(df2_rounded.index).last()
+    
+    log.info(f"  After grouping by minute:")
+    log.info(f"    {s1}: {len(df1_grouped):,} unique minutes")
+    log.info(f"    {s2}: {len(df2_grouped):,} unique minutes")
+    
+    # Encontrar minutos comunes
+    minute_common = df1_grouped.index.intersection(df2_grouped.index)
+    log.info(f"  Common minutes: {len(minute_common):,}")
+    
+    if len(minute_common) > 100:
+        log.info(f"  ✅ Using minute-rounded alignment")
+        aligned1 = df1_grouped.loc[minute_common]['mark_price']
+        aligned2 = df2_grouped.loc[minute_common]['mark_price']
         
-        # ADF test
-        try:
-            adf_stat, adf_p, _, _, _, _ = adfuller(test_data, autolag='AIC')
-            results['adf_pvalues'].append(adf_p)
-            results['timestamps'].append(timestamp)
-        except:
-            continue
+        # Log sample of aligned data
+        log.info(f"  Sample aligned data:")
+        for i in range(min(5, len(aligned1))):
+            ts = aligned1.index[i]
+            log.info(f"    {ts}: {s1}={aligned1.iloc[i]:.6f}, {s2}={aligned2.iloc[i]:.6f}")
         
-        # KPSS test
-        try:
-            kpss_stat, kpss_p, _, _ = kpss(test_data, regression='c')
-            results['kpss_pvalues'].append(kpss_p)
-        except:
-            results['kpss_pvalues'].append(np.nan)
+        return aligned1, aligned2
     
-    # Convert to Series
-    if results['timestamps']:
-        results['adf_pvalues'] = pd.Series(results['adf_pvalues'], index=results['timestamps'])
-        results['kpss_pvalues'] = pd.Series(results['kpss_pvalues'], index=results['timestamps'])
-        
-        # Summary statistics
-        adf_stationary_pct = (results['adf_pvalues'] < 0.05).mean() * 100
-        kpss_stationary_pct = (results['kpss_pvalues'] > 0.05).mean() * 100
-        
-        results['summary'] = {
-            'adf_stationary_pct': adf_stationary_pct,
-            'kpss_stationary_pct': kpss_stationary_pct,
-            'adf_latest_pvalue': results['adf_pvalues'].iloc[-1],
-            'kpss_latest_pvalue': results['kpss_pvalues'].iloc[-1],
-            'observations': len(results['adf_pvalues'])
-        }
-        
-        log.info(f"  Dynamic spread ADF: {adf_stationary_pct:.1f}% of windows stationary")
-        log.info(f"  Dynamic spread KPSS: {kpss_stationary_pct:.1f}% of windows stationary")
+    # PASO 3: Usar nearest neighbor matching
+    log.info(f"\n📊 STEP 3: Nearest neighbor alignment")
     
-    return results
+    # Encontrar overlap temporal
+    start_time = max(prices1.index.min(), prices2.index.min())
+    end_time = min(prices1.index.max(), prices2.index.max())
+    
+    log.info(f"  Temporal overlap: {start_time} to {end_time}")
+    
+    if start_time >= end_time:
+        log.error(f"  ❌ No temporal overlap!")
+        return pd.Series(), pd.Series()
+    
+    # Filtrar a overlap period
+    overlap1 = prices1[(prices1.index >= start_time) & (prices1.index <= end_time)]
+    overlap2 = prices2[(prices2.index >= start_time) & (prices2.index <= end_time)]
+    
+    log.info(f"  Data in overlap period:")
+    log.info(f"    {s1}: {len(overlap1):,} records")
+    log.info(f"    {s2}: {len(overlap2):,} records")
+    
+    # Usar resample para alinear a intervalos regulares
+    freq = '5T'  # 5 minutos para tener más puntos
+    log.info(f"  Resampling to {freq} intervals...")
+    
+    resampled1 = overlap1.resample(freq).last().dropna()
+    resampled2 = overlap2.resample(freq).last().dropna()
+    
+    log.info(f"  After resampling:")
+    log.info(f"    {s1}: {len(resampled1):,} intervals")
+    log.info(f"    {s2}: {len(resampled2):,} intervals")
+    
+    # Encontrar intervalos comunes
+    final_common = resampled1.index.intersection(resampled2.index)
+    log.info(f"  Final common intervals: {len(final_common):,}")
+    
+    if len(final_common) > 10:
+        log.info(f"  ✅ Using {freq} resampled alignment")
+        return resampled1.loc[final_common], resampled2.loc[final_common]
+    else:
+        log.error(f"  ❌ Insufficient aligned data: {len(final_common)} points")
+        return pd.Series(), pd.Series()
 
-def calculate_half_life_dynamic(dynamic_spread: pd.Series) -> Dict:
-    """Calculate half-life on dynamic spread"""
-    log.info("Calculating half-life on dynamic spread...")
+def calculate_regression_and_spread(prices1: pd.Series, prices2: pd.Series, 
+                                  symbol1: str, symbol2: str) -> Dict:
+    """Calcular regresión y spread entre dos series de precios"""
+    log.info(f"\n📈 REGRESSION AND SPREAD CALCULATION: {symbol1} vs {symbol2}")
     
-    spread_clean = dynamic_spread.dropna()
-    if len(spread_clean) < 20:
-        return {'error': 'Insufficient data'}
+    if len(prices1) != len(prices2) or len(prices1) < 10:
+        log.error(f"Insufficient aligned data: {len(prices1)} points")
+        return {}
     
-    # AR(1) regression
-    spread_lag = spread_clean.shift(1)
-    delta_spread = spread_clean.diff()
-    
-    valid_data = pd.DataFrame({
-        'delta': delta_spread,
-        'lag': spread_lag
-    }).dropna()
+    # Eliminar NaN values
+    valid_data = pd.DataFrame({'price1': prices1, 'price2': prices2}).dropna()
     
     if len(valid_data) < 10:
-        return {'error': 'Insufficient valid data'}
+        log.error(f"Insufficient valid data after cleaning: {len(valid_data)} points")
+        return {}
     
-    # OLS regression
-    X = np.column_stack([np.ones(len(valid_data)), valid_data['lag'].values])
-    y = valid_data['delta'].values
+    log.info(f"Using {len(valid_data):,} aligned data points for regression")
     
-    model = OLS(y, X).fit()
-    alpha_hat, beta_hat = model.params
+    # Log sample of data being used
+    log.info(f"Sample of aligned data:")
+    for i in range(min(5, len(valid_data))):
+        row = valid_data.iloc[i]
+        ts = valid_data.index[i]
+        log.info(f"  {ts}: price1={row['price1']:.6f}, price2={row['price2']:.6f}")
     
-    # Calculate half-life
-    if beta_hat >= 0:
-        halflife_obs = np.inf
-    else:
-        halflife_obs = -np.log(2) / beta_hat
+    # Preparar datos para regresión
+    X = valid_data['price2'].values.reshape(-1, 1)  # Symbol2 como predictor
+    y = valid_data['price1'].values                 # Symbol1 como target
     
-    # Convert to time units
-    samples_per_day = _infer_samples_per_day(spread_clean.index)
-    halflife_days = halflife_obs / samples_per_day if samples_per_day > 0 else np.inf
-    halflife_hours = halflife_days * 24
+    # Regresión lineal
+    reg = LinearRegression()
+    reg.fit(X, y)
+    
+    # Coeficientes
+    alpha = reg.intercept_
+    beta = reg.coef_[0]
+    r_squared = reg.score(X, y)
+    
+    # Predicciones
+    y_pred = reg.predict(X)
+    
+    # Spread = Actual - Predicted
+    spread = y - y_pred
+    spread_series = pd.Series(spread, index=valid_data.index)
+    
+    # Estadísticas del spread
+    spread_mean = spread.mean()
+    spread_std = spread.std()
+    
+    # Z-score del spread
+    z_score = (spread - spread_mean) / spread_std
+    z_score_series = pd.Series(z_score, index=valid_data.index)
+    
+    # Correlación y estadísticas adicionales
+    correlation = np.corrcoef(valid_data['price1'], valid_data['price2'])[0, 1]
+    
+    log.info(f"Regression results:")
+    log.info(f"  Equation: {symbol1} = {alpha:.6f} + {beta:.6f} * {symbol2}")
+    log.info(f"  R²: {r_squared:.4f}")
+    log.info(f"  Correlation: {correlation:.4f}")
+    log.info(f"  Spread mean: {spread_mean:.6f}")
+    log.info(f"  Spread std: {spread_std:.6f}")
     
     return {
-        'ar1': {
-            'alpha': alpha_hat,
-            'beta': beta_hat,
-            'r_squared': model.rsquared,
-            'beta_pvalue': model.pvalues[1],
-            'half_life_obs': halflife_obs,
-            'half_life_days': halflife_days,
-            'half_life_hours': halflife_hours,
-        }
+        'alpha': alpha,
+        'beta': beta,
+        'r_squared': r_squared,
+        'correlation': correlation,
+        'spread_mean': spread_mean,
+        'spread_std': spread_std,
+        'spread': spread_series,
+        'z_score': z_score_series,
+        'aligned_prices1': pd.Series(valid_data['price1'], index=valid_data.index),
+        'aligned_prices2': pd.Series(valid_data['price2'], index=valid_data.index),
+        'predictions': pd.Series(y_pred, index=valid_data.index)
     }
 
-def create_enhanced_visualization(symbol1: str, symbol2: str,
-                                prices1: pd.Series, prices2: pd.Series,
-                                dynamic_spreads: Dict[int, Dict],
-                                rolling_stationarity: Dict[int, Dict],
-                                half_life_results: Dict[int, Dict]):
-    """Create visualization with dynamic spreads"""
+def create_complete_pair_analysis(symbol1: str, symbol2: str):
+    """Crear análisis completo con ejes Y duales y mejor alineamiento"""
     
-    fig = plt.figure(figsize=(20, 16))
-    gs = fig.add_gridspec(5, 2, height_ratios=[1.5, 1, 1, 1, 1], hspace=0.3, wspace=0.3)
+    log.info(f"Creating complete pair analysis for {symbol1} / {symbol2}")
     
     s1 = symbol1.split('_')[-2] if '_' in symbol1 else symbol1
     s2 = symbol2.split('_')[-2] if '_' in symbol2 else symbol2
     
-    # 1. Price Series (Mark Prices)
-    ax1 = fig.add_subplot(gs[0, :])
+    # CARGAR DATOS
+    log.info(f"Loading mark prices for {s1}...")
+    df_marks1 = load_mark_prices_data(symbol1, sample_rate=10)
+    
+    log.info(f"Loading mark prices for {s2}...")
+    df_marks2 = load_mark_prices_data(symbol2, sample_rate=10)
+    
+    if df_marks1.empty or df_marks2.empty:
+        log.error("No mark prices data available")
+        return
+    
+    log.info(f"Loaded data:")
+    log.info(f"  {s1}: {len(df_marks1):,} records")
+    log.info(f"  {s2}: {len(df_marks2):,} records")
+    
+    # Alineamiento mejorado con debug
+    aligned_prices1, aligned_prices2 = align_price_data_improved(df_marks1, df_marks2, s1, s2)
+    
+    if aligned_prices1.empty or aligned_prices2.empty:
+        log.error("No aligned data available")
+        return
+    
+    log.info(f"Final aligned data: {len(aligned_prices1):,} common points")
+    
+    # Calcular regresión y spread
+    regression_results = calculate_regression_and_spread(aligned_prices1, aligned_prices2, s1, s2)
+    
+    if not regression_results:
+        log.error("Could not calculate regression")
+        return
+    
+    # Crear figura con 4 subplots
+    fig = plt.figure(figsize=(20, 16))
+    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
     
     color1 = 'tab:blue'
-    ax1.set_xlabel('Date')
-    ax1.set_ylabel(f'{s1} Mark Price', color=color1)
-    ax1.plot(prices1.index, prices1.values, color=color1, alpha=0.7, linewidth=1, label=s1)
-    ax1.tick_params(axis='y', labelcolor=color1)
-    ax1.set_yscale('log')
-    
-    ax1_twin = ax1.twinx()
     color2 = 'tab:orange'
-    ax1_twin.set_ylabel(f'{s2} Mark Price', color=color2)
-    ax1_twin.plot(prices2.index, prices2.values, color=color2, alpha=0.7, linewidth=1, label=s2)
-    ax1_twin.tick_params(axis='y', labelcolor=color2)
-    ax1_twin.set_yscale('log')
     
-    ax1.set_title(f'Mark Prices: {s1} vs {s2} (from database)', fontsize=14, fontweight='bold')
+    # ===== SUBPLOT 1: SERIES TEMPORALES CON EJES Y DUALES =====
+    ax1 = fig.add_subplot(gs[0, 0])
+    
+    # Plot symbol1 (eje izquierdo)
+    ax1.plot(df_marks1.index, df_marks1['mark_price'], 
+             color=color1, linewidth=1, alpha=0.8, label=f'{s1}')
+    ax1.set_ylabel(f'{s1} Price (USD)', color=color1, fontweight='bold')
+    ax1.tick_params(axis='y', labelcolor=color1)
     ax1.grid(True, alpha=0.3)
     
-    # 2. Dynamic Spreads Comparison
-    ax2 = fig.add_subplot(gs[1, :])
+    # Plot symbol2 (eje derecho)
+    ax1_twin = ax1.twinx()
+    ax1_twin.plot(df_marks2.index, df_marks2['mark_price'], 
+                  color=color2, linewidth=1, alpha=0.8, label=f'{s2}')
+    ax1_twin.set_ylabel(f'{s2} Price (USD)', color=color2, fontweight='bold')
+    ax1_twin.tick_params(axis='y', labelcolor=color2)
     
-    colors = plt.cm.viridis(np.linspace(0, 1, len(dynamic_spreads)))
+    ax1.set_title(f'Mark Prices: {s1} vs {s2}', fontweight='bold')
     
-    for i, (window_days, data) in enumerate(sorted(dynamic_spreads.items())):
-        spread = data['spread']
-        ax2.plot(spread.index, spread.values, alpha=0.7, linewidth=1, 
-                color=colors[i], label=f'{window_days}d window')
+    # Leyenda combinada
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax1_twin.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
     
-    ax2.set_title('Dynamic Spreads (OLS Rolling)', fontsize=12, fontweight='bold')
-    ax2.set_ylabel('Spread Value')
-    ax2.legend(loc='upper right')
+    # ===== SUBPLOT 2: SCATTERPLOT =====
+    ax2 = fig.add_subplot(gs[0, 1])
+    
+    # Scatter plot con línea de regresión
+    aligned_p1 = regression_results['aligned_prices1']
+    aligned_p2 = regression_results['aligned_prices2']
+    predictions = regression_results['predictions']
+    
+    ax2.scatter(aligned_p2, aligned_p1, alpha=0.6, s=30, color='blue', label='Data')
+    ax2.plot(aligned_p2, predictions, color='red', linewidth=2, label='Regression Line')
+    
+    ax2.set_xlabel(f'{s2} Price (USD)')
+    ax2.set_ylabel(f'{s1} Price (USD)')
+    ax2.set_title(f'Scatter Plot: {s1} vs {s2}', fontweight='bold')
+    
+    # Añadir ecuación y R²
+    alpha = regression_results['alpha']
+    beta = regression_results['beta']
+    r_squared = regression_results['r_squared']
+    
+    equation_text = f'{s1} = {alpha:.4f} + {beta:.4f} × {s2}\nR² = {r_squared:.4f}\nPoints: {len(aligned_p1):,}'
+    ax2.text(0.05, 0.95, equation_text, transform=ax2.transAxes, 
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+            verticalalignment='top', fontsize=10)
+    
+    ax2.legend()
     ax2.grid(True, alpha=0.3)
     
-    # 3. Beta Evolution
-    ax3 = fig.add_subplot(gs[2, 0])
+    # ===== SUBPLOT 3: SPREAD =====
+    ax3 = fig.add_subplot(gs[1, 0])
     
-    for i, (window_days, data) in enumerate(sorted(dynamic_spreads.items())):
-        beta = data['beta']
-        ax3.plot(beta.index, beta.values, alpha=0.7, linewidth=1,
-                color=colors[i], label=f'{window_days}d')
+    spread = regression_results['spread']
+    spread_mean = regression_results['spread_mean']
+    spread_std = regression_results['spread_std']
     
-    ax3.set_title('Rolling Beta (Hedge Ratio)', fontsize=12, fontweight='bold')
-    ax3.set_ylabel('Beta')
+    ax3.plot(spread.index, spread.values, color='green', linewidth=1, alpha=0.8)
+    ax3.axhline(y=spread_mean, color='red', linestyle='--', alpha=0.7, label=f'Mean: {spread_mean:.4f}')
+    ax3.axhline(y=spread_mean + 2*spread_std, color='orange', linestyle=':', alpha=0.7, label='+2σ')
+    ax3.axhline(y=spread_mean - 2*spread_std, color='orange', linestyle=':', alpha=0.7, label='-2σ')
+    ax3.fill_between(spread.index, spread_mean - 2*spread_std, spread_mean + 2*spread_std, 
+                     alpha=0.1, color='orange')
+    
+    ax3.set_ylabel('Spread (Actual - Predicted)')
+    ax3.set_title(f'Regression Spread: {s1} - Predicted', fontweight='bold')
     ax3.legend()
     ax3.grid(True, alpha=0.3)
+    ax3.tick_params(axis='x', rotation=45)
     
-    # 4. R-squared Evolution
-    ax4 = fig.add_subplot(gs[2, 1])
+    # ===== SUBPLOT 4: Z-SCORE =====
+    ax4 = fig.add_subplot(gs[1, 1])
     
-    for i, (window_days, data) in enumerate(sorted(dynamic_spreads.items())):
-        r2 = data['r_squared']
-        ax4.plot(r2.index, r2.values, alpha=0.7, linewidth=1,
-                color=colors[i], label=f'{window_days}d')
+    z_score = regression_results['z_score']
     
-    ax4.set_title('Rolling R² (Model Fit)', fontsize=12, fontweight='bold')
-    ax4.set_ylabel('R²')
-    ax4.set_ylim(0, 1)
+    ax4.plot(z_score.index, z_score.values, color='purple', linewidth=1, alpha=0.8)
+    ax4.axhline(y=0, color='black', linestyle='-', alpha=0.5)
+    ax4.axhline(y=2, color='red', linestyle='--', alpha=0.7, label='±2σ')
+    ax4.axhline(y=-2, color='red', linestyle='--', alpha=0.7)
+    ax4.axhline(y=3, color='darkred', linestyle=':', alpha=0.7, label='±3σ')
+    ax4.axhline(y=-3, color='darkred', linestyle=':', alpha=0.7)
+    ax4.fill_between(z_score.index, -2, 2, alpha=0.1, color='green')
+    
+    ax4.set_ylabel('Z-Score')
+    ax4.set_title(f'Spread Z-Score (Trading Signals)', fontweight='bold')
     ax4.legend()
     ax4.grid(True, alpha=0.3)
+    ax4.tick_params(axis='x', rotation=45)
     
-    # 5. Z-Scores for main window (e.g., 30 days)
-    ax5 = fig.add_subplot(gs[3, :])
+    # Formato de fechas para todos los subplots con fechas
+    for ax in [ax1, ax3, ax4]:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
     
-    main_window = 30  # or choose the middle window
-    if main_window in dynamic_spreads:
-        spread = dynamic_spreads[main_window]['spread']
-        
-        # Calculate rolling statistics for z-score
-        samples_per_day = _infer_samples_per_day(spread.index)
-        window_samples = int(30 * samples_per_day)
-        
-        spread_mean = spread.rolling(window_samples).mean()
-        spread_std = spread.rolling(window_samples).std()
-        z_scores = (spread - spread_mean) / spread_std
-        
-        ax5.plot(z_scores.index, z_scores.values, 'b-', alpha=0.7, linewidth=1)
-        ax5.axhline(y=0, color='k', linestyle='-', alpha=0.5)
-        ax5.axhline(y=2, color='r', linestyle='--', alpha=0.5, label='±2σ')
-        ax5.axhline(y=-2, color='r', linestyle='--', alpha=0.5)
-        ax5.axhline(y=3, color='darkred', linestyle=':', alpha=0.5, label='±3σ')
-        ax5.axhline(y=-3, color='darkred', linestyle=':', alpha=0.5)
-        ax5.fill_between(z_scores.index, -2, 2, alpha=0.1, color='green')
-        
-    ax5.set_title(f'Z-Score of Dynamic Spread ({main_window}d window)', fontsize=12, fontweight='bold')
-    ax5.set_ylabel('Z-Score')
-    ax5.legend()
-    ax5.grid(True, alpha=0.3)
+    # Título principal
+    fig.suptitle(f'Complete Pair Analysis: {s1} / {s2} (Improved Alignment)', fontsize=16, fontweight='bold')
     
-    # 6. Rolling ADF p-values for different windows
-    ax6 = fig.add_subplot(gs[4, 0])
-    
-    for window_days, stationarity_data in rolling_stationarity.items():
-        if 'adf_pvalues' in stationarity_data and isinstance(stationarity_data['adf_pvalues'], pd.Series):
-            adf_pvals = stationarity_data['adf_pvalues']
-            ax6.plot(adf_pvals.index, adf_pvals.values, alpha=0.7, linewidth=1, 
-                    label=f'{window_days}d spread')
-    
-    ax6.axhline(y=0.05, color='r', linestyle='--', alpha=0.5, label='5% significance')
-    ax6.axhline(y=0.01, color='darkred', linestyle=':', alpha=0.5, label='1% significance')
-    ax6.fill_between(ax6.get_xlim(), 0, 0.05, alpha=0.2, color='green')
-    ax6.set_title('Rolling ADF Tests on Dynamic Spreads', fontsize=12, fontweight='bold')
-    ax6.set_ylabel('p-value')
-    ax6.set_ylim(0, 0.5)
-    ax6.legend()
-    ax6.grid(True, alpha=0.3)
-    
-    # 7. Half-life comparison
-    ax7 = fig.add_subplot(gs[4, 1])
-    
-    windows = []
-    half_lives = []
-    
-    for window_days, hl_data in half_life_results.items():
-        if 'ar1' in hl_data:
-            windows.append(window_days)
-            half_lives.append(hl_data['ar1']['half_life_days'])
-    
-    if windows and half_lives:
-        bars = ax7.bar(windows, half_lives, alpha=0.7, color='purple')
-        ax7.set_xlabel('Window Size (days)')
-        ax7.set_ylabel('Half-life (days)')
-        ax7.set_title('Half-life by Window Size', fontsize=12, fontweight='bold')
-        ax7.grid(True, alpha=0.3, axis='y')
-        
-        # Add value labels
-        for bar, hl in zip(bars, half_lives):
-            if hl < np.inf:
-                ax7.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.1,
-                        f'{hl:.1f}', ha='center', va='bottom')
-    
-    # Main title
-    fig.suptitle(f'Dynamic Spread Analysis: {s1}/{s2} (Using Mark Prices)', 
-                 fontsize=16, fontweight='bold', y=0.995)
-    
-    # Save figure
     plt.tight_layout()
+    
+    # Guardar
     output_dir = Path('plots')
     output_dir.mkdir(exist_ok=True)
-    filename = output_dir / f"{s1}_{s2}_dynamic_spread_analysis.png"
-    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    filename = output_dir / f"{s1}_{s2}_complete_improved.png"
+    plt.savefig(filename, dpi=300, bbox_inches='tight', facecolor='white')
     plt.close()
     
-    log.info(f"Dynamic spread visualization saved: {filename}")
+    log.info(f"Complete analysis plot saved: {filename}")
+    
+    # Estadísticas finales
+    log.info(f"\n📊 COMPLETE ANALYSIS SUMMARY:")
+    log.info(f"  Aligned data points: {len(aligned_prices1):,}")
+    log.info(f"  Regression equation: {s1} = {alpha:.6f} + {beta:.6f} × {s2}")
+    log.info(f"  R²: {r_squared:.4f}")
+    log.info(f"  Correlation: {regression_results['correlation']:.4f}")
+    log.info(f"  Spread statistics:")
+    log.info(f"    Mean: {spread_mean:.6f}")
+    log.info(f"    Std: {spread_std:.6f}")
+    log.info(f"    Current Z-score: {z_score.iloc[-1]:.2f}")
+    
+    # Trading signals
+    current_z = z_score.iloc[-1]
+    if abs(current_z) > 3:
+        signal = "STRONG SIGNAL"
+    elif abs(current_z) > 2:
+        signal = "MODERATE SIGNAL"
+    else:
+        signal = "NO SIGNAL"
+    
+    direction = "SHORT spread" if current_z > 0 else "LONG spread" if current_z < 0 else "NEUTRAL"
+    
+    log.info(f"  Trading assessment: {signal} - {direction}")
 
 def main():
-    """Main function with dynamic spread analysis"""
-    parser = argparse.ArgumentParser(description="Pair Trading Analysis with Dynamic Spreads")
+    """Función principal con debug detallado"""
+    parser = argparse.ArgumentParser(description="Complete Pair Analysis with Debug")
     parser.add_argument("--symbol1", type=str, required=True)
     parser.add_argument("--symbol2", type=str, required=True)
-    parser.add_argument("--windows", nargs='+', type=int, default=[7, 15, 30, 60, 90],
-                       help="OLS rolling windows in days")
-    parser.add_argument("--test-window", type=int, default=30,
-                       help="Window for stationarity tests in days")
-    parser.add_argument("--no-plots", action="store_true")
     
     args = parser.parse_args()
     
-    log.info("🚀 Dynamic Spread Pair Trading Analysis")
-    log.info(f"Analyzing pair: {args.symbol1} / {args.symbol2}")
-    log.info(f"OLS windows: {args.windows} days")
+    log.info("📊 Starting COMPLETE Pair Analysis with DEBUG")
+    log.info(f"Includes: Time series + Scatter plot + Spread + Z-score + DEBUG logs")
+    log.info(f"Symbols: {args.symbol1} / {args.symbol2}")
     
     try:
-        # Load mark prices data
-        prices1, prices2 = load_mark_prices_data(args.symbol1, args.symbol2)
-        if prices1.empty or prices2.empty:
-            log.error("No mark prices data available")
-            return False
+        # Crear análisis completo
+        create_complete_pair_analysis(args.symbol1, args.symbol2)
         
-        # Calculate log prices
-        log_p1 = np.log(prices1)
-        log_p2 = np.log(prices2)
-        
-        # Calculate dynamic spreads for each window
-        log.info("\n" + "="*60)
-        log.info("CALCULATING DYNAMIC SPREADS")
-        log.info("="*60)
-        
-        dynamic_spreads = {}
-        samples_per_day = _infer_samples_per_day(log_p1.index)
-        
-        for window_days in args.windows:
-            window_samples = int(window_days * samples_per_day)
-            
-            if len(log_p1) < window_samples * 2:
-                log.warning(f"Insufficient data for {window_days}-day window")
-                continue
-            
-            log.info(f"\nProcessing {window_days}-day window ({window_samples} samples)...")
-            dynamic_spreads[window_days] = calculate_dynamic_spread(log_p1, log_p2, window_samples)
-            
-            # Show statistics
-            spread = dynamic_spreads[window_days]['spread']
-            beta = dynamic_spreads[window_days]['beta']
-            log.info(f"  Spread range: {spread.min():.4f} to {spread.max():.4f}")
-            log.info(f"  Beta range: {beta.min():.4f} to {beta.max():.4f}")
-            log.info(f"  Beta current: {beta.iloc[-1]:.4f}")
-        
-        # Run stationarity tests on dynamic spreads
-        log.info("\n" + "="*60)
-        log.info("STATIONARITY TESTS ON DYNAMIC SPREADS")
-        log.info("="*60)
-        
-        rolling_stationarity = {}
-        
-        for window_days, spread_data in dynamic_spreads.items():
-            log.info(f"\nTesting {window_days}-day dynamic spread...")
-            rolling_stationarity[window_days] = calculate_rolling_stationarity_dynamic(
-                spread_data['spread'], 
-                f"{window_days}d dynamic spread",
-                test_window_days=args.test_window
-            )
-        
-        # Calculate half-life for each dynamic spread
-        log.info("\n" + "="*60)
-        log.info("HALF-LIFE ANALYSIS ON DYNAMIC SPREADS")
-        log.info("="*60)
-        
-        half_life_results = {}
-        
-        for window_days, spread_data in dynamic_spreads.items():
-            log.info(f"\nCalculating half-life for {window_days}-day spread...")
-            hl_result = calculate_half_life_dynamic(spread_data['spread'])
-            half_life_results[window_days] = hl_result
-            
-            if 'ar1' in hl_result:
-                log.info(f"  Half-life: {hl_result['ar1']['half_life_days']:.2f} days")
-                log.info(f"  R²: {hl_result['ar1']['r_squared']:.4f}")
-        
-        # Generate visualization
-        if not args.no_plots:
-            log.info("\n" + "="*60)
-            log.info("CREATING VISUALIZATION")
-            log.info("="*60)
-            create_enhanced_visualization(
-                args.symbol1, args.symbol2,
-                prices1, prices2,
-                dynamic_spreads,
-                rolling_stationarity,
-                half_life_results
-            )
-        
-        # Summary report
-        log.info("\n" + "="*60)
-        log.info("DYNAMIC SPREAD ANALYSIS SUMMARY")
-        log.info("="*60)
-        
-        for window_days in sorted(dynamic_spreads.keys()):
-            log.info(f"\n{window_days}-day window:")
-            
-            # Current parameters
-            current_beta = dynamic_spreads[window_days]['beta'].iloc[-1]
-            current_alpha = dynamic_spreads[window_days]['alpha'].iloc[-1]
-            log.info(f"  Current beta: {current_beta:.4f}")
-            log.info(f"  Current alpha: {current_alpha:.4f}")
-            
-            # Stationarity
-            if window_days in rolling_stationarity and 'summary' in rolling_stationarity[window_days]:
-                summary = rolling_stationarity[window_days]['summary']
-                log.info(f"  Stationarity: {summary['adf_stationary_pct']:.1f}% of periods")
-            
-            # Half-life
-            if window_days in half_life_results and 'ar1' in half_life_results[window_days]:
-                hl = half_life_results[window_days]['ar1']['half_life_days']
-                log.info(f"  Half-life: {hl:.2f} days")
-        
-        log.info("\n✅ Dynamic spread analysis completed successfully!")
+        log.info("✅ Complete pair analysis with debug finished!")
+        log.info("🎯 Check the detailed logs above to understand alignment issues!")
         return True
         
     except Exception as e:
-        log.error(f"Analysis failed: {e}")
+        log.error(f"❌ Analysis failed: {e}")
         import traceback
         log.error(traceback.format_exc())
         return False
