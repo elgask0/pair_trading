@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Advanced Pair Trading Analysis Script
-Analyzes statistical relationships between two trading symbols with comprehensive metrics
+Advanced Pair Trading Analysis Script - OHLCV VERSION
+Analyzes statistical relationships between two trading symbols using OHLCV close prices
 """
 
 import argparse
@@ -62,20 +62,20 @@ def create_analysis_directories(base_dir: str) -> dict:
         os.makedirs(dir_path, exist_ok=True)
     
     # Create subdirectories for different window sizes
-    for window in [3, 7, 15, 30, 60, 90]:
+    for window in [1, 3, 7, 15, 30, 60, 90]:
         window_dir = os.path.join(directories['windows'], f'{window}d')
         os.makedirs(window_dir, exist_ok=True)
     
     logger.info(f"Created analysis directory structure in: {base_dir}")
     return directories
 
-def load_mark_prices_data(symbol: str, limit: int = None) -> pd.DataFrame:
-    """Load mark prices data for a symbol - FIXED VERSION"""
+def load_ohlcv_data(symbol: str, limit: int = None) -> pd.DataFrame:
+    """Load OHLCV close price data for a symbol"""
     try:
         with db_manager.get_session() as session:
             query = """
-            SELECT timestamp, mark_price
-            FROM mark_prices 
+            SELECT timestamp, close
+            FROM ohlcv 
             WHERE symbol = :symbol 
             ORDER BY timestamp ASC
             """
@@ -92,7 +92,7 @@ def load_mark_prices_data(symbol: str, limit: int = None) -> pd.DataFrame:
             )
             
             if df.empty:
-                logger.warning(f"No data found for symbol: {symbol}")
+                logger.warning(f"No OHLCV data found for symbol: {symbol}")
                 return df
             
             # Ensure index is datetime
@@ -101,18 +101,18 @@ def load_mark_prices_data(symbol: str, limit: int = None) -> pd.DataFrame:
             
             df = df.sort_index()
             
-            logger.info(f"Loaded {len(df):,} mark_prices records for {symbol}")
+            logger.info(f"Loaded {len(df):,} OHLCV records for {symbol}")
             return df
             
     except Exception as e:
-        logger.error(f"Error loading data for {symbol}: {e}")
+        logger.error(f"Error loading OHLCV data for {symbol}: {e}")
         return pd.DataFrame()
 
 def create_minute_alignment_optimized(df1: pd.DataFrame, df2: pd.DataFrame, 
                                     symbol1: str, symbol2: str) -> pd.DataFrame:
-    """Create optimized minute-level alignment of two price series"""
+    """Create optimized minute-level alignment of two price series using OHLCV close"""
     try:
-        logger.info(f"\n🔄 OPTIMIZED ALIGNMENT: {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]}")
+        logger.info(f"\n🔄 OPTIMIZED ALIGNMENT: {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV Close)")
         
         # Find overlap period
         start_time = max(df1.index.min(), df2.index.min())
@@ -135,8 +135,8 @@ def create_minute_alignment_optimized(df1: pd.DataFrame, df2: pd.DataFrame,
         
         # Combine and drop NaN values
         combined = pd.DataFrame({
-            f'{symbol1.split("_")[-2]}_price': df1_resampled['mark_price'],
-            f'{symbol2.split("_")[-2]}_price': df2_resampled['mark_price']
+            f'{symbol1.split("_")[-2]}_price': df1_resampled['close'],
+            f'{symbol2.split("_")[-2]}_price': df2_resampled['close']
         })
         
         # Drop rows where either price is NaN
@@ -164,7 +164,7 @@ def create_minute_alignment_optimized(df1: pd.DataFrame, df2: pd.DataFrame,
 def calculate_comprehensive_stats(df: pd.DataFrame, symbol1: str, symbol2: str) -> dict:
     """Calculate comprehensive statistical measures"""
     try:
-        logger.info(f"\n📈 COMPREHENSIVE STATISTICS: {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]}")
+        logger.info(f"\n📈 COMPREHENSIVE STATISTICS: {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV)")
         logger.info(f"Using {len(df):,} clean data points")
         
         if len(df) < 100:
@@ -262,7 +262,7 @@ def calculate_comprehensive_stats(df: pd.DataFrame, symbol1: str, symbol2: str) 
         return {}
 
 def calculate_rolling_stats(df: pd.DataFrame, window_days: int, symbol1: str, symbol2: str) -> dict:
-    """Calculate rolling statistics for a given window"""
+    """Calculate rolling statistics for a given window - FIXED VERSION"""
     try:
         window_minutes = window_days * 24 * 60
         
@@ -274,64 +274,83 @@ def calculate_rolling_stats(df: pd.DataFrame, window_days: int, symbol1: str, sy
         cols = df.columns.tolist()
         x_col, y_col = cols[0], cols[1]
         
+        logger.info(f"  Calculating rolling stats for {window_days}d window (window={window_minutes} minutes)")
+        
         # Calculate rolling correlations
         rolling_corr = df[x_col].rolling(window=window_minutes).corr(df[y_col])
         
-        # Calculate rolling regression coefficients
-        def rolling_regression(window_data):
-            if len(window_data) < 10:  # Minimum data points
-                return pd.Series([np.nan, np.nan, np.nan], index=['alpha', 'beta', 'r_squared'])
-            
-            x = window_data[x_col].values
-            y = window_data[y_col].values
-            
+        # Calculate rolling z-scores using a simpler approach
+        def calculate_rolling_zscore_simple(series):
+            """Simplified rolling z-score calculation"""
             try:
-                X = x.reshape(-1, 1)
-                reg = LinearRegression().fit(X, y)
-                alpha = reg.intercept_
-                beta = reg.coef_[0]
-                r_squared = r2_score(y, reg.predict(X))
-                return pd.Series([alpha, beta, r_squared], index=['alpha', 'beta', 'r_squared'])
-            except:
-                return pd.Series([np.nan, np.nan, np.nan], index=['alpha', 'beta', 'r_squared'])
-        
-        rolling_reg = df.rolling(window=window_minutes).apply(rolling_regression)
+                if len(series) < window_minutes:
+                    return pd.Series([np.nan] * len(series), index=series.index)
+                
+                result = []
+                for i in range(len(series)):
+                    if i < window_minutes - 1:
+                        result.append(np.nan)
+                    else:
+                        # Get window data
+                        window_x = df[x_col].iloc[i-window_minutes+1:i+1].values
+                        window_y = df[y_col].iloc[i-window_minutes+1:i+1].values
+                        
+                        if len(window_x) >= 10:  # Minimum data points
+                            try:
+                                # Calculate regression
+                                X = window_x.reshape(-1, 1)
+                                reg = LinearRegression().fit(X, window_y)
+                                alpha = reg.intercept_
+                                beta = reg.coef_[0]
+                                
+                                # Calculate spread for window
+                                spread = window_y - (alpha + beta * window_x)
+                                spread_mean = np.mean(spread)
+                                spread_std = np.std(spread)
+                                
+                                # Current z-score (last value in window)
+                                current_spread = spread[-1]
+                                zscore = (current_spread - spread_mean) / spread_std if spread_std > 0 else 0
+                                result.append(zscore)
+                            except:
+                                result.append(np.nan)
+                        else:
+                            result.append(np.nan)
+                
+                return pd.Series(result, index=series.index)
+            except Exception as e:
+                logger.error(f"Error in rolling zscore calculation: {e}")
+                return pd.Series([np.nan] * len(series), index=series.index)
         
         # Calculate rolling z-scores
-        def calculate_rolling_zscore(window_data):
-            if len(window_data) < 10:
-                return np.nan
-            
-            x = window_data[x_col].values
-            y = window_data[y_col].values
-            
-            try:
-                # Get regression parameters for this window
-                X = x.reshape(-1, 1)
-                reg = LinearRegression().fit(X, y)
-                alpha = reg.intercept_
-                beta = reg.coef_[0]
-                
-                # Calculate spread
-                spread = y - (alpha + beta * x)
-                spread_mean = np.mean(spread)
-                spread_std = np.std(spread)
-                
-                # Current z-score (last value in window)
-                current_spread = spread[-1]
-                zscore = (current_spread - spread_mean) / spread_std if spread_std > 0 else 0
-                return zscore
-            except:
-                return np.nan
+        rolling_zscore = calculate_rolling_zscore_simple(df[x_col])
         
-        rolling_zscore = df.rolling(window=window_minutes).apply(calculate_rolling_zscore)
+        # Calculate rolling regression coefficients (simplified)
+        rolling_alpha = pd.Series([np.nan] * len(df), index=df.index)
+        rolling_beta = pd.Series([np.nan] * len(df), index=df.index)
+        rolling_r2 = pd.Series([np.nan] * len(df), index=df.index)
+        
+        for i in range(window_minutes-1, len(df)):
+            try:
+                window_x = df[x_col].iloc[i-window_minutes+1:i+1].values
+                window_y = df[y_col].iloc[i-window_minutes+1:i+1].values
+                
+                if len(window_x) >= 10:
+                    X = window_x.reshape(-1, 1)
+                    reg = LinearRegression().fit(X, window_y)
+                    
+                    rolling_alpha.iloc[i] = reg.intercept_
+                    rolling_beta.iloc[i] = reg.coef_[0]
+                    rolling_r2.iloc[i] = r2_score(window_y, reg.predict(X))
+            except:
+                continue
         
         # Clean up the results
         results = {
             'correlation': rolling_corr.dropna(),
-            'alpha': rolling_reg['alpha'].dropna() if 'alpha' in rolling_reg.columns else pd.Series(dtype=float),
-            'beta': rolling_reg['beta'].dropna() if 'beta' in rolling_reg.columns else pd.Series(dtype=float),
-            'r_squared': rolling_reg['r_squared'].dropna() if 'r_squared' in rolling_reg.columns else pd.Series(dtype=float),
+            'alpha': rolling_alpha.dropna(),
+            'beta': rolling_beta.dropna(),
+            'r_squared': rolling_r2.dropna(),
             'zscore': rolling_zscore.dropna(),
             'window_days': window_days
         }
@@ -347,10 +366,13 @@ def calculate_rolling_stats(df: pd.DataFrame, window_days: int, symbol1: str, sy
             results['zscore_std'] = results['zscore'].std()
             results['zscore_current'] = results['zscore'].iloc[-1]
         
+        logger.info(f"  Rolling stats calculated: {len(results['correlation'])} correlation points, {len(results['zscore'])} zscore points")
+        
         return results
         
     except Exception as e:
         logger.error(f"Error calculating rolling stats for {window_days}d window: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return None
 
 def calculate_hurst_exponent(spread_series):
@@ -514,10 +536,10 @@ def calculate_advanced_spread_metrics(df: pd.DataFrame, window_days: int) -> dic
         logger.error(f"Error calculating advanced spread metrics: {e}")
         return {}
 
-def create_overview_figure(df: pd.DataFrame, stats: dict, symbol1: str, symbol2: str, output_path: str):
-    """Create comprehensive overview figure"""
+def create_overview_figure(df: pd.DataFrame, comprehensive_stats: dict, symbol1: str, symbol2: str, output_path: str):
+    """Create comprehensive overview figure - OHLCV VERSION"""
     try:
-        logger.info(f"Creating overview figure for {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]}")
+        logger.info(f"Creating overview figure for {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV)")
         
         # Create figure with subplots
         fig = plt.figure(figsize=(20, 16))
@@ -533,12 +555,12 @@ def create_overview_figure(df: pd.DataFrame, stats: dict, symbol1: str, symbol2:
         ax1 = fig.add_subplot(gs[0, :2])
         ax1_twin = ax1.twinx()
         
-        line1 = ax1.plot(df.index, df[x_col], label=f'{s1_name} Price', color='blue', alpha=0.7)
-        line2 = ax1_twin.plot(df.index, df[y_col], label=f'{s2_name} Price', color='red', alpha=0.7)
+        line1 = ax1.plot(df.index, df[x_col], label=f'{s1_name} Close Price', color='blue', alpha=0.7)
+        line2 = ax1_twin.plot(df.index, df[y_col], label=f'{s2_name} Close Price', color='red', alpha=0.7)
         
-        ax1.set_ylabel(f'{s1_name} Price', color='blue')
-        ax1_twin.set_ylabel(f'{s2_name} Price', color='red')
-        ax1.set_title('Price Time Series', fontsize=14, fontweight='bold')
+        ax1.set_ylabel(f'{s1_name} Close Price', color='blue')
+        ax1_twin.set_ylabel(f'{s2_name} Close Price', color='red')
+        ax1.set_title('OHLCV Close Price Time Series', fontsize=14, fontweight='bold')
         ax1.grid(True, alpha=0.3)
         
         # Combined legend
@@ -548,30 +570,30 @@ def create_overview_figure(df: pd.DataFrame, stats: dict, symbol1: str, symbol2:
         
         # 2. Scatter Plot with Regression (top right)
         ax2 = fig.add_subplot(gs[0, 2])
-        ax2.scatter(stats['x_values'], stats['y_values'], alpha=0.5, s=1)
-        ax2.plot(stats['x_values'], stats['regression_line'], color='red', linewidth=2)
-        ax2.set_xlabel(f'{s1_name} Price')
-        ax2.set_ylabel(f'{s2_name} Price')
-        ax2.set_title(f'Regression: R² = {stats["r_squared"]:.4f}', fontsize=12, fontweight='bold')
+        ax2.scatter(comprehensive_stats['x_values'], comprehensive_stats['y_values'], alpha=0.5, s=1)
+        ax2.plot(comprehensive_stats['x_values'], comprehensive_stats['regression_line'], color='red', linewidth=2)
+        ax2.set_xlabel(f'{s1_name} Close Price')
+        ax2.set_ylabel(f'{s2_name} Close Price')
+        ax2.set_title(f'Regression: R² = {comprehensive_stats["r_squared"]:.4f}', fontsize=12, fontweight='bold')
         ax2.grid(True, alpha=0.3)
         
         # 3. Spread Time Series (second row, spans all columns)
         ax3 = fig.add_subplot(gs[1, :])
-        spread_series = pd.Series(stats['spread'], index=df.index)
+        spread_series = pd.Series(comprehensive_stats['spread'], index=df.index)
         ax3.plot(spread_series.index, spread_series.values, color='green', alpha=0.7)
-        ax3.axhline(y=stats['spread_mean'], color='black', linestyle='--', alpha=0.5, label='Mean')
-        ax3.axhline(y=stats['spread_mean'] + stats['spread_std'], color='red', linestyle='--', alpha=0.5, label='+1σ')
-        ax3.axhline(y=stats['spread_mean'] - stats['spread_std'], color='red', linestyle='--', alpha=0.5, label='-1σ')
-        ax3.axhline(y=stats['spread_mean'] + 2*stats['spread_std'], color='red', linestyle='-', alpha=0.7, label='+2σ')
-        ax3.axhline(y=stats['spread_mean'] - 2*stats['spread_std'], color='red', linestyle='-', alpha=0.7, label='-2σ')
+        ax3.axhline(y=comprehensive_stats['spread_mean'], color='black', linestyle='--', alpha=0.5, label='Mean')
+        ax3.axhline(y=comprehensive_stats['spread_mean'] + comprehensive_stats['spread_std'], color='red', linestyle='--', alpha=0.5, label='+1σ')
+        ax3.axhline(y=comprehensive_stats['spread_mean'] - comprehensive_stats['spread_std'], color='red', linestyle='--', alpha=0.5, label='-1σ')
+        ax3.axhline(y=comprehensive_stats['spread_mean'] + 2*comprehensive_stats['spread_std'], color='red', linestyle='-', alpha=0.7, label='+2σ')
+        ax3.axhline(y=comprehensive_stats['spread_mean'] - 2*comprehensive_stats['spread_std'], color='red', linestyle='-', alpha=0.7, label='-2σ')
         ax3.set_ylabel('Spread')
-        ax3.set_title(f'Spread Time Series (Current Z-score: {stats["zscore_current"]:.2f})', fontsize=14, fontweight='bold')
+        ax3.set_title(f'Spread Time Series (Current Z-score: {comprehensive_stats["zscore_current"]:.2f})', fontsize=14, fontweight='bold')
         ax3.legend(loc='upper right')
         ax3.grid(True, alpha=0.3)
         
         # 4. Z-Score Time Series (third row, left)
         ax4 = fig.add_subplot(gs[2, 0])
-        zscore_series = (spread_series - stats['spread_mean']) / stats['spread_std']
+        zscore_series = (spread_series - comprehensive_stats['spread_mean']) / comprehensive_stats['spread_std']
         ax4.plot(zscore_series.index, zscore_series.values, color='purple', alpha=0.7)
         ax4.axhline(y=0, color='black', linestyle='-', alpha=0.5)
         ax4.axhline(y=1, color='orange', linestyle='--', alpha=0.7)
@@ -584,14 +606,14 @@ def create_overview_figure(df: pd.DataFrame, stats: dict, symbol1: str, symbol2:
         
         # 5. Spread Distribution (third row, center)
         ax5 = fig.add_subplot(gs[2, 1])
-        ax5.hist(stats['spread'], bins=50, alpha=0.7, color='green', density=True)
-        ax5.axvline(x=stats['spread_mean'], color='black', linestyle='--', label='Mean')
-        ax5.axvline(x=stats['spread_mean'] + stats['spread_std'], color='red', linestyle='--', alpha=0.7)
-        ax5.axvline(x=stats['spread_mean'] - stats['spread_std'], color='red', linestyle='--', alpha=0.7)
+        ax5.hist(comprehensive_stats['spread'], bins=50, alpha=0.7, color='green', density=True)
+        ax5.axvline(x=comprehensive_stats['spread_mean'], color='black', linestyle='--', label='Mean')
+        ax5.axvline(x=comprehensive_stats['spread_mean'] + comprehensive_stats['spread_std'], color='red', linestyle='--', alpha=0.7)
+        ax5.axvline(x=comprehensive_stats['spread_mean'] - comprehensive_stats['spread_std'], color='red', linestyle='--', alpha=0.7)
         
-        # Overlay normal distribution
-        x_norm = np.linspace(stats['spread'].min(), stats['spread'].max(), 100)
-        y_norm = stats.norm.pdf(x_norm, stats['spread_mean'], stats['spread_std'])
+        # Overlay normal distribution - FIXED: Use scipy.stats.norm
+        x_norm = np.linspace(comprehensive_stats['spread'].min(), comprehensive_stats['spread'].max(), 100)
+        y_norm = stats.norm.pdf(x_norm, comprehensive_stats['spread_mean'], comprehensive_stats['spread_std'])
         ax5.plot(x_norm, y_norm, 'r-', linewidth=2, alpha=0.8, label='Normal')
         
         ax5.set_xlabel('Spread Value')
@@ -605,26 +627,27 @@ def create_overview_figure(df: pd.DataFrame, stats: dict, symbol1: str, symbol2:
         ax6.axis('off')
         
         stats_text = f"""
-        REGRESSION ANALYSIS
-        α (intercept): {stats['alpha']:.6f}
-        β (slope): {stats['beta']:.6f}
-        R²: {stats['r_squared']:.4f}
-        Correlation: {stats['correlation']:.4f}
+        REGRESSION ANALYSIS (OHLCV)
+        α (intercept): {comprehensive_stats['alpha']:.6f}
+        β (slope): {comprehensive_stats['beta']:.6f}
+        R²: {comprehensive_stats['r_squared']:.4f}
+        Correlation: {comprehensive_stats['correlation']:.4f}
         
         SPREAD STATISTICS
-        Mean: {stats['spread_mean']:.6f}
-        Std Dev: {stats['spread_std']:.6f}
-        Current Z-score: {stats['zscore_current']:.2f}
+        Mean: {comprehensive_stats['spread_mean']:.6f}
+        Std Dev: {comprehensive_stats['spread_std']:.6f}
+        Current Z-score: {comprehensive_stats['zscore_current']:.2f}
         
         TRADING SIGNAL
-        Half-life: {stats['half_life']:.1f} days
-        Signal: {stats['signal_strength']} {stats['signal']}
+        Half-life: {comprehensive_stats['half_life']:.1f} days
+        Signal: {comprehensive_stats['signal_strength']} {comprehensive_stats['signal']}
         """
         
         ax6.text(0.05, 0.95, stats_text, transform=ax6.transAxes, fontsize=10,
                 verticalalignment='top', fontfamily='monospace',
                 bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
         
+        # 7. Rolling Correlation (bottom row, spans all columns)
         # 7. Rolling Correlation (bottom row, spans all columns)
         ax7 = fig.add_subplot(gs[3, :])
         
@@ -633,9 +656,9 @@ def create_overview_figure(df: pd.DataFrame, stats: dict, symbol1: str, symbol2:
         if len(df) > window_size:
             rolling_corr = df[x_col].rolling(window=window_size).corr(df[y_col])
             ax7.plot(rolling_corr.index, rolling_corr.values, color='blue', alpha=0.7)
-            ax7.axhline(y=stats['correlation'], color='red', linestyle='--', alpha=0.7, label=f'Overall: {stats["correlation"]:.3f}')
+            ax7.axhline(y=comprehensive_stats['correlation'], color='red', linestyle='--', alpha=0.7, label=f'Overall: {comprehensive_stats["correlation"]:.3f}')
             ax7.set_ylabel('Rolling Correlation')
-            ax7.set_title('24-Hour Rolling Correlation', fontsize=12, fontweight='bold')
+            ax7.set_title('24-Hour Rolling Correlation (OHLCV)', fontsize=12, fontweight='bold')
             ax7.legend()
             ax7.grid(True, alpha=0.3)
         else:
@@ -649,7 +672,7 @@ def create_overview_figure(df: pd.DataFrame, stats: dict, symbol1: str, symbol2:
             plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
         
         # Main title
-        fig.suptitle(f'Comprehensive Pair Analysis: {s1_name} vs {s2_name}', 
+        fig.suptitle(f'Comprehensive Pair Analysis (OHLCV): {s1_name} vs {s2_name}', 
                     fontsize=18, fontweight='bold', y=0.98)
         
         # Save figure
@@ -666,7 +689,7 @@ def create_window_figure(df: pd.DataFrame, rolling_data: dict, window_days: int,
                        symbol1: str, symbol2: str, output_path: str):
     """Create figure for specific rolling window analysis"""
     try:
-        logger.info(f"Creating {window_days}-day window figure for {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]}")
+        logger.info(f"Creating {window_days}-day window figure for {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV)")
         
         if not rolling_data or len(rolling_data.get('correlation', [])) == 0:
             logger.warning(f"No data available for {window_days}-day window figure")
@@ -674,7 +697,7 @@ def create_window_figure(df: pd.DataFrame, rolling_data: dict, window_days: int,
         
         # Create figure
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle(f'{window_days}-Day Rolling Window Analysis: {symbol1.split("_")[-2]} vs {symbol2.split("_")[-2]}', 
+        fig.suptitle(f'{window_days}-Day Rolling Window Analysis (OHLCV): {symbol1.split("_")[-2]} vs {symbol2.split("_")[-2]}', 
                     fontsize=16, fontweight='bold')
         
         s1_name = symbol1.split('_')[-2]
@@ -760,7 +783,7 @@ def create_window_figure(df: pd.DataFrame, rolling_data: dict, window_days: int,
 def create_comparison_figure(all_rolling_data: dict, symbol1: str, symbol2: str, output_path: str):
     """Create comparison figure across all windows"""
     try:
-        logger.info(f"Creating comparison figure for all windows: {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]}")
+        logger.info(f"Creating comparison figure for all windows: {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV)")
         
         # Filter valid data
         valid_windows = {k: v for k, v in all_rolling_data.items() if v is not None and len(v.get('correlation', [])) > 0}
@@ -771,7 +794,7 @@ def create_comparison_figure(all_rolling_data: dict, symbol1: str, symbol2: str,
         
         # Create figure
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle(f'Multi-Window Comparison: {symbol1.split("_")[-2]} vs {symbol2.split("_")[-2]}', 
+        fig.suptitle(f'Multi-Window Comparison (OHLCV): {symbol1.split("_")[-2]} vs {symbol2.split("_")[-2]}', 
                     fontsize=16, fontweight='bold')
         
         colors = ['blue', 'green', 'red', 'purple', 'orange', 'brown']
@@ -873,7 +896,7 @@ def create_comparison_figure(all_rolling_data: dict, symbol1: str, symbol2: str,
 def create_advanced_metrics_table(all_rolling_data: dict, s1: str, s2: str, output_dir: str):
     """Create advanced metrics comparison table"""
     try:
-        logger.info(f"Creating advanced metrics table for {s1.split('_')[-2]} vs {s2.split('_')[-2]}")
+        logger.info(f"Creating advanced metrics table for {s1.split('_')[-2]} vs {s2.split('_')[-2]} (OHLCV)")
         
         # Filter valid data
         valid_data = {k: v for k, v in all_rolling_data.items() if v is not None}
@@ -989,11 +1012,11 @@ def create_advanced_metrics_table(all_rolling_data: dict, s1: str, s2: str, outp
                         else:
                             stat_table[cell_key].set_facecolor('#ECF0F1')
         
-        plt.title(f'Advanced Metrics Comparison: {s1.split("_")[-2]} vs {s2.split("_")[-2]}', 
+        plt.title(f'Advanced Metrics Comparison (OHLCV): {s1.split("_")[-2]} vs {s2.split("_")[-2]}', 
                  fontsize=16, fontweight='bold', pad=20)
         
         # Save table
-        filename = f"advanced_metrics_{s1.split('_')[-2]}_{s2.split('_')[-2]}.png"
+        filename = f"advanced_metrics_ohlcv_{s1.split('_')[-2]}_{s2.split('_')[-2]}.png"
         filepath = os.path.join(output_dir, filename)
         plt.savefig(filepath, dpi=300, bbox_inches='tight', facecolor='white')
         plt.close()
@@ -1007,32 +1030,32 @@ def create_advanced_metrics_table(all_rolling_data: dict, s1: str, s2: str, outp
         return None
 
 def create_complete_analysis(symbol1: str, symbol2: str) -> dict:
-    """Create complete pair analysis with all metrics and visualizations"""
+    """Create complete pair analysis with all metrics and visualizations using OHLCV data"""
     try:
-        logger.info(f"Creating complete analysis with advanced statistics for {symbol1} / {symbol2}")
+        logger.info(f"Creating complete OHLCV analysis for {symbol1} / {symbol2}")
         
         # Create directory structure
         s1_short = symbol1.split('_')[-2]
         s2_short = symbol2.split('_')[-2]
-        base_dir = f"plots/pair_analysis/{s1_short}_{s2_short}"
+        base_dir = f"plots/pair_analysis_ohlcv/{s1_short}_{s2_short}"
         directories = create_analysis_directories(base_dir)
         
-        # Load data
-        logger.info("Loading mark prices data...")
-        df1 = load_mark_prices_data(symbol1)
-        df2 = load_mark_prices_data(symbol2)
+        # Load OHLCV data
+        logger.info("Loading OHLCV close price data...")
+        df1 = load_ohlcv_data(symbol1)
+        df2 = load_ohlcv_data(symbol2)
         
         if df1.empty or df2.empty:
-            logger.error("Failed to load data for one or both symbols")
+            logger.error("Failed to load OHLCV data for one or both symbols")
             return {}
         
-        logger.info(f"Data loaded: {s1_short}={len(df1):,}, {s2_short}={len(df2):,}")
+        logger.info(f"OHLCV data loaded: {s1_short}={len(df1):,}, {s2_short}={len(df2):,}")
         
         # Align data
         aligned_df = create_minute_alignment_optimized(df1, df2, symbol1, symbol2)
         
         if aligned_df.empty:
-            logger.error("Failed to align data")
+            logger.error("Failed to align OHLCV data")
             return {}
         
         # Calculate comprehensive statistics
@@ -1043,12 +1066,12 @@ def create_complete_analysis(symbol1: str, symbol2: str) -> dict:
             return {}
         
         # Create overview figure
-        overview_path = os.path.join(directories['overview'], f"overview_{s1_short}_{s2_short}.png")
+        overview_path = os.path.join(directories['overview'], f"overview_ohlcv_{s1_short}_{s2_short}.png")
         create_overview_figure(aligned_df, comprehensive_stats, symbol1, symbol2, overview_path)
         
-        # Calculate rolling statistics for different windows
+        # Calculate rolling statistics for different windows - usar ventanas más pequeñas
         logger.info("Calculating rolling statistics with advanced metrics for all windows...")
-        windows = [3, 7, 15, 30, 60, 90]
+        windows = [1, 3, 7, 15, 30]  # Ventanas más pequeñas para OHLCV
         all_rolling_data = {}
         
         for window in windows:
@@ -1066,14 +1089,14 @@ def create_complete_analysis(symbol1: str, symbol2: str) -> dict:
                 all_rolling_data[window] = rolling_stats
                 
                 # Create window-specific figure
-                window_path = os.path.join(directories['windows'], f'{window}d', f"rolling_{window}d_{s1_short}_{s2_short}.png")
+                window_path = os.path.join(directories['windows'], f'{window}d', f"rolling_ohlcv_{window}d_{s1_short}_{s2_short}.png")
                 create_window_figure(aligned_df, rolling_stats, window, symbol1, symbol2, window_path)
             else:
                 logger.warning(f"No data available for {window}-day window")
                 all_rolling_data[window] = None
         
         # Create comparison figure
-        comparison_path = os.path.join(directories['comparison'], f"comparison_all_windows_{s1_short}_{s2_short}.png")
+        comparison_path = os.path.join(directories['comparison'], f"comparison_ohlcv_all_windows_{s1_short}_{s2_short}.png")
         create_comparison_figure(all_rolling_data, symbol1, symbol2, comparison_path)
         
         # Create advanced metrics table
@@ -1093,21 +1116,21 @@ def create_complete_analysis(symbol1: str, symbol2: str) -> dict:
             }
         }
         
-        logger.info(f"✅ Complete analysis finished for {s1_short} vs {s2_short}")
+        logger.info(f"✅ Complete OHLCV analysis finished for {s1_short} vs {s2_short}")
         logger.info(f"📊 Generated {len([f for f in results['files'].values() if f])} main files")
         logger.info(f"📁 Output directory: {base_dir}")
         
         return results
         
     except Exception as e:
-        logger.error(f"Error in complete analysis: {e}")
+        logger.error(f"Error in complete OHLCV analysis: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         return {}
 
 def main():
     """Main execution function"""
     try:
-        parser = argparse.ArgumentParser(description='Advanced Pair Trading Analysis')
+        parser = argparse.ArgumentParser(description='Advanced Pair Trading Analysis using OHLCV data')
         parser.add_argument('--symbol1', required=True, help='First symbol to analyze')
         parser.add_argument('--symbol2', required=True, help='Second symbol to analyze')
         parser.add_argument('--limit', type=int, default=None, help='Limit number of records per symbol')
@@ -1115,9 +1138,10 @@ def main():
         args = parser.parse_args()
         
         # Log analysis start
-        logger.info("🔬 Starting ADVANCED STATISTICAL Pair Analysis")
+        logger.info("🔬 Starting ADVANCED STATISTICAL Pair Analysis (OHLCV)")
         logger.info(f"Symbols: {args.symbol1} / {args.symbol2}")
-        logger.info("Rolling Windows: 3, 7, 15, 30, 60, 90 days")
+        logger.info("Data Source: OHLCV Close Prices")
+        logger.info("Rolling Windows: 1, 3, 7, 15, 30 days")
         
         if ADVANCED_STATS:
             logger.info("Advanced Tests: ADF, PP, KPSS, Engle-Granger, Johansen")
@@ -1127,7 +1151,7 @@ def main():
         results = create_complete_analysis(args.symbol1, args.symbol2)
         
         if results:
-            logger.info("🎉 Analysis completed successfully!")
+            logger.info("🎉 OHLCV Analysis completed successfully!")
             
             # Print summary
             stats = results['comprehensive_stats']
@@ -1135,7 +1159,7 @@ def main():
             s2_name = args.symbol2.split('_')[-2]
             
             print(f"\n" + "="*60)
-            print(f"PAIR ANALYSIS SUMMARY: {s1_name} vs {s2_name}")
+            print(f"PAIR ANALYSIS SUMMARY (OHLCV): {s1_name} vs {s2_name}")
             print(f"="*60)
             print(f"Data Points: {results['data_points']:,}")
             print(f"Correlation: {stats['correlation']:.4f}")
@@ -1147,7 +1171,7 @@ def main():
             print(f"="*60)
             
         else:
-            logger.error("❌ Analysis failed - no results generated")
+            logger.error("❌ OHLCV Analysis failed - no results generated")
             return 1
             
         return 0
@@ -1156,7 +1180,7 @@ def main():
         logger.info("Analysis interrupted by user")
         return 1
     except Exception as e:
-        logger.error(f"❌ Analysis failed: {e}")
+        logger.error(f"❌ OHLCV Analysis failed: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         return 1
 
