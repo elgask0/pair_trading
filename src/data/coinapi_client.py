@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CoinAPI client for historical data - FIXED VERSION
+CoinAPI client for historical data - FIXED VERSION with Proper Orderbook Handling
 """
 
 import requests
@@ -172,15 +172,18 @@ class CoinAPIClient:
             return start_date, end_date
     
     def get_ohlcv_for_date(self, symbol: str, date_str: str) -> pd.DataFrame:
-        """Get OHLCV data for a specific date - IMPROVED ERROR HANDLING"""
+        """Get OHLCV data for a specific date - IMPROVED FOR FULL DAY COVERAGE"""
         try:
             url = f"{self.base_url}/ohlcv/{symbol}/history"
+            
+            # Use 'date' parameter as recommended by documentation
             params = {
                 'period_id': '1MIN',
-                'time_start': f"{date_str}T00:00:00Z",
-                'time_end': f"{date_str}T23:59:59Z",
-                'limit': 2000
+                'date': date_str,  # Better method according to docs
+                'limit': 100000   # Maximum limit for full day coverage
             }
+            
+            log.debug(f"Fetching OHLCV for {symbol} on {date_str} with params: {params}")
             
             response = self.session.get(url, params=params)
             
@@ -188,6 +191,7 @@ class CoinAPIClient:
                 data = response.json()
                 
                 if not data:
+                    log.debug(f"No OHLCV data returned for {symbol} on {date_str}")
                     return pd.DataFrame()
                 
                 # Handle different response formats
@@ -201,9 +205,11 @@ class CoinAPIClient:
                         return pd.DataFrame()
                 
                 if not isinstance(data, list) or not data:
+                    log.debug(f"No OHLCV data list for {symbol} on {date_str}")
                     return pd.DataFrame()
                 
                 df = pd.DataFrame(data)
+                log.debug(f"Raw OHLCV data for {symbol} on {date_str}: {len(df)} records")
                 
                 # Check if required columns exist
                 time_col = None
@@ -245,9 +251,13 @@ class CoinAPIClient:
                 # Drop rows with NaN values
                 df = df.dropna(subset=required_cols)
                 
+                log.info(f"Successfully fetched {len(df)} OHLCV records for {symbol} on {date_str}")
                 return df[required_cols]
             else:
-                log.warning(f"No OHLCV data for {symbol} on {date_str}: HTTP {response.status_code}")
+                log.warning(f"OHLCV API error for {symbol} on {date_str}: HTTP {response.status_code}")
+                if response.status_code == 429:
+                    log.warning("Rate limit hit, adding delay...")
+                    time.sleep(5)
                 return pd.DataFrame()
                 
         except Exception as e:
@@ -255,14 +265,19 @@ class CoinAPIClient:
             return pd.DataFrame()
     
     def get_orderbook_for_date(self, symbol: str, date_str: str) -> pd.DataFrame:
-        """Get orderbook data for a specific date - IMPROVED ERROR HANDLING"""
+        """Get orderbook data for a specific date - COMPLETELY REWRITTEN FOR FULL COVERAGE"""
         try:
             url = f"{self.base_url}/orderbooks/{symbol}/history"
+            
+            # Use 'date' parameter as recommended by documentation
+            # Maximum limit for full day coverage (up to 100,000 records)
             params = {
-                'time_start': f"{date_str}T00:00:00Z",
-                'time_end': f"{date_str}T23:59:59Z",
-                'limit': 1000
+                'date': date_str,        # Preferred method according to docs
+                'limit': 100000,        # Maximum allowed limit
+                'limit_levels': 10      # We want up to 10 levels per side
             }
+            
+            log.debug(f"Fetching orderbook for {symbol} on {date_str} with params: {params}")
             
             response = self.session.get(url, params=params)
             
@@ -270,6 +285,7 @@ class CoinAPIClient:
                 data = response.json()
                 
                 if not data:
+                    log.debug(f"No orderbook data returned for {symbol} on {date_str}")
                     return pd.DataFrame()
                 
                 # Handle different response formats
@@ -283,10 +299,15 @@ class CoinAPIClient:
                         return pd.DataFrame()
                 
                 if not isinstance(data, list) or not data:
+                    log.debug(f"No orderbook data list for {symbol} on {date_str}")
                     return pd.DataFrame()
+                
+                log.debug(f"Raw orderbook data for {symbol} on {date_str}: {len(data)} snapshots")
                 
                 # Process orderbook data
                 processed_data = []
+                valid_snapshots = 0
+                
                 for snapshot in data:
                     if not isinstance(snapshot, dict):
                         continue
@@ -309,41 +330,89 @@ class CoinAPIClient:
                     bids = snapshot.get('bids', [])
                     asks = snapshot.get('asks', [])
                     
+                    # Validate that we have at least level 1 data
+                    has_valid_data = False
+                    
                     for i in range(10):
                         # Process bids
                         if i < len(bids) and isinstance(bids[i], dict):
                             try:
-                                processed_snapshot[f'bid_{i+1}_price'] = float(bids[i].get('price', 0))
-                                processed_snapshot[f'bid_{i+1}_size'] = float(bids[i].get('size', 0))
+                                price = float(bids[i].get('price', 0))
+                                size = float(bids[i].get('size', 0))
+                                if price > 0 and size > 0:
+                                    processed_snapshot[f'bid{i+1}_price'] = price
+                                    processed_snapshot[f'bid{i+1}_size'] = size
+                                    if i == 0:  # Level 1 data
+                                        has_valid_data = True
+                                else:
+                                    processed_snapshot[f'bid{i+1}_price'] = None
+                                    processed_snapshot[f'bid{i+1}_size'] = None
                             except (ValueError, TypeError):
-                                processed_snapshot[f'bid_{i+1}_price'] = None
-                                processed_snapshot[f'bid_{i+1}_size'] = None
+                                processed_snapshot[f'bid{i+1}_price'] = None
+                                processed_snapshot[f'bid{i+1}_size'] = None
                         else:
-                            processed_snapshot[f'bid_{i+1}_price'] = None
-                            processed_snapshot[f'bid_{i+1}_size'] = None
+                            processed_snapshot[f'bid{i+1}_price'] = None
+                            processed_snapshot[f'bid{i+1}_size'] = None
                         
                         # Process asks
                         if i < len(asks) and isinstance(asks[i], dict):
                             try:
-                                processed_snapshot[f'ask_{i+1}_price'] = float(asks[i].get('price', 0))
-                                processed_snapshot[f'ask_{i+1}_size'] = float(asks[i].get('size', 0))
+                                price = float(asks[i].get('price', 0))
+                                size = float(asks[i].get('size', 0))
+                                if price > 0 and size > 0:
+                                    processed_snapshot[f'ask{i+1}_price'] = price
+                                    processed_snapshot[f'ask{i+1}_size'] = size
+                                    if i == 0:  # Level 1 data
+                                        has_valid_data = True
+                                else:
+                                    processed_snapshot[f'ask{i+1}_price'] = None
+                                    processed_snapshot[f'ask{i+1}_size'] = None
                             except (ValueError, TypeError):
-                                processed_snapshot[f'ask_{i+1}_price'] = None
-                                processed_snapshot[f'ask_{i+1}_size'] = None
+                                processed_snapshot[f'ask{i+1}_price'] = None
+                                processed_snapshot[f'ask{i+1}_size'] = None
                         else:
-                            processed_snapshot[f'ask_{i+1}_price'] = None
-                            processed_snapshot[f'ask_{i+1}_size'] = None
+                            processed_snapshot[f'ask{i+1}_price'] = None
+                            processed_snapshot[f'ask{i+1}_size'] = None
                     
-                    processed_data.append(processed_snapshot)
+                    # Only include snapshots with valid level 1 data
+                    if has_valid_data:
+                        processed_data.append(processed_snapshot)
+                        valid_snapshots += 1
                 
                 if processed_data:
                     df = pd.DataFrame(processed_data)
                     df.set_index('timestamp', inplace=True)
+                    df = df.sort_index()  # Ensure chronological order
+                    
+                    log.info(f"Successfully fetched {len(df)} orderbook snapshots for {symbol} on {date_str}")
+                    log.debug(f"  Valid snapshots: {valid_snapshots}/{len(data)}")
+                    
+                    # Log data quality metrics
+                    if len(df) > 0:
+                        # Check time gaps
+                        time_diffs = df.index.to_series().diff().dt.total_seconds() / 60  # minutes
+                        avg_interval = time_diffs.mean()
+                        max_gap = time_diffs.max()
+                        
+                        log.debug(f"  Average interval: {avg_interval:.2f} minutes")
+                        log.debug(f"  Maximum gap: {max_gap:.2f} minutes")
+                        
+                        # For 1-minute data, we expect ~1440 records per day
+                        expected_records = 1440  # 24 * 60
+                        coverage_pct = (len(df) / expected_records) * 100
+                        log.debug(f"  Daily coverage: {coverage_pct:.1f}% ({len(df)}/{expected_records})")
+                    
                     return df
                 else:
+                    log.warning(f"No valid orderbook snapshots found for {symbol} on {date_str}")
                     return pd.DataFrame()
             else:
-                log.warning(f"No orderbook data for {symbol} on {date_str}: HTTP {response.status_code}")
+                log.warning(f"Orderbook API error for {symbol} on {date_str}: HTTP {response.status_code}")
+                if response.status_code == 429:
+                    log.warning("Rate limit hit, adding delay...")
+                    time.sleep(5)
+                elif response.status_code == 400:
+                    log.warning(f"Bad request for orderbook {symbol} on {date_str}: {response.text}")
                 return pd.DataFrame()
                 
         except Exception as e:

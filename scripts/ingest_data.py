@@ -1,137 +1,215 @@
 #!/usr/bin/env python3
 """
-Data ingestion script
-Downloads historical data from multiple sources for configured trading pairs
+Data ingestion script - WITH SELECTIVE OPTIONS AND FORCE OVERWRITE
 """
 
 import sys
 import os
 import argparse
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pathlib import Path
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data.ingestion import data_ingestion
-from config.settings import settings
 from src.utils.logger import get_ingestion_logger
+from config.settings import settings
 
 log = get_ingestion_logger()
 
+def _delete_orderbook_data(symbol: str):
+    """Delete existing orderbook data for symbol"""
+    from src.database.connection import db_manager
+    from sqlalchemy import text
+    
+    with db_manager.get_session() as session:
+        result = session.execute(text("DELETE FROM orderbook WHERE symbol = :symbol"), 
+                               {'symbol': symbol})
+        log.info(f"   🗑️ Deleted {result.rowcount:,} orderbook records")
+        return result.rowcount
+
+def _delete_ohlcv_data(symbol: str):
+    """Delete existing OHLCV data for symbol"""
+    from src.database.connection import db_manager
+    from sqlalchemy import text
+    
+    with db_manager.get_session() as session:
+        result = session.execute(text("DELETE FROM ohlcv WHERE symbol = :symbol"), 
+                               {'symbol': symbol})
+        log.info(f"   🗑️ Deleted {result.rowcount:,} OHLCV records")
+        return result.rowcount
+
+def _delete_funding_data(symbol: str):
+    """Delete existing funding rate data for symbol"""
+    from src.database.connection import db_manager
+    from sqlalchemy import text
+    
+    with db_manager.get_session() as session:
+        result = session.execute(text("DELETE FROM funding_rates WHERE symbol = :symbol"), 
+                               {'symbol': symbol})
+        log.info(f"   🗑️ Deleted {result.rowcount:,} funding rate records")
+        return result.rowcount
+
 def main():
-    parser = argparse.ArgumentParser(description="Ingest historical data from multiple sources")
-    parser.add_argument("--symbol", type=str, help="Specific symbol to ingest")
-    parser.add_argument("--funding-only", action="store_true", help="Ingest only funding rates for perpetual symbols")
-    parser.add_argument("--show-summary", action="store_true", help="Show data summary after ingestion")
+    parser = argparse.ArgumentParser(description="Data ingestion with selective options and force overwrite")
+    parser.add_argument("--symbol", type=str, help="Specific symbol to process")
+    parser.add_argument("--funding-only", action="store_true", help="Only funding rates")
+    parser.add_argument("--orderbook-only", action="store_true", help="Only orderbook data")
+    parser.add_argument("--ohlcv-only", action="store_true", help="Only OHLCV data")
+    parser.add_argument("--force-overwrite", action="store_true", help="Delete existing data first then re-ingest")
     
     args = parser.parse_args()
     
-    log.info("Starting data ingestion process...")
+    # Determine data types to process
+    if args.funding_only:
+        data_types = ["funding"]
+        log.info("🚀 Starting FUNDING-ONLY ingestion...")
+    elif args.orderbook_only:
+        data_types = ["orderbook"]
+        log.info("🚀 Starting ORDERBOOK-ONLY ingestion...")
+    elif args.ohlcv_only:
+        data_types = ["ohlcv"]
+        log.info("🚀 Starting OHLCV-ONLY ingestion...")
+    else:
+        data_types = ["ohlcv", "orderbook", "funding"]
+        log.info("🚀 Starting COMPLETE data ingestion...")
+    
+    if args.force_overwrite:
+        log.warning("⚠️ FORCE OVERWRITE MODE: Will delete existing data first!")
+        log.warning("   This action cannot be undone!")
+        
+        # Ask for confirmation unless single symbol
+        if not args.symbol:
+            response = input("\nAre you sure you want to delete existing data for ALL symbols? (yes/no): ")
+            if response.lower() != 'yes':
+                log.info("Operation cancelled by user")
+                return False
     
     try:
+        # Get symbols to process
         if args.symbol:
-            # Ingest specific symbol
-            if args.funding_only and "PERP_" in args.symbol:
-                # Ingest only funding rates for the perpetual symbol
-                results = data_ingestion.ingest_funding_rates([args.symbol])
-                success = results.get(args.symbol, False)
-                
-                if success:
-                    log.info(f"Successfully ingested funding rates for {args.symbol}")
-                else:
-                    log.error(f"Failed to ingest funding rates for {args.symbol}")
-                    return False
-            elif args.funding_only:
-                log.warning(f"Symbol {args.symbol} is not a perpetual contract (no PERP_ in name)")
-                log.info("Use a symbol like MEXCFTS_PERP_SPX_USDT for funding rates")
-                return False
-            else:
-                # Complete ingestion for the symbol
-                success = data_ingestion.ingest_symbol_data(args.symbol, funding_only=False)
-                
-                if success:
-                    log.info(f"Successfully ingested all data types for {args.symbol}")
-                else:
-                    log.error(f"Failed to ingest data for {args.symbol}")
-                    return False
+            symbols = [args.symbol]
         else:
-            # Ingest all symbols
-            if args.funding_only:
-                # Get all perpetual symbols for funding rates
-                all_symbols = settings.get_all_symbols()
-                perp_symbols = [s for s in all_symbols if "PERP_" in s]
-                
-                if not perp_symbols:
-                    log.warning("No perpetual symbols found for funding rates ingestion")
-                    log.info("Check your config/symbols.yaml file for symbols with PERP_ in the name")
-                    return True
-                
-                log.info(f"Ingesting funding rates for {len(perp_symbols)} perpetual symbols: {perp_symbols}")
-                success = data_ingestion.ingest_all_symbols(funding_only=True)
-                
-                if success:
-                    log.info("Successfully ingested funding rates for all perpetual symbols")
-                else:
-                    log.warning("Some perpetual symbols failed during funding rates ingestion")
-            else:
-                # Complete ingestion for all symbols
-                log.info("Starting complete data ingestion (OHLCV, orderbook, funding rates)")
-                success = data_ingestion.ingest_all_symbols(funding_only=False)
-                
-                if success:
-                    log.info("Successfully ingested all data types for all symbols")
-                else:
-                    log.warning("Some symbols failed during complete ingestion")
+            active_pairs = settings.get_active_pairs()
+            symbols = list(set([pair.symbol1 for pair in active_pairs] + [pair.symbol2 for pair in active_pairs]))
         
-        # Show data summary
-        if args.show_summary or args.funding_only:
-            log.info("\n=== Data Summary ===")
+        log.info(f"Processing {len(symbols)} symbols: {[s.split('_')[-2] for s in symbols]}")
+        
+        success_count = 0
+        total_deleted = {"ohlcv": 0, "orderbook": 0, "funding": 0}
+        
+        for symbol in symbols:
+            log.info(f"\n{'='*60}")
+            log.info(f"PROCESSING {symbol}")
+            log.info(f"{'='*60}")
             
-            if args.funding_only:
-                # Show funding rates summary
-                symbols_to_check = [args.symbol] if args.symbol else [s for s in settings.get_all_symbols() if "PERP_" in s]
+            symbol_success = True
+            
+            # STEP 1: Delete existing data if force overwrite
+            if args.force_overwrite:
+                log.info(f"🗑️ Deleting existing data for {symbol}...")
                 
-                log.info("Funding Rates Data:")
-                for symbol in symbols_to_check:
-                    min_date, max_date = data_ingestion.get_funding_data_range(symbol)
-                    if min_date and max_date:
-                        log.info(f"  {symbol}: {min_date} to {max_date}")
+                if "ohlcv" in data_types:
+                    deleted = _delete_ohlcv_data(symbol)
+                    total_deleted["ohlcv"] += deleted
+                
+                if "orderbook" in data_types:
+                    deleted = _delete_orderbook_data(symbol)
+                    total_deleted["orderbook"] += deleted
+                
+                if "funding" in data_types and "PERP_" in symbol:
+                    deleted = _delete_funding_data(symbol)
+                    total_deleted["funding"] += deleted
+            
+            # STEP 2: Update symbol info (lightweight operation)
+            log.info(f"📋 Updating symbol info for {symbol}...")
+            data_ingestion.update_symbol_info(symbol)
+            
+            # STEP 3: Ingest data based on selected types
+            if "funding" in data_types:
+                if "PERP_" in symbol:
+                    log.info(f"💰 Ingesting funding rates for {symbol}...")
+                    funding_results = data_ingestion.ingest_funding_rates([symbol])
+                    if not funding_results.get(symbol, False):
+                        log.error(f"❌ Funding rates failed for {symbol}")
+                        symbol_success = False
                     else:
-                        log.warning(f"  {symbol}: No funding rate data found")
+                        log.info(f"✅ Funding rates completed for {symbol}")
+                else:
+                    log.info(f"⏭️ Skipping funding rates for {symbol} (not a perpetual contract)")
+            
+            if "ohlcv" in data_types:
+                log.info(f"📈 Ingesting OHLCV data for {symbol}...")
+                if not data_ingestion.ingest_ohlcv_data(symbol):
+                    log.error(f"❌ OHLCV failed for {symbol}")
+                    symbol_success = False
+                else:
+                    log.info(f"✅ OHLCV completed for {symbol}")
+            
+            if "orderbook" in data_types:
+                log.info(f"📊 Ingesting orderbook data for {symbol}...")
+                if not data_ingestion.ingest_orderbook_data(symbol):
+                    log.error(f"❌ Orderbook failed for {symbol}")
+                    symbol_success = False
+                else:
+                    log.info(f"✅ Orderbook completed for {symbol}")
+            
+            # STEP 4: Summary for this symbol
+            if symbol_success:
+                success_count += 1
+                log.info(f"🎉 {symbol} completed successfully!")
+                
+                # Quick stats
+                from src.database.connection import db_manager
+                from sqlalchemy import text
+                with db_manager.get_session() as session:
+                    if "ohlcv" in data_types:
+                        result = session.execute(text("""
+                            SELECT COUNT(*) as count 
+                            FROM ohlcv WHERE symbol = :symbol
+                        """), {'symbol': symbol}).fetchone()
+                        log.info(f"   📈 OHLCV records: {result.count:,}")
+                    
+                    if "orderbook" in data_types:
+                        result = session.execute(text("""
+                            SELECT COUNT(*) as count 
+                            FROM orderbook WHERE symbol = :symbol
+                        """), {'symbol': symbol}).fetchone()
+                        log.info(f"   📊 Orderbook records: {result.count:,}")
+                    
+                    if "funding" in data_types and "PERP_" in symbol:
+                        result = session.execute(text("""
+                            SELECT COUNT(*) as count 
+                            FROM funding_rates WHERE symbol = :symbol
+                        """), {'symbol': symbol}).fetchone()
+                        log.info(f"   💰 Funding records: {result.count:,}")
             else:
-                # Show OHLCV summary
-                symbols_to_check = [args.symbol] if args.symbol else settings.get_all_symbols()
-                
-                log.info("OHLCV Data:")
-                for symbol in symbols_to_check:
-                    min_date, max_date = data_ingestion.get_symbol_data_range(symbol)
-                    if min_date and max_date:
-                        log.info(f"  {symbol}: {min_date} to {max_date}")
-                    else:
-                        log.warning(f"  {symbol}: No OHLCV data found")
-                
-                # Also show funding rates for perpetual symbols
-                perp_symbols = [s for s in symbols_to_check if "PERP_" in s]
-                if perp_symbols:
-                    log.info("Funding Rates Data:")
-                    for symbol in perp_symbols:
-                        min_date, max_date = data_ingestion.get_funding_data_range(symbol)
-                        if min_date and max_date:
-                            log.info(f"  {symbol}: {min_date} to {max_date}")
-                        else:
-                            log.warning(f"  {symbol}: No funding rate data found")
+                log.error(f"💥 {symbol} had some failures")
         
-        # Final success message
-        log.info("\n=== Ingestion Complete ===")
-        if args.funding_only:
-            log.info("✅ Funding rates ingestion completed")
-            log.info("Next steps:")
-            log.info("  - Run 'python scripts/clean_data.py' to clean and validate data")
-            log.info("  - Run 'python scripts/analyze_data.py' to analyze funding patterns")
-        else:
-            log.info("✅ Complete data ingestion finished")
-            log.info("Next steps:")
-            log.info("  - Run 'python scripts/validate_data.py' to validate data quality")
-            log.info("  - Run 'python scripts/clean_data.py' to clean data")
+        # FINAL SUMMARY
+        data_type_names = {
+            "funding": "funding rates",
+            "orderbook": "orderbook",
+            "ohlcv": "OHLCV"
+        }
+        selected_types = [data_type_names[dt] for dt in data_types]
         
-        return True
+        log.info(f"\n🎉 Data ingestion completed!")
+        log.info(f"📊 Data types processed: {', '.join(selected_types)}")
+        log.info(f"✅ Successful symbols: {success_count}/{len(symbols)}")
+        
+        if args.force_overwrite and any(total_deleted.values()):
+            log.info(f"🗑️ Total records deleted:")
+            for data_type, count in total_deleted.items():
+                if count > 0:
+                    log.info(f"   {data_type_names[data_type]}: {count:,}")
+        
+        log.info(f"\nNext steps:")
+        if "ohlcv" in data_types or "orderbook" in data_types:
+            log.info(f"  - Run 'python scripts/validate_data.py' to validate data quality")
+            log.info(f"  - Run 'python scripts/clean_data.py' to clean and mark quality")
+        if "orderbook" in data_types:
+            log.info(f"  - Run 'python scripts/calculate_markprices.py' to calculate mark prices")
+        
+        return success_count == len(symbols)
         
     except Exception as e:
         log.error(f"Data ingestion failed: {e}")
