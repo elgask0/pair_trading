@@ -2,6 +2,7 @@
 """
 Data ingestion module - VERSION CON PARÁMETROS SELECTIVOS Y SOBREESCRITURA
 FIXED: Usa todos los datos disponibles en overwrite mode por defecto
+FIXED: Orderbook ahora busca gaps igual que OHLCV
 """
 
 import pandas as pd
@@ -404,7 +405,7 @@ class DataIngestion:
             return False
     
     def ingest_orderbook_data(self, symbol: str, overwrite: bool = False, days_back: int = None) -> bool:
-        """Ingest orderbook data - FIXED: Usa todos los datos si days_back es None en overwrite mode"""
+        """Ingest orderbook data - FIXED: Busca gaps igual que OHLCV"""
         log.info(f"Starting orderbook ingestion for {symbol} (overwrite={overwrite}, days_back={days_back})")
         
         try:
@@ -443,36 +444,40 @@ class DataIngestion:
                 total_records = self._fetch_orderbook_range(symbol, start_fetch, end_fetch)
                 
             else:
-                # Modo incremental
+                # Modo incremental - FIXED: Misma lógica que OHLCV
                 min_date, max_date = self.get_orderbook_data_range(symbol)
                 
                 if min_date and max_date:
                     log.info(f"Existing orderbook data for {symbol}: {min_date.date()} to {max_date.date()}")
-                    
-                    # Fetch only recent data (last 3 days from available end)
-                    start_fetch = max(max_date.date(), available_end.date() - timedelta(days=3))
-                    if start_fetch < available_end.date():
-                        start_fetch = start_fetch + timedelta(days=1)  # Start from next day
-                    else:
-                        log.info(f"No new orderbook data for {symbol}")
-                        return True
                 else:
                     log.info(f"No existing orderbook data for {symbol}")
+                
+                # Determine what data to fetch - FIXED: Buscar gaps
+                ranges_to_fetch = []
+                
+                if not min_date:
                     # No existing data, fetch based on days_back or default
                     if days_back is None:
-                        days_back = 7  # Default for incremental mode
-                    start_fetch = available_end.date() - timedelta(days=days_back)
+                        days_back = 7  # Default for incremental mode (más conservador que OHLCV)
+                    start_fetch = max(available_start.date(), (available_end.date() - timedelta(days=days_back)))
+                    ranges_to_fetch.append((start_fetch, available_end.date()))
+                    log.info(f"No existing data - fetching last {days_back} days: {start_fetch} to {available_end.date()}")
+                else:
+                    # FIXED: Check for new data at the end (igual que OHLCV)
+                    if available_end.date() > max_date.date():
+                        gap_start = max_date.date() + timedelta(days=1)  # Start from next day
+                        ranges_to_fetch.append((gap_start, available_end.date()))
+                        log.info(f"New orderbook data available: {gap_start} to {available_end.date()}")
                 
-                end_fetch = available_end.date()
-                
-                if start_fetch > end_fetch:
-                    log.info(f"No new orderbook data for {symbol}")
+                if not ranges_to_fetch:
+                    log.info(f"No new orderbook data to fetch for {symbol}")
                     return True
                 
-                log.info(f"Fetching orderbook data: {start_fetch} to {end_fetch}")
-                
-                # Fetch orderbook data
-                total_records = self._fetch_orderbook_range(symbol, start_fetch, end_fetch)
+                # Fetch data for each range - FIXED: Similar a OHLCV
+                total_records = 0
+                for start_date, end_date in ranges_to_fetch:
+                    records = self._fetch_orderbook_range(symbol, start_date, end_date)
+                    total_records += records
             
             log.info(f"✅ Successfully fetched {total_records} orderbook snapshots for {symbol}")
             return total_records > 0
@@ -657,189 +662,189 @@ class DataIngestion:
             with db_manager.get_session() as session:
                 records = []
                 for timestamp, row in df.iterrows():
-                    try:
-                        record = {
-                            'symbol': symbol,
-                            'timestamp': timestamp.to_pydatetime() if hasattr(timestamp, 'to_pydatetime') else timestamp,
-                            'open': float(row['open']),
-                            'high': float(row['high']),
-                            'low': float(row['low']),
-                            'close': float(row['close']),
-                            'volume': float(row['volume'])
-                        }
-                        
-                        # Validar datos básicos
-                        if (record['open'] > 0 and record['high'] > 0 and 
-                            record['low'] > 0 and record['close'] > 0 and
-                            record['high'] >= record['low'] and
-                            record['volume'] >= 0):
-                            records.append(record)
-                        
-                    except (ValueError, KeyError) as e:
-                        log.debug(f"Skipping invalid OHLCV record for {symbol} at {timestamp}: {e}")
-                        continue
-                
+                   try:
+                       record = {
+                           'symbol': symbol,
+                           'timestamp': timestamp.to_pydatetime() if hasattr(timestamp, 'to_pydatetime') else timestamp,
+                           'open': float(row['open']),
+                           'high': float(row['high']),
+                           'low': float(row['low']),
+                           'close': float(row['close']),
+                           'volume': float(row['volume'])
+                       }
+                       
+                       # Validar datos básicos
+                       if (record['open'] > 0 and record['high'] > 0 and 
+                           record['low'] > 0 and record['close'] > 0 and
+                           record['high'] >= record['low'] and
+                           record['volume'] >= 0):
+                           records.append(record)
+                       
+                   except (ValueError, KeyError) as e:
+                       log.debug(f"Skipping invalid OHLCV record for {symbol} at {timestamp}: {e}")
+                       continue
+               
                 if records:
-                    session.execute(text("""
-                        INSERT INTO ohlcv (symbol, timestamp, open, high, low, close, volume)
-                        VALUES (:symbol, :timestamp, :open, :high, :low, :close, :volume)
-                        ON CONFLICT (symbol, timestamp) DO UPDATE SET
-                            open = EXCLUDED.open,
-                            high = EXCLUDED.high,
-                            low = EXCLUDED.low,
-                            close = EXCLUDED.close,
-                            volume = EXCLUDED.volume
-                    """), records)
-                    session.commit()
-                
-                return len(records)
-                
+                   session.execute(text("""
+                       INSERT INTO ohlcv (symbol, timestamp, open, high, low, close, volume)
+                       VALUES (:symbol, :timestamp, :open, :high, :low, :close, :volume)
+                       ON CONFLICT (symbol, timestamp) DO UPDATE SET
+                           open = EXCLUDED.open,
+                           high = EXCLUDED.high,
+                           low = EXCLUDED.low,
+                           close = EXCLUDED.close,
+                           volume = EXCLUDED.volume
+                   """), records)
+                   session.commit()
+               
+            return len(records)
+               
         except Exception as e:
             log.error(f"Error inserting OHLCV data for {symbol}: {e}")
             return 0
-    
+   
     def _insert_orderbook_data(self, symbol: str, df: pd.DataFrame) -> int:
-        """Insert orderbook data ROBUSTO - Version 3.0"""
-        if df.empty:
-            return 0
-        
-        try:
-            with db_manager.get_session() as session:
-                records = []
-                
-                for timestamp, row in df.iterrows():
-                    try:
-                        record = {
-                            'symbol': symbol,
-                            'timestamp': timestamp.to_pydatetime() if hasattr(timestamp, 'to_pydatetime') else timestamp
-                        }
-                        
-                        # Agregar niveles bid/ask (1-10)
-                        valid_level1 = False
-                        
-                        for i in range(1, 11):
-                            for side in ['bid', 'ask']:
-                                price_col = f'{side}{i}_price'
-                                size_col = f'{side}{i}_size'
-                                
-                                price = row.get(price_col)
-                                size = row.get(size_col)
-                                
-                                # Validar y convertir
-                                try:
-                                    if pd.notna(price) and price > 0:
-                                        record[price_col] = float(price)
-                                        if i == 1:  # Nivel 1
-                                            valid_level1 = True
-                                    else:
-                                        record[price_col] = None
-                                        
-                                    if pd.notna(size) and size > 0:
-                                        record[size_col] = float(size)
-                                    else:
-                                        record[size_col] = None
-                                except (ValueError, TypeError):
-                                    record[price_col] = None
-                                    record[size_col] = None
-                        
-                        # Solo agregar si tiene al menos nivel 1 válido y spread correcto
-                        if valid_level1:
-                            bid1 = record.get('bid1_price')
-                            ask1 = record.get('ask1_price')
-                            if bid1 and ask1 and bid1 < ask1:
-                                records.append(record)
-                        
-                    except Exception as e:
-                        log.debug(f"Error procesando record {symbol} {timestamp}: {e}")
-                        continue
-                
-                if records:
-                    # Construir query dinámica
-                    columns = list(records[0].keys())
-                    placeholders = ', '.join([f':{col}' for col in columns])
-                    columns_str = ', '.join(columns)
-                    
-                    # Para sobreescritura usamos UPSERT
-                    update_clauses = []
-                    for col in columns:
-                        if col not in ['symbol', 'timestamp']:
-                            update_clauses.append(f"{col} = EXCLUDED.{col}")
-                    
-                    insert_query = f"""
-                        INSERT INTO orderbook ({columns_str})
-                        VALUES ({placeholders})
-                        ON CONFLICT (symbol, timestamp) DO UPDATE SET
-                            {', '.join(update_clauses)}
-                    """
-                    
-                    result = session.execute(text(insert_query), records)
-                    session.commit()
-                    
-                    log.debug(f"✅ Insertados {len(records)} orderbook records para {symbol}")
-                    return len(records)
-                else:
-                    log.debug(f"No hay records válidos para {symbol}")
-                    return 0
-                    
-        except Exception as e:
-            log.error(f"Error insertando orderbook {symbol}: {e}")
-            import traceback
-            log.debug(traceback.format_exc())
-            return 0
-    
+       """Insert orderbook data ROBUSTO - Version 3.0"""
+       if df.empty:
+           return 0
+       
+       try:
+           with db_manager.get_session() as session:
+               records = []
+               
+               for timestamp, row in df.iterrows():
+                   try:
+                       record = {
+                           'symbol': symbol,
+                           'timestamp': timestamp.to_pydatetime() if hasattr(timestamp, 'to_pydatetime') else timestamp
+                       }
+                       
+                       # Agregar niveles bid/ask (1-10)
+                       valid_level1 = False
+                       
+                       for i in range(1, 11):
+                           for side in ['bid', 'ask']:
+                               price_col = f'{side}{i}_price'
+                               size_col = f'{side}{i}_size'
+                               
+                               price = row.get(price_col)
+                               size = row.get(size_col)
+                               
+                               # Validar y convertir
+                               try:
+                                   if pd.notna(price) and price > 0:
+                                       record[price_col] = float(price)
+                                       if i == 1:  # Nivel 1
+                                           valid_level1 = True
+                                   else:
+                                       record[price_col] = None
+                                       
+                                   if pd.notna(size) and size > 0:
+                                       record[size_col] = float(size)
+                                   else:
+                                       record[size_col] = None
+                               except (ValueError, TypeError):
+                                   record[price_col] = None
+                                   record[size_col] = None
+                       
+                       # Solo agregar si tiene al menos nivel 1 válido y spread correcto
+                       if valid_level1:
+                           bid1 = record.get('bid1_price')
+                           ask1 = record.get('ask1_price')
+                           if bid1 and ask1 and bid1 < ask1:
+                               records.append(record)
+                       
+                   except Exception as e:
+                       log.debug(f"Error procesando record {symbol} {timestamp}: {e}")
+                       continue
+               
+               if records:
+                   # Construir query dinámica
+                   columns = list(records[0].keys())
+                   placeholders = ', '.join([f':{col}' for col in columns])
+                   columns_str = ', '.join(columns)
+                   
+                   # Para sobreescritura usamos UPSERT
+                   update_clauses = []
+                   for col in columns:
+                       if col not in ['symbol', 'timestamp']:
+                           update_clauses.append(f"{col} = EXCLUDED.{col}")
+                   
+                   insert_query = f"""
+                       INSERT INTO orderbook ({columns_str})
+                       VALUES ({placeholders})
+                       ON CONFLICT (symbol, timestamp) DO UPDATE SET
+                           {', '.join(update_clauses)}
+                   """
+                   
+                   result = session.execute(text(insert_query), records)
+                   session.commit()
+                   
+                   log.debug(f"✅ Insertados {len(records)} orderbook records para {symbol}")
+                   return len(records)
+               else:
+                   log.debug(f"No hay records válidos para {symbol}")
+                   return 0
+                   
+       except Exception as e:
+           log.error(f"Error insertando orderbook {symbol}: {e}")
+           import traceback
+           log.debug(traceback.format_exc())
+           return 0
+   
     def _ingest_symbol_funding_rates(self, symbol: str, funding_df: pd.DataFrame) -> bool:
-        """Insert funding rates for a specific symbol - ROBUST VERSION"""
-        try:
-            with db_manager.get_session() as session:
-                records = []
-                
-                for _, row in funding_df.iterrows():
-                    try:
-                        timestamp = row['timestamp']
-                        
-                        # Handle timestamp conversion
-                        if isinstance(timestamp, str):
-                            timestamp = pd.to_datetime(timestamp, utc=True)
-                        elif isinstance(timestamp, (int, float)):
-                            timestamp = pd.to_datetime(timestamp, unit='s', utc=True)
-                        elif not isinstance(timestamp, datetime):
-                            timestamp = pd.to_datetime(timestamp, utc=True)
-                        
-                        # Convert to naive UTC datetime
-                        if hasattr(timestamp, 'tz') and timestamp.tz is not None:
-                            timestamp = timestamp.tz_convert('UTC').tz_localize(None)
-                        
-                        if hasattr(timestamp, 'to_pydatetime'):
-                            timestamp = timestamp.to_pydatetime()
-                        
-                        records.append({
-                            'symbol': symbol,
-                            'timestamp': timestamp,
-                            'funding_rate': float(row['funding_rate']),
-                            'collect_cycle': int(row.get('collect_cycle', 28800))
-                        })
-                        
-                    except Exception as e:
-                        log.debug(f"Skipping invalid funding rate record for {symbol}: {e}")
-                        continue
-                
-                if records:
-                    session.execute(text("""
-                        INSERT INTO funding_rates (symbol, timestamp, funding_rate, collect_cycle)
-                        VALUES (:symbol, :timestamp, :funding_rate, :collect_cycle)
-                        ON CONFLICT (symbol, timestamp) DO UPDATE SET
-                            funding_rate = EXCLUDED.funding_rate,
-                            collect_cycle = EXCLUDED.collect_cycle
-                    """), records)
-                    session.commit()
-                    
-                    log.info(f"✅ Inserted {len(records)} funding rate records for {symbol}")
-                
-                return True
-                
-        except Exception as e:
-            log.error(f"Error inserting funding rates for {symbol}: {e}")
-            return False
+       """Insert funding rates for a specific symbol - ROBUST VERSION"""
+       try:
+           with db_manager.get_session() as session:
+               records = []
+               
+               for _, row in funding_df.iterrows():
+                   try:
+                       timestamp = row['timestamp']
+                       
+                       # Handle timestamp conversion
+                       if isinstance(timestamp, str):
+                           timestamp = pd.to_datetime(timestamp, utc=True)
+                       elif isinstance(timestamp, (int, float)):
+                           timestamp = pd.to_datetime(timestamp, unit='s', utc=True)
+                       elif not isinstance(timestamp, datetime):
+                           timestamp = pd.to_datetime(timestamp, utc=True)
+                       
+                       # Convert to naive UTC datetime
+                       if hasattr(timestamp, 'tz') and timestamp.tz is not None:
+                           timestamp = timestamp.tz_convert('UTC').tz_localize(None)
+                       
+                       if hasattr(timestamp, 'to_pydatetime'):
+                           timestamp = timestamp.to_pydatetime()
+                       
+                       records.append({
+                           'symbol': symbol,
+                           'timestamp': timestamp,
+                           'funding_rate': float(row['funding_rate']),
+                           'collect_cycle': int(row.get('collect_cycle', 28800))
+                       })
+                       
+                   except Exception as e:
+                       log.debug(f"Skipping invalid funding rate record for {symbol}: {e}")
+                       continue
+               
+               if records:
+                   session.execute(text("""
+                       INSERT INTO funding_rates (symbol, timestamp, funding_rate, collect_cycle)
+                       VALUES (:symbol, :timestamp, :funding_rate, :collect_cycle)
+                       ON CONFLICT (symbol, timestamp) DO UPDATE SET
+                           funding_rate = EXCLUDED.funding_rate,
+                           collect_cycle = EXCLUDED.collect_cycle
+                   """), records)
+                   session.commit()
+                   
+                   log.info(f"✅ Inserted {len(records)} funding rate records for {symbol}")
+               
+               return True
+               
+       except Exception as e:
+           log.error(f"Error inserting funding rates for {symbol}: {e}")
+           return False
 
 # Global instance
 data_ingestion = DataIngestion()
