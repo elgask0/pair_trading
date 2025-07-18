@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Data ingestion module - VERSION CON PARÁMETROS Y SOBREESCRITURA
-Permite seleccionar qué tipo de datos ingestar y si sobreescribir
+Data ingestion module - VERSION CON PARÁMETROS SELECTIVOS Y SOBREESCRITURA
+FIXED: Usa todos los datos disponibles en overwrite mode por defecto
 """
 
 import pandas as pd
@@ -21,11 +21,174 @@ from config.settings import settings
 log = get_ingestion_logger()
 
 class DataIngestion:
-    """Main data ingestion class - CON PARÁMETROS Y SOBREESCRITURA"""
+    """Main data ingestion class - CON PARÁMETROS SELECTIVOS Y SOBREESCRITURA"""
     
     def __init__(self):
         self.coinapi = coinapi_client
         self.mexc = mexc_client
+    
+    def ingest_data(self, symbols: List[str], data_types: List[str] = None, 
+                   overwrite: bool = False, days_back: int = None) -> Dict[str, Dict[str, bool]]:
+        """
+        Función principal de ingesta con parámetros selectivos - FIXED
+        
+        Args:
+            symbols: Lista de símbolos a procesar
+            data_types: Lista de tipos de datos ['ohlcv', 'orderbook', 'funding'] o None para todos
+            overwrite: Si True, sobreescribe datos existentes en lugar de modo incremental
+            days_back: Días hacia atrás para ingestar. Si None en overwrite mode, usa TODOS los datos disponibles
+            
+        Returns:
+            Dict con resultados por símbolo y tipo de datos
+        """
+        
+        # Tipos de datos disponibles
+        available_types = ['ohlcv', 'orderbook', 'funding']
+        
+        # Si no se especifican tipos, usar todos
+        if data_types is None:
+            data_types = available_types.copy()
+        else:
+            # Validar tipos especificados
+            data_types = [dt for dt in data_types if dt in available_types]
+        
+        if not data_types:
+            log.error("No valid data types specified")
+            return {}
+        
+        # FIXED: En overwrite mode, si no se especifica days_back, usar todos los datos
+        if overwrite and days_back is None:
+            log.info(f"🚀 Starting data ingestion for {len(symbols)} symbols")
+            log.info(f"📊 Data types: {data_types}")
+            log.info(f"🔄 Mode: OVERWRITE (ALL AVAILABLE DATA)")
+        elif overwrite:
+            log.info(f"🚀 Starting data ingestion for {len(symbols)} symbols")
+            log.info(f"📊 Data types: {data_types}")
+            log.info(f"🔄 Mode: OVERWRITE ({days_back} days back)")
+        else:
+            log.info(f"🚀 Starting data ingestion for {len(symbols)} symbols")
+            log.info(f"📊 Data types: {data_types}")
+            log.info(f"🔄 Mode: INCREMENTAL")
+            if days_back is None:
+                days_back = 7  # Default for incremental mode
+        
+        results = {}
+        
+        for symbol in symbols:
+            log.info(f"\n{'='*60}")
+            log.info(f"PROCESSING {symbol}")
+            log.info(f"{'='*60}")
+            
+            symbol_results = {}
+            
+            # 1. Update symbol info (lightweight operation)
+            log.info(f"📋 Updating symbol info for {symbol}...")
+            self.update_symbol_info(symbol)
+            
+            # 2. Process each requested data type
+            for data_type in data_types:
+                log.info(f"\n📊 Processing {data_type.upper()} for {symbol}...")
+                
+                try:
+                    if data_type == 'ohlcv':
+                        success = self.ingest_ohlcv_data(symbol, overwrite=overwrite, days_back=days_back)
+                        symbol_results['ohlcv'] = success
+                        
+                    elif data_type == 'orderbook':
+                        success = self.ingest_orderbook_data(symbol, overwrite=overwrite, days_back=days_back)
+                        symbol_results['orderbook'] = success
+                        
+                    elif data_type == 'funding':
+                        if "PERP_" in symbol:
+                            funding_results = self.ingest_funding_rates([symbol], overwrite=overwrite)
+                            success = funding_results.get(symbol, False)
+                            symbol_results['funding'] = success
+                        else:
+                            log.info(f"⏭️ Skipping funding rates for {symbol} (not a perpetual contract)")
+                            symbol_results['funding'] = True  # Not applicable, so mark as successful
+                    
+                    if success:
+                        log.info(f"✅ {data_type.upper()} completed for {symbol}")
+                    else:
+                        log.error(f"❌ {data_type.upper()} failed for {symbol}")
+                        
+                except Exception as e:
+                    log.error(f"💥 Error processing {data_type} for {symbol}: {e}")
+                    symbol_results[data_type] = False
+            
+            results[symbol] = symbol_results
+            
+            # Log symbol summary
+            successful_types = [dt for dt, success in symbol_results.items() if success]
+            log.info(f"\n📊 {symbol} SUMMARY: {len(successful_types)}/{len(data_types)} data types successful")
+            log.info(f"✅ Successful: {successful_types}")
+            if len(successful_types) < len(data_types):
+                failed_types = [dt for dt, success in symbol_results.items() if not success]
+                log.warning(f"❌ Failed: {failed_types}")
+        
+        # Final summary
+        log.info(f"\n🎉 DATA INGESTION COMPLETED!")
+        self._log_final_summary(results, data_types)
+        
+        return results
+    
+    def _log_final_summary(self, results: Dict[str, Dict[str, bool]], data_types: List[str]):
+        """Log final ingestion summary"""
+        total_symbols = len(results)
+        total_operations = total_symbols * len(data_types)
+        successful_operations = sum(
+            sum(1 for success in symbol_results.values() if success)
+            for symbol_results in results.values()
+        )
+        
+        log.info(f"📊 FINAL SUMMARY:")
+        log.info(f"  Symbols processed: {total_symbols}")
+        log.info(f"  Data types: {data_types}")
+        log.info(f"  Total operations: {successful_operations}/{total_operations}")
+        log.info(f"  Success rate: {successful_operations/total_operations*100:.1f}%")
+        
+        # Per data type summary
+        for data_type in data_types:
+            type_successes = sum(
+                1 for symbol_results in results.values() 
+                if symbol_results.get(data_type, False)
+            )
+            log.info(f"  {data_type.upper()}: {type_successes}/{total_symbols} symbols successful")
+        
+        # Show quick stats if available
+        self._log_quick_stats(list(results.keys()), data_types)
+    
+    def _log_quick_stats(self, symbols: List[str], data_types: List[str]):
+        """Log quick statistics from database"""
+        try:
+            with db_manager.get_session() as session:
+                for data_type in data_types:
+                    if data_type == 'ohlcv':
+                        for symbol in symbols:
+                            result = session.execute(text("""
+                                SELECT COUNT(*) as count 
+                                FROM ohlcv WHERE symbol = :symbol
+                            """), {'symbol': symbol}).fetchone()
+                            log.info(f"    {symbol}: {result.count:,} OHLCV records")
+                    
+                    elif data_type == 'orderbook':
+                        for symbol in symbols:
+                            result = session.execute(text("""
+                                SELECT COUNT(*) as count 
+                                FROM orderbook WHERE symbol = :symbol
+                            """), {'symbol': symbol}).fetchone()
+                            log.info(f"    {symbol}: {result.count:,} orderbook records")
+                    
+                    elif data_type == 'funding':
+                        for symbol in symbols:
+                            if "PERP_" in symbol:
+                                result = session.execute(text("""
+                                    SELECT COUNT(*) as count 
+                                    FROM funding_rates WHERE symbol = :symbol
+                                """), {'symbol': symbol}).fetchone()
+                                log.info(f"    {symbol}: {result.count:,} funding records")
+        except Exception as e:
+            log.debug(f"Could not fetch quick stats: {e}")
     
     def get_symbol_data_range(self, symbol: str) -> Tuple[Optional[datetime], Optional[datetime]]:
         """Get existing data range for symbol"""
@@ -108,7 +271,7 @@ class DataIngestion:
     
     def update_symbol_info(self, symbol: str) -> bool:
         """Update symbol information with robust error handling"""
-        log.info(f"Updating symbol info for {symbol}")
+        log.debug(f"Updating symbol info for {symbol}")
         
         try:
             symbol_info = self.coinapi.get_symbol_info(symbol)
@@ -158,15 +321,15 @@ class DataIngestion:
                 })
                 session.commit()
             
-            log.info(f"✅ Updated symbol info for {symbol}")
+            log.debug(f"✅ Updated symbol info for {symbol}")
             return True
             
         except Exception as e:
-            log.error(f"Failed to update symbol info for {symbol}: {e}")
+            log.warning(f"Failed to update symbol info for {symbol}: {e}")
             return False
     
-    def ingest_ohlcv_data(self, symbol: str, overwrite: bool = False, days_back: int = 30) -> bool:
-        """Ingest OHLCV data - CON OPCIÓN DE SOBREESCRITURA"""
+    def ingest_ohlcv_data(self, symbol: str, overwrite: bool = False, days_back: int = None) -> bool:
+        """Ingest OHLCV data - FIXED: Usa todos los datos si days_back es None en overwrite mode"""
         log.info(f"Starting OHLCV ingestion for {symbol} (overwrite={overwrite}, days_back={days_back})")
         
         try:
@@ -178,11 +341,16 @@ class DataIngestion:
                 return False
             
             if overwrite:
-                # Calcular rango a eliminar y reemplazar
-                start_fetch = available_end - timedelta(days=days_back)
-                end_fetch = available_end
-                
-                log.info(f"OVERWRITE MODE: Fetching OHLCV {start_fetch.date()} to {end_fetch.date()}")
+                if days_back is None:
+                    # FIXED: Usar TODO el rango disponible
+                    start_fetch = available_start
+                    end_fetch = available_end
+                    log.info(f"OVERWRITE MODE: Fetching ALL AVAILABLE OHLCV data {start_fetch.date()} to {end_fetch.date()}")
+                else:
+                    # Usar días específicos
+                    start_fetch = available_end - timedelta(days=days_back)
+                    end_fetch = available_end
+                    log.info(f"OVERWRITE MODE: Fetching OHLCV {start_fetch.date()} to {end_fetch.date()}")
                 
                 # Eliminar datos existentes en el rango
                 self.delete_existing_data(symbol, 'ohlcv', start_fetch.isoformat(), end_fetch.isoformat())
@@ -203,7 +371,9 @@ class DataIngestion:
                 ranges_to_fetch = []
                 
                 if not min_date:
-                    # No existing data, fetch last days_back days
+                    # No existing data, fetch based on days_back or default
+                    if days_back is None:
+                        days_back = 30  # Default for incremental mode
                     start_fetch = max(available_start, available_end - timedelta(days=days_back))
                     ranges_to_fetch.append((start_fetch, available_end))
                     log.info(f"No existing data - fetching last {days_back} days: {start_fetch.date()} to {available_end.date()}")
@@ -233,8 +403,8 @@ class DataIngestion:
             log.error(traceback.format_exc())
             return False
     
-    def ingest_orderbook_data(self, symbol: str, overwrite: bool = False, days_back: int = 7) -> bool:
-        """Ingest orderbook data - CON OPCIÓN DE SOBREESCRITURA"""
+    def ingest_orderbook_data(self, symbol: str, overwrite: bool = False, days_back: int = None) -> bool:
+        """Ingest orderbook data - FIXED: Usa todos los datos si days_back es None en overwrite mode"""
         log.info(f"Starting orderbook ingestion for {symbol} (overwrite={overwrite}, days_back={days_back})")
         
         try:
@@ -246,32 +416,40 @@ class DataIngestion:
                 return False
             
             if overwrite:
-                # Calcular rango a eliminar y reemplazar
-                start_fetch = available_end.date() - timedelta(days=days_back)
-                end_fetch = available_end.date()
+                if days_back is None:
+                    # FIXED: Usar TODO el rango disponible
+                    start_fetch = available_start.date()
+                    end_fetch = available_end.date()
+                    log.info(f"OVERWRITE MODE: Fetching ALL AVAILABLE orderbook data {start_fetch} to {end_fetch}")
+                else:
+                    # Usar días específicos
+                    start_fetch = available_end.date() - timedelta(days=days_back)
+                    end_fetch = available_end.date()
+                    log.info(f"OVERWRITE MODE: Fetching orderbook {start_fetch} to {end_fetch}")
                 
-                log.info(f"OVERWRITE MODE: Fetching orderbook {start_fetch} to {end_fetch}")
+                # Eliminar datos existentes en el rango con fechas precisas
+                start_datetime = datetime.combine(start_fetch, datetime.min.time())
+                end_datetime = datetime.combine(end_fetch, datetime.max.time())
                 
-                # Eliminar datos existentes en el rango
-                self.delete_existing_data(symbol, 'orderbook', 
-                                        datetime.combine(start_fetch, datetime.min.time()).isoformat(),
-                                        datetime.combine(end_fetch, datetime.max.time()).isoformat())
+                deleted_count = self.delete_existing_data(
+                    symbol, 'orderbook', 
+                    start_datetime.isoformat(),
+                    end_datetime.isoformat()
+                )
+                
+                log.info(f"Deleted {deleted_count:,} existing orderbook records for overwrite")
                 
                 # Fetch data para el rango especificado
                 total_records = self._fetch_orderbook_range(symbol, start_fetch, end_fetch)
                 
             else:
-                # Modo incremental (como antes)
+                # Modo incremental
                 min_date, max_date = self.get_orderbook_data_range(symbol)
                 
                 if min_date and max_date:
                     log.info(f"Existing orderbook data for {symbol}: {min_date.date()} to {max_date.date()}")
-                else:
-                    log.info(f"No existing orderbook data for {symbol}")
-                
-                # Determine new data range
-                if max_date:
-                    # Fetch only recent data
+                    
+                    # Fetch only recent data (last 3 days from available end)
                     start_fetch = max(max_date.date(), available_end.date() - timedelta(days=3))
                     if start_fetch < available_end.date():
                         start_fetch = start_fetch + timedelta(days=1)  # Start from next day
@@ -279,7 +457,10 @@ class DataIngestion:
                         log.info(f"No new orderbook data for {symbol}")
                         return True
                 else:
-                    # No existing data, fetch last days_back days
+                    log.info(f"No existing orderbook data for {symbol}")
+                    # No existing data, fetch based on days_back or default
+                    if days_back is None:
+                        days_back = 7  # Default for incremental mode
                     start_fetch = available_end.date() - timedelta(days=days_back)
                 
                 end_fetch = available_end.date()
@@ -303,7 +484,7 @@ class DataIngestion:
             return False
     
     def ingest_funding_rates(self, symbols: List[str], overwrite: bool = False) -> Dict[str, bool]:
-        """Ingest funding rates - CON OPCIÓN DE SOBREESCRITURA"""
+        """Ingest funding rates - CON OPCIÓN DE SOBREESCRITURA MEJORADA"""
         log.info(f"Starting funding rates ingestion for {len(symbols)} symbols (overwrite={overwrite})")
         
         results = {}
@@ -319,7 +500,8 @@ class DataIngestion:
             try:
                 if overwrite:
                     # Eliminar todos los funding rates existentes
-                    self.delete_existing_data(symbol, 'funding')
+                    deleted_count = self.delete_existing_data(symbol, 'funding')
+                    log.info(f"Deleted {deleted_count:,} existing funding records for overwrite")
                 
                 # Get funding rate history from MEXC
                 funding_data = self.mexc.get_funding_rate_history(symbol)
@@ -356,12 +538,19 @@ class DataIngestion:
             successful_days = 0
             
             # Progress tracking
-            from tqdm import tqdm
+            try:
+                from tqdm import tqdm
+                use_tqdm = True
+            except ImportError:
+                use_tqdm = False
+                log.info("tqdm not available, using simple progress logging")
             
             total_days = (end_date_only - current_date).days + 1
-            pbar = tqdm(total=total_days, 
-                       desc=f"OHLCV {symbol.split('_')[-2] if '_' in symbol else symbol}", 
-                       unit="days")
+            
+            if use_tqdm:
+                pbar = tqdm(total=total_days, 
+                           desc=f"OHLCV {symbol.split('_')[-2] if '_' in symbol else symbol}", 
+                           unit="days")
             
             while current_date <= end_date_only:
                 try:
@@ -373,19 +562,25 @@ class DataIngestion:
                         if records_count > 0:
                             successful_days += 1
                     
-                    pbar.set_postfix(Records=total_records, Days=successful_days)
-                    pbar.update(1)
+                    if use_tqdm:
+                        pbar.set_postfix(Records=total_records, Days=successful_days)
+                        pbar.update(1)
+                    else:
+                        if (current_date.day % 5 == 0):  # Log every 5 days
+                            log.info(f"Progress: {successful_days} days, {total_records} records")
                     
                     # Rate limiting
                     time.sleep(0.2)
                     
                 except Exception as e:
                     log.warning(f"Failed to fetch OHLCV for {symbol} on {current_date}: {e}")
-                    pbar.update(1)
+                    if use_tqdm:
+                        pbar.update(1)
                 
                 current_date += timedelta(days=1)
             
-            pbar.close()
+            if use_tqdm:
+                pbar.close()
             
             log.info(f"OHLCV fetch completed: {total_records} records from {successful_days}/{total_days} days")
             return total_records
@@ -399,16 +594,22 @@ class DataIngestion:
         log.info(f"Fetching orderbook {symbol}: {start_date} to {end_date}")
         
         try:
-            from tqdm import tqdm
+            try:
+                from tqdm import tqdm
+                use_tqdm = True
+            except ImportError:
+                use_tqdm = False
             
             current_date = start_date
             total_records = 0
             successful_days = 0
             
             total_days = (end_date - start_date).days + 1
-            pbar = tqdm(total=total_days, 
-                       desc=f"Orderbook {symbol.split('_')[-2] if '_' in symbol else symbol}", 
-                       unit="days")
+            
+            if use_tqdm:
+                pbar = tqdm(total=total_days, 
+                           desc=f"Orderbook {symbol.split('_')[-2] if '_' in symbol else symbol}", 
+                           unit="days")
             
             while current_date <= end_date:
                 try:
@@ -420,19 +621,25 @@ class DataIngestion:
                         if records_count > 0:
                             successful_days += 1
                     
-                    pbar.set_postfix(Records=total_records, Days=successful_days)
-                    pbar.update(1)
+                    if use_tqdm:
+                        pbar.set_postfix(Records=total_records, Days=successful_days)
+                        pbar.update(1)
+                    else:
+                        if (current_date.day % 3 == 0):  # Log every 3 days for orderbook
+                            log.info(f"Orderbook progress: {successful_days} days, {total_records} records")
                     
                     # Rate limiting más agresivo para orderbook
                     time.sleep(0.5)
                     
                 except Exception as e:
                     log.warning(f"Failed to fetch orderbook for {symbol} on {current_date}: {e}")
-                    pbar.update(1)
+                    if use_tqdm:
+                        pbar.update(1)
                 
                 current_date += timedelta(days=1)
             
-            pbar.close()
+            if use_tqdm:
+                pbar.close()
             
             log.info(f"Orderbook fetch completed: {total_records} records from {successful_days}/{total_days} days")
             return total_records
@@ -469,7 +676,7 @@ class DataIngestion:
                             records.append(record)
                         
                     except (ValueError, KeyError) as e:
-                        log.warning(f"Skipping invalid OHLCV record for {symbol} at {timestamp}: {e}")
+                        log.debug(f"Skipping invalid OHLCV record for {symbol} at {timestamp}: {e}")
                         continue
                 
                 if records:
@@ -543,7 +750,7 @@ class DataIngestion:
                                 records.append(record)
                         
                     except Exception as e:
-                        log.warning(f"Error procesando record {symbol} {timestamp}: {e}")
+                        log.debug(f"Error procesando record {symbol} {timestamp}: {e}")
                         continue
                 
                 if records:
@@ -553,65 +760,31 @@ class DataIngestion:
                     columns_str = ', '.join(columns)
                     
                     # Para sobreescritura usamos UPSERT
+                    update_clauses = []
+                    for col in columns:
+                        if col not in ['symbol', 'timestamp']:
+                            update_clauses.append(f"{col} = EXCLUDED.{col}")
+                    
                     insert_query = f"""
                         INSERT INTO orderbook ({columns_str})
                         VALUES ({placeholders})
                         ON CONFLICT (symbol, timestamp) DO UPDATE SET
-                            bid1_price = EXCLUDED.bid1_price,
-                            bid1_size = EXCLUDED.bid1_size,
-                            ask1_price = EXCLUDED.ask1_price,
-                            ask1_size = EXCLUDED.ask1_size,
-                            bid2_price = EXCLUDED.bid2_price,
-                            bid2_size = EXCLUDED.bid2_size,
-                            ask2_price = EXCLUDED.ask2_price,
-                            ask2_size = EXCLUDED.ask2_size,
-                            bid3_price = EXCLUDED.bid3_price,
-                            bid3_size = EXCLUDED.bid3_size,
-                            ask3_price = EXCLUDED.ask3_price,
-                            ask3_size = EXCLUDED.ask3_size,
-                            bid4_price = EXCLUDED.bid4_price,
-                            bid4_size = EXCLUDED.bid4_size,
-                            ask4_price = EXCLUDED.ask4_price,
-                            ask4_size = EXCLUDED.ask4_size,
-                            bid5_price = EXCLUDED.bid5_price,
-                            bid5_size = EXCLUDED.bid5_size,
-                            ask5_price = EXCLUDED.ask5_price,
-                            ask5_size = EXCLUDED.ask5_size,
-                            bid6_price = EXCLUDED.bid6_price,
-                            bid6_size = EXCLUDED.bid6_size,
-                            ask6_price = EXCLUDED.ask6_price,
-                            ask6_size = EXCLUDED.ask6_size,
-                            bid7_price = EXCLUDED.bid7_price,
-                            bid7_size = EXCLUDED.bid7_size,
-                            ask7_price = EXCLUDED.ask7_price,
-                            ask7_size = EXCLUDED.ask7_size,
-                            bid8_price = EXCLUDED.bid8_price,
-                            bid8_size = EXCLUDED.bid8_size,
-                            ask8_price = EXCLUDED.ask8_price,
-                            ask8_size = EXCLUDED.ask8_size,
-                            bid9_price = EXCLUDED.bid9_price,
-                            bid9_size = EXCLUDED.bid9_size,
-                            ask9_price = EXCLUDED.ask9_price,
-                            ask9_size = EXCLUDED.ask9_size,
-                            bid10_price = EXCLUDED.bid10_price,
-                            bid10_size = EXCLUDED.bid10_size,
-                            ask10_price = EXCLUDED.ask10_price,
-                            ask10_size = EXCLUDED.ask10_size
+                            {', '.join(update_clauses)}
                     """
                     
                     result = session.execute(text(insert_query), records)
                     session.commit()
                     
-                    log.info(f"✅ Insertados {len(records)} orderbook records para {symbol}")
+                    log.debug(f"✅ Insertados {len(records)} orderbook records para {symbol}")
                     return len(records)
                 else:
-                    log.warning(f"No hay records válidos para {symbol}")
+                    log.debug(f"No hay records válidos para {symbol}")
                     return 0
                     
         except Exception as e:
             log.error(f"Error insertando orderbook {symbol}: {e}")
             import traceback
-            log.error(traceback.format_exc())
+            log.debug(traceback.format_exc())
             return 0
     
     def _ingest_symbol_funding_rates(self, symbol: str, funding_df: pd.DataFrame) -> bool:
@@ -647,7 +820,7 @@ class DataIngestion:
                         })
                         
                     except Exception as e:
-                        log.warning(f"Skipping invalid funding rate record for {symbol}: {e}")
+                        log.debug(f"Skipping invalid funding rate record for {symbol}: {e}")
                         continue
                 
                 if records:
@@ -667,25 +840,6 @@ class DataIngestion:
         except Exception as e:
             log.error(f"Error inserting funding rates for {symbol}: {e}")
             return False
-    
-    def ingest_symbol_data(self, symbol: str, data_types: List[str] = None, overwrite: bool = False, 
-                          days_back: int = 7) -> bool:
-        """Ingest data for a symbol - CON PARÁMETROS DE CONTROL"""
-        
-        # Tipos de datos disponibles
-        available_types = ['ohlcv', 'orderbook', 'funding']
-        
-        # Si no se especifican tipos, usar todos
-        if data_types is None:
-            data_types = available_types
-        
-        # Validar tipos
-        data_types = [dt for dt in data_types if dt in available_types]
-        
-        if not data_types:
-            log.error(f"No valid data types specified")
-            return False
-        
-        log.info(f"Starting selective ingestion for {symbol}")
-        log.info(f"Data types: {data_types}")
-        
+
+# Global instance
+data_ingestion = DataIngestion()

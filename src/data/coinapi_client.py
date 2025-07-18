@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CoinAPI client ROBUSTO - Solo datos reales de API
-Version 3.0 - Sin datos sintéticos
+Version 3.1 - FIXED: Solicita 10 niveles de orderbook
 """
 
 import requests
@@ -89,28 +89,31 @@ class CoinAPIClient:
         return None
     
     def get_orderbook_for_date(self, symbol: str, date_str: str) -> pd.DataFrame:
-        """Get orderbook data - SOLO DATOS REALES"""
+        """Get orderbook data - FIXED: Solicita 10 niveles"""
         
         log.info(f"Obteniendo orderbook REAL para {symbol} en {date_str}")
         
         url = f"{self.base_url}/orderbooks/{symbol}/history"
         
-        # Configuraciones optimizadas para evitar timeouts
+        # FIXED: Configuraciones optimizadas para 10 niveles
         configs = [
-            {'date': date_str, 'limit': 500, 'limit_levels': 5},    # Configuración conservadora
-            {'date': date_str, 'limit': 1000, 'limit_levels': 3},   # Menos niveles
-            {'date': date_str, 'limit': 100, 'limit_levels': 2}     # Mínimo viable
+            {'date': date_str, 'limit': 500, 'limit_levels': 10},   # FIXED: 10 niveles
+            {'date': date_str, 'limit': 1000, 'limit_levels': 10},  # FIXED: 10 niveles
+            {'date': date_str, 'limit': 200, 'limit_levels': 8},    # Fallback con 8 niveles
+            {'date': date_str, 'limit': 100, 'limit_levels': 5}     # Fallback mínimo
         ]
         
         for i, params in enumerate(configs):
-            context = f"orderbook {symbol} {date_str} (config {i+1})"
+            context = f"orderbook {symbol} {date_str} (config {i+1}: {params['limit_levels']} levels)"
             data = self._make_request_with_retries(url, params, context)
             
             if data and isinstance(data, list) and len(data) > 0:
                 # Procesar datos reales
                 processed_df = self._process_orderbook_response(data, symbol, date_str)
                 if not processed_df.empty:
-                    log.info(f"✅ Datos reales obtenidos para {symbol} en {date_str}: {len(processed_df)} snapshots")
+                    # Verificar cuántos niveles realmente obtuvimos
+                    levels_obtained = self._count_levels_in_df(processed_df)
+                    log.info(f"✅ Datos reales obtenidos para {symbol} en {date_str}: {len(processed_df)} snapshots, {levels_obtained} niveles promedio")
                     return processed_df
             
             # Pausa entre configuraciones
@@ -121,8 +124,30 @@ class CoinAPIClient:
         log.warning(f"❌ No se pudieron obtener datos reales para {symbol} en {date_str}")
         return pd.DataFrame()
     
+    def _count_levels_in_df(self, df: pd.DataFrame) -> float:
+        """Contar niveles promedio en el DataFrame"""
+        if df.empty:
+            return 0
+        
+        total_levels = 0
+        total_snapshots = 0
+        
+        for _, row in df.iterrows():
+            snapshot_levels = 0
+            for i in range(1, 11):
+                if (pd.notna(row.get(f'bid{i}_price')) and pd.notna(row.get(f'ask{i}_price')) and
+                    row.get(f'bid{i}_price', 0) > 0 and row.get(f'ask{i}_price', 0) > 0):
+                    snapshot_levels += 1
+                else:
+                    break
+            
+            total_levels += snapshot_levels
+            total_snapshots += 1
+        
+        return total_levels / total_snapshots if total_snapshots > 0 else 0
+    
     def _process_orderbook_response(self, data: List[dict], symbol: str, date_str: str) -> pd.DataFrame:
-        """Procesar respuesta de orderbook de CoinAPI"""
+        """Procesar respuesta de orderbook de CoinAPI - MEJORADO para 10 niveles"""
         
         processed_data = []
         valid_snapshots = 0
@@ -153,8 +178,9 @@ class CoinAPIClient:
             if not bids or not asks:
                 continue
             
-            # Procesar hasta 10 niveles
+            # FIXED: Procesar hasta 10 niveles con validación mejorada
             has_level1 = False
+            levels_processed = 0
             
             for i in range(10):
                 # Procesar bids
@@ -168,6 +194,7 @@ class CoinAPIClient:
                             processed_snapshot[f'bid{i+1}_size'] = size
                             if i == 0:
                                 has_level1 = True
+                            levels_processed = max(levels_processed, i + 1)
                         else:
                             processed_snapshot[f'bid{i+1}_price'] = None
                             processed_snapshot[f'bid{i+1}_size'] = None
@@ -189,6 +216,7 @@ class CoinAPIClient:
                             processed_snapshot[f'ask{i+1}_size'] = size
                             if i == 0:
                                 has_level1 = True
+                            levels_processed = max(levels_processed, i + 1)
                         else:
                             processed_snapshot[f'ask{i+1}_price'] = None
                             processed_snapshot[f'ask{i+1}_size'] = None
@@ -207,6 +235,10 @@ class CoinAPIClient:
                 if bid1 and ask1 and bid1 < ask1:
                     processed_data.append(processed_snapshot)
                     valid_snapshots += 1
+                    
+                    # Log ocasional para debugging
+                    if valid_snapshots % 100 == 0:
+                        log.debug(f"Snapshot {valid_snapshots}: {levels_processed} niveles procesados")
         
         if processed_data:
             df = pd.DataFrame(processed_data)
