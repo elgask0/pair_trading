@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-CoinAPI client ROBUSTO - Solo datos reales de API
-Version 3.1 - FIXED: Solicita 10 niveles de orderbook
+CoinAPI client OPTIMIZADO - Version 3.3 - FIXED: Sin bucles infinitos
+Tu código original + optimizaciones + protección contra bucles
 """
 
 import requests
@@ -16,7 +16,7 @@ from src.utils.exceptions import APIError
 log = get_ingestion_logger()
 
 class CoinAPIClient:
-    """CoinAPI client ROBUSTO - Solo datos reales"""
+    """CoinAPI client ROBUSTO - Solo datos reales + optimizaciones SIN BUCLES"""
     
     def __init__(self):
         self.base_url = getattr(settings, 'COINAPI_BASE_URL', 'https://rest.coinapi.io/v1')
@@ -30,24 +30,26 @@ class CoinAPIClient:
                 'Accept-Encoding': 'gzip, deflate'
             })
         
-        # Configuración de reintentos
+        # ✅ Timeouts optimizados
+        self.timeout = (5, 30)  # (connect, read)
         self.max_retries = 3
         self.base_timeout = 15
         self.retry_delay = 2
     
     def _make_request_with_retries(self, url: str, params: dict, context: str = "") -> Optional[dict]:
-        """Hacer petición con reintentos automáticos"""
+        """Hacer petición con reintentos automáticos + OPTIMIZACIONES"""
         
         for attempt in range(self.max_retries):
-            timeout = self.base_timeout + (attempt * 5)  # Timeout incremental
-            
             try:
                 log.debug(f"Intento {attempt + 1}/{self.max_retries} para {context}")
                 log.debug(f"URL: {url}")
                 log.debug(f"Params: {params}")
-                log.debug(f"Timeout: {timeout}s")
                 
-                response = self.session.get(url, params=params, timeout=timeout)
+                # ✅ Usar timeout como tuple
+                response = self.session.get(url, params=params, timeout=self.timeout)
+                
+                # ✅ Log rate limits
+                self._log_rate_limit_headers(response, context)
                 
                 if response.status_code == 200:
                     data = response.json()
@@ -55,9 +57,17 @@ class CoinAPIClient:
                     return data
                     
                 elif response.status_code == 429:
+                    # ✅ Respetar Retry-After exacto
                     retry_after = int(response.headers.get('Retry-After', 30))
-                    log.warning(f"Rate limit en {context} - esperando {retry_after}s")
+                    log.warning(f"Rate limit 429 en {context} - esperando {retry_after}s (cabecera)")
                     time.sleep(retry_after)
+                    continue
+                    
+                elif response.status_code == 503:
+                    # ✅ Backoff exponencial para 503
+                    wait_time = (2 ** attempt) + 1
+                    log.warning(f"Error 503 en {context} - esperando {wait_time}s")
+                    time.sleep(wait_time)
                     continue
                     
                 else:
@@ -69,7 +79,7 @@ class CoinAPIClient:
                         return None
                         
             except requests.exceptions.Timeout:
-                log.warning(f"Timeout en {context} (intento {attempt + 1}) - {timeout}s")
+                log.warning(f"Timeout en {context} (intento {attempt + 1}) - {self.timeout}s")
                 if attempt < self.max_retries - 1:
                     time.sleep(self.retry_delay * (attempt + 1))
                     continue
@@ -88,39 +98,65 @@ class CoinAPIClient:
         
         return None
     
+    def _log_rate_limit_headers(self, response: requests.Response, context: str):
+        """✅ Log cabeceras de rate limit"""
+        headers = response.headers
+        
+        limit = headers.get('X-RateLimit-Limit')
+        remaining = headers.get('X-RateLimit-Remaining')
+        cost = headers.get('X-RateLimit-Request-Cost')
+        
+        if remaining and limit:
+            usage_pct = ((int(limit) - int(remaining)) / int(limit)) * 100
+            log.debug(f"Rate limit: {remaining}/{limit} restantes ({usage_pct:.1f}% usado)")
+            
+            if int(remaining) < 1000:
+                log.warning(f"⚠️ Pocos créditos restantes: {remaining}")
+        
+        if cost:
+            log.debug(f"Coste petición: {cost} créditos")
+    
     def get_orderbook_for_date(self, symbol: str, date_str: str) -> pd.DataFrame:
-        """Get orderbook data - FIXED: Solicita 10 niveles"""
+        """Get orderbook data - FIXED: SIN BUCLES INFINITOS"""
         
         log.info(f"Obteniendo orderbook REAL para {symbol} en {date_str}")
         
         url = f"{self.base_url}/orderbooks/{symbol}/history"
         
-        # FIXED: Configuraciones optimizadas para 10 niveles
+        # ✅ Configuraciones optimizadas
         configs = [
-            {'date': date_str, 'limit': 500, 'limit_levels': 10},   # FIXED: 10 niveles
-            {'date': date_str, 'limit': 1000, 'limit_levels': 10},  # FIXED: 10 niveles
-            {'date': date_str, 'limit': 200, 'limit_levels': 8},    # Fallback con 8 niveles
-            {'date': date_str, 'limit': 100, 'limit_levels': 5}     # Fallback mínimo
+            {'date': date_str, 'limit': 1000, 'limit_levels': 10},  # 10 créditos
+            {'date': date_str, 'limit': 500, 'limit_levels': 10},   # 5 créditos  
+            {'date': date_str, 'limit': 200, 'limit_levels': 8},    # 2 créditos
+            {'date': date_str, 'limit': 100, 'limit_levels': 5}     # 1 crédito
         ]
         
         for i, params in enumerate(configs):
             context = f"orderbook {symbol} {date_str} (config {i+1}: {params['limit_levels']} levels)"
-            data = self._make_request_with_retries(url, params, context)
             
-            if data and isinstance(data, list) and len(data) > 0:
-                # Procesar datos reales
-                processed_df = self._process_orderbook_response(data, symbol, date_str)
-                if not processed_df.empty:
-                    # Verificar cuántos niveles realmente obtuvimos
-                    levels_obtained = self._count_levels_in_df(processed_df)
-                    log.info(f"✅ Datos reales obtenidos para {symbol} en {date_str}: {len(processed_df)} snapshots, {levels_obtained} niveles promedio")
-                    return processed_df
+            # ✅ FIXED: Intentar una sola llamada por configuración, NO paginación compleja
+            try:
+                data = self._make_request_with_retries(url, params, context)
+                
+                if data and isinstance(data, list) and len(data) > 0:
+                    # ✅ Procesar datos encontrados
+                    processed_df = self._process_orderbook_response(data, symbol, date_str)
+                    if not processed_df.empty:
+                        levels_obtained = self._count_levels_in_df(processed_df)
+                        log.info(f"✅ Datos reales obtenidos para {symbol} en {date_str}: {len(data)} snapshots raw → {len(processed_df)} válidos, {levels_obtained:.1f} niveles promedio")
+                        return processed_df
+                else:
+                    log.debug(f"Config {i+1}: Sin datos para {symbol} en {date_str}")
+                
+            except Exception as e:
+                log.warning(f"Error en config {i+1} para {symbol} {date_str}: {e}")
+                continue
             
-            # Pausa entre configuraciones
+            # ✅ Pausa entre configuraciones
             if i < len(configs) - 1:
                 time.sleep(2)
         
-        # Si todo falla, retornar DataFrame vacío
+        # ✅ Si TODAS las configuraciones fallan, continuar al siguiente día
         log.warning(f"❌ No se pudieron obtener datos reales para {symbol} en {date_str}")
         return pd.DataFrame()
     
@@ -244,8 +280,74 @@ class CoinAPIClient:
             df = pd.DataFrame(processed_data)
             df.set_index('timestamp', inplace=True)
             df = df.sort_index()
+            # ✅ Eliminar duplicados
+            df = df[~df.index.duplicated(keep='first')]
             return df
         else:
+            return pd.DataFrame()
+    
+    def get_ohlcv_for_date(self, symbol: str, date_str: str) -> pd.DataFrame:
+        """Get OHLCV data OPTIMIZADO para 1min"""
+        
+        url = f"{self.base_url}/ohlcv/{symbol}/history"
+        params = {
+            'period_id': '1MIN',
+            'date': date_str,
+            'limit': 2000  # 20 créditos, suficiente para día completo
+        }
+        
+        context = f"ohlcv {symbol} {date_str}"
+        data = self._make_request_with_retries(url, params, context)
+        
+        if data and isinstance(data, list) and len(data) > 0:
+            try:
+                df = pd.DataFrame(data)
+                
+                # Buscar columna de tiempo
+                time_col = None
+                for col in ['time_period_start', 'timestamp', 'time']:
+                    if col in df.columns:
+                        time_col = col
+                        break
+                
+                if not time_col:
+                    log.warning(f"No time column found in OHLCV response for {symbol}")
+                    return pd.DataFrame()
+                
+                df[time_col] = pd.to_datetime(df[time_col])
+                df.set_index(time_col, inplace=True)
+                
+                # Mapear columnas
+                column_mapping = {
+                    'price_open': 'open', 'open_price': 'open', 'o': 'open',
+                    'price_high': 'high', 'high_price': 'high', 'h': 'high',
+                    'price_low': 'low', 'low_price': 'low', 'l': 'low',
+                    'price_close': 'close', 'close_price': 'close', 'c': 'close',
+                    'volume_traded': 'volume', 'vol': 'volume', 'v': 'volume'
+                }
+                
+                df = df.rename(columns=column_mapping)
+                
+                required_cols = ['open', 'high', 'low', 'close', 'volume']
+                missing_cols = [col for col in required_cols if col not in df.columns]
+                
+                if missing_cols:
+                    log.warning(f"Missing OHLCV columns {missing_cols} for {symbol}")
+                    return pd.DataFrame()
+                
+                for col in required_cols:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                
+                df = df.dropna(subset=required_cols)
+                
+                log.info(f"Successfully fetched {len(df)} OHLCV records for {symbol} on {date_str}")
+                return df[required_cols]
+                
+            except Exception as e:
+                log.error(f"Error processing OHLCV for {symbol} on {date_str}: {e}")
+                return pd.DataFrame()
+        else:
+            log.warning(f"No OHLCV data for {symbol} on {date_str}")
             return pd.DataFrame()
     
     def get_symbol_info(self, symbol: str) -> Dict:
@@ -349,70 +451,6 @@ class CoinAPIClient:
             end_date = datetime.now()
             start_date = end_date - timedelta(days=365)
             return start_date, end_date
-    
-    def get_ohlcv_for_date(self, symbol: str, date_str: str) -> pd.DataFrame:
-        """Get OHLCV data ROBUSTO"""
-        
-        url = f"{self.base_url}/ohlcv/{symbol}/history"
-        params = {
-            'period_id': '1MIN',
-            'date': date_str,
-            'limit': 100000
-        }
-        
-        context = f"ohlcv {symbol} {date_str}"
-        data = self._make_request_with_retries(url, params, context)
-        
-        if data and isinstance(data, list) and len(data) > 0:
-            try:
-                df = pd.DataFrame(data)
-                
-                # Buscar columna de tiempo
-                time_col = None
-                for col in ['time_period_start', 'timestamp', 'time']:
-                    if col in df.columns:
-                        time_col = col
-                        break
-                
-                if not time_col:
-                    log.warning(f"No time column found in OHLCV response for {symbol}")
-                    return pd.DataFrame()
-                
-                df[time_col] = pd.to_datetime(df[time_col])
-                df.set_index(time_col, inplace=True)
-                
-                # Mapear columnas
-                column_mapping = {
-                    'price_open': 'open', 'open_price': 'open', 'o': 'open',
-                    'price_high': 'high', 'high_price': 'high', 'h': 'high',
-                    'price_low': 'low', 'low_price': 'low', 'l': 'low',
-                    'price_close': 'close', 'close_price': 'close', 'c': 'close',
-                    'volume_traded': 'volume', 'vol': 'volume', 'v': 'volume'
-                }
-                
-                df = df.rename(columns=column_mapping)
-                
-                required_cols = ['open', 'high', 'low', 'close', 'volume']
-                missing_cols = [col for col in required_cols if col not in df.columns]
-                
-                if missing_cols:
-                    log.warning(f"Missing OHLCV columns {missing_cols} for {symbol}")
-                    return pd.DataFrame()
-                
-                for col in required_cols:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                
-                df = df.dropna(subset=required_cols)
-                
-                log.info(f"Successfully fetched {len(df)} OHLCV records for {symbol} on {date_str}")
-                return df[required_cols]
-                
-            except Exception as e:
-                log.error(f"Error processing OHLCV for {symbol} on {date_str}: {e}")
-                return pd.DataFrame()
-        else:
-            log.warning(f"No OHLCV data for {symbol} on {date_str}")
-            return pd.DataFrame()
 
 # Instancia global
 coinapi_client = CoinAPIClient()
