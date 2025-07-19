@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-CoinAPI client OPTIMIZADO - Version 3.3 - FIXED: Sin bucles infinitos
-Tu código original + optimizaciones + protección contra bucles
+CoinAPI client OPTIMIZADO - Version 3.4 - FIXED: Limita correctamente datos por día
 """
 
 import requests
@@ -16,7 +15,7 @@ from src.utils.exceptions import APIError
 log = get_ingestion_logger()
 
 class CoinAPIClient:
-    """CoinAPI client ROBUSTO - Solo datos reales + optimizaciones SIN BUCLES"""
+    """CoinAPI client ROBUSTO - FIXED: Control estricto de datos por día"""
     
     def __init__(self):
         self.base_url = getattr(settings, 'COINAPI_BASE_URL', 'https://rest.coinapi.io/v1')
@@ -188,6 +187,9 @@ class CoinAPIClient:
         processed_data = []
         valid_snapshots = 0
         
+        # FIXED: Filtrar datos por fecha estrictamente
+        target_date = pd.to_datetime(date_str).date()
+        
         for snapshot in data:
             if not isinstance(snapshot, dict):
                 continue
@@ -202,6 +204,12 @@ class CoinAPIClient:
             
             try:
                 timestamp = pd.to_datetime(timestamp, utc=True)
+                
+                # FIXED: Filtrar estrictamente por fecha target
+                if timestamp.date() != target_date:
+                    log.debug(f"Skipping snapshot outside target date: {timestamp.date()} != {target_date}")
+                    continue
+                    
             except:
                 continue
             
@@ -287,13 +295,20 @@ class CoinAPIClient:
             return pd.DataFrame()
     
     def get_ohlcv_for_date(self, symbol: str, date_str: str) -> pd.DataFrame:
-        """Get OHLCV data OPTIMIZADO para 1min"""
+        """Get OHLCV data OPTIMIZADO para 1min - FIXED: Control estricto por día"""
         
         url = f"{self.base_url}/ohlcv/{symbol}/history"
+        
+        # FIXED: Usar time_start y time_end para controlar exactamente el día
+        target_date = pd.to_datetime(date_str).date()
+        time_start = f"{target_date}T00:00:00"
+        time_end = f"{target_date}T23:59:59"
+        
         params = {
             'period_id': '1MIN',
-            'date': date_str,
-            'limit': 2000  # 20 créditos, suficiente para día completo
+            'time_start': time_start,
+            'time_end': time_end,
+            'limit': 1500  # FIXED: 1440 max para 1 día + margen
         }
         
         context = f"ohlcv {symbol} {date_str}"
@@ -315,6 +330,14 @@ class CoinAPIClient:
                     return pd.DataFrame()
                 
                 df[time_col] = pd.to_datetime(df[time_col])
+                
+                # FIXED: Filtrar estrictamente por fecha target
+                df = df[df[time_col].dt.date == target_date]
+                
+                if df.empty:
+                    log.warning(f"No OHLCV data for target date {target_date} after filtering")
+                    return pd.DataFrame()
+                
                 df.set_index(time_col, inplace=True)
                 
                 # Mapear columnas
@@ -340,7 +363,19 @@ class CoinAPIClient:
                 
                 df = df.dropna(subset=required_cols)
                 
+                # FIXED: Validar que tenemos cantidad razonable para 1 día
+                if len(df) > 1500:
+                    log.warning(f"Too many OHLCV records ({len(df)}) for 1 day, truncating to most recent 1440")
+                    df = df.tail(1440)  # Tomar los últimos 1440 (24h)
+                
                 log.info(f"Successfully fetched {len(df)} OHLCV records for {symbol} on {date_str}")
+                
+                # FIXED: Log si el número es sospechoso
+                if len(df) > 1440:
+                    log.warning(f"⚠️ Expected max 1440 OHLCV records for 1 day, got {len(df)}")
+                elif len(df) < 1000:
+                    log.info(f"⚠️ Only {len(df)} OHLCV records for {date_str}, might be partial day")
+                
                 return df[required_cols]
                 
             except Exception as e:

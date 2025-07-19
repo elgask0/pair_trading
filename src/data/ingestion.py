@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Data ingestion module - VERSION CON PARÁMETROS SELECTIVOS Y SOBREESCRITURA
-FIXED: Usa todos los datos disponibles en overwrite mode por defecto
-FIXED: Orderbook ahora busca gaps igual que OHLCV
+Data ingestion module - VERSION CON DETECCIÓN MEJORADA DE GAPS
+FIXED: Orderbook ahora detecta correctamente todos los días faltantes
 """
 
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from sqlalchemy import text
 import time
 
@@ -22,7 +21,7 @@ from config.settings import settings
 log = get_ingestion_logger()
 
 class DataIngestion:
-    """Main data ingestion class - CON PARÁMETROS SELECTIVOS Y SOBREESCRITURA"""
+    """Main data ingestion class - CON DETECCIÓN MEJORADA DE GAPS"""
     
     def __init__(self):
         self.coinapi = coinapi_client
@@ -133,63 +132,97 @@ class DataIngestion:
         
         return results
     
-    def _log_final_summary(self, results: Dict[str, Dict[str, bool]], data_types: List[str]):
-        """Log final ingestion summary"""
-        total_symbols = len(results)
-        total_operations = total_symbols * len(data_types)
-        successful_operations = sum(
-            sum(1 for success in symbol_results.values() if success)
-            for symbol_results in results.values()
-        )
+    def _detect_missing_days(self, available_start: datetime, available_end: datetime, 
+                            existing_min: datetime, existing_max: datetime, 
+                            symbol: str, data_type: str) -> List[Tuple[datetime, datetime]]:
+        """
+        NUEVA FUNCIÓN: Detecta todos los días faltantes en el rango completo
+        Retorna lista de rangos (start_date, end_date) que necesitan ser fetched
+        """
+        log.info(f"🔍 Detecting missing days for {symbol} {data_type}")
+        log.info(f"  Available range: {available_start.date()} to {available_end.date()}")
         
-        log.info(f"📊 FINAL SUMMARY:")
-        log.info(f"  Symbols processed: {total_symbols}")
-        log.info(f"  Data types: {data_types}")
-        log.info(f"  Total operations: {successful_operations}/{total_operations}")
-        log.info(f"  Success rate: {successful_operations/total_operations*100:.1f}%")
+        if existing_min and existing_max:
+            log.info(f"  Existing range: {existing_min.date()} to {existing_max.date()}")
+        else:
+            log.info(f"  No existing data")
         
-        # Per data type summary
-        for data_type in data_types:
-            type_successes = sum(
-                1 for symbol_results in results.values() 
-                if symbol_results.get(data_type, False)
-            )
-            log.info(f"  {data_type.upper()}: {type_successes}/{total_symbols} symbols successful")
+        ranges_to_fetch = []
         
-        # Show quick stats if available
-        self._log_quick_stats(list(results.keys()), data_types)
-    
-    def _log_quick_stats(self, symbols: List[str], data_types: List[str]):
-        """Log quick statistics from database"""
-        try:
-            with db_manager.get_session() as session:
-                for data_type in data_types:
-                    if data_type == 'ohlcv':
-                        for symbol in symbols:
-                            result = session.execute(text("""
-                                SELECT COUNT(*) as count 
-                                FROM ohlcv WHERE symbol = :symbol
-                            """), {'symbol': symbol}).fetchone()
-                            log.info(f"    {symbol}: {result.count:,} OHLCV records")
-                    
-                    elif data_type == 'orderbook':
-                        for symbol in symbols:
-                            result = session.execute(text("""
-                                SELECT COUNT(*) as count 
-                                FROM orderbook WHERE symbol = :symbol
-                            """), {'symbol': symbol}).fetchone()
-                            log.info(f"    {symbol}: {result.count:,} orderbook records")
-                    
-                    elif data_type == 'funding':
-                        for symbol in symbols:
-                            if "PERP_" in symbol:
-                                result = session.execute(text("""
-                                    SELECT COUNT(*) as count 
-                                    FROM funding_rates WHERE symbol = :symbol
-                                """), {'symbol': symbol}).fetchone()
-                                log.info(f"    {symbol}: {result.count:,} funding records")
-        except Exception as e:
-            log.debug(f"Could not fetch quick stats: {e}")
+        # Si no hay datos existentes, fetch todo el rango disponible
+        if not existing_min or not existing_max:
+            ranges_to_fetch.append((available_start.date(), available_end.date()))
+            log.info(f"  No existing data - will fetch: {available_start.date()} to {available_end.date()}")
+            return ranges_to_fetch
+        
+        # Verificar qué días existen realmente en la DB
+        with db_manager.get_session() as session:
+            table_name = 'ohlcv' if data_type == 'ohlcv' else 'orderbook'
+            
+            existing_days_query = f"""
+                SELECT DISTINCT DATE(timestamp) as day
+                FROM {table_name}
+                WHERE symbol = :symbol
+                AND timestamp >= :start_date
+                AND timestamp <= :end_date
+                ORDER BY day
+            """
+            
+            result = session.execute(text(existing_days_query), {
+                'symbol': symbol,
+                'start_date': available_start,
+                'end_date': available_end
+            }).fetchall()
+            
+            existing_days = set(row.day for row in result)
+            log.info(f"  Found {len(existing_days)} existing days in DB")
+        
+        # Generar set completo de días que deberían existir
+        current_date = available_start.date()
+        should_exist_days = set()
+        
+        while current_date <= available_end.date():
+            should_exist_days.add(current_date)
+            current_date += timedelta(days=1)
+        
+        log.info(f"  Should exist: {len(should_exist_days)} days")
+        
+        # Encontrar días faltantes
+        missing_days = should_exist_days - existing_days
+        
+        if not missing_days:
+            log.info(f"  ✅ No missing days for {symbol} {data_type}")
+            return ranges_to_fetch
+        
+        log.info(f"  ❌ Missing {len(missing_days)} days for {symbol} {data_type}")
+        
+        # Agrupar días consecutivos en rangos
+        missing_days_sorted = sorted(missing_days)
+        
+        if missing_days_sorted:
+            range_start = missing_days_sorted[0]
+            range_end = missing_days_sorted[0]
+            
+            for day in missing_days_sorted[1:]:
+                if day == range_end + timedelta(days=1):
+                    # Día consecutivo, extender rango
+                    range_end = day
+                else:
+                    # Gap encontrado, cerrar rango actual y empezar nuevo
+                    ranges_to_fetch.append((range_start, range_end))
+                    range_start = day
+                    range_end = day
+            
+            # Agregar último rango
+            ranges_to_fetch.append((range_start, range_end))
+        
+        # Log de rangos a fetch
+        log.info(f"  📋 Will fetch {len(ranges_to_fetch)} ranges:")
+        for i, (start, end) in enumerate(ranges_to_fetch):
+            days_in_range = (end - start).days + 1
+            log.info(f"    Range {i+1}: {start} to {end} ({days_in_range} days)")
+        
+        return ranges_to_fetch
     
     def get_symbol_data_range(self, symbol: str) -> Tuple[Optional[datetime], Optional[datetime]]:
         """Get existing data range for symbol"""
@@ -330,7 +363,7 @@ class DataIngestion:
             return False
     
     def ingest_ohlcv_data(self, symbol: str, overwrite: bool = False, days_back: int = None) -> bool:
-        """Ingest OHLCV data - FIXED: Usa todos los datos si days_back es None en overwrite mode"""
+        """Ingest OHLCV data - FIXED: Usa detección mejorada de gaps"""
         log.info(f"Starting OHLCV ingestion for {symbol} (overwrite={overwrite}, days_back={days_back})")
         
         try:
@@ -360,39 +393,26 @@ class DataIngestion:
                 total_records = self._fetch_ohlcv_range(symbol, start_fetch, end_fetch)
                 
             else:
-                # Modo incremental (como antes)
+                # Modo incremental - NUEVA LÓGICA MEJORADA
                 min_date, max_date = self.get_symbol_data_range(symbol)
                 
-                if min_date and max_date:
-                    log.info(f"Existing OHLCV data for {symbol}: {min_date.date()} to {max_date.date()}")
-                else:
-                    log.info(f"No existing OHLCV data for {symbol}")
-                
-                # Determine what data to fetch
-                ranges_to_fetch = []
-                
-                if not min_date:
-                    # No existing data, fetch based on days_back or default
-                    if days_back is None:
-                        days_back = 30  # Default for incremental mode
-                    start_fetch = max(available_start, available_end - timedelta(days=days_back))
-                    ranges_to_fetch.append((start_fetch, available_end))
-                    log.info(f"No existing data - fetching last {days_back} days: {start_fetch.date()} to {available_end.date()}")
-                else:
-                    # Check for new data at the end
-                    if available_end > max_date:
-                        gap_start = max_date + timedelta(hours=1)  # Small overlap
-                        ranges_to_fetch.append((gap_start, available_end))
-                        log.info(f"New data available: {gap_start.date()} to {available_end.date()}")
+                # Usar nueva función de detección de gaps
+                ranges_to_fetch = self._detect_missing_days(
+                    available_start, available_end, min_date, max_date, symbol, 'ohlcv'
+                )
                 
                 if not ranges_to_fetch:
-                    log.info(f"No new OHLCV data to fetch for {symbol}")
+                    log.info(f"No missing OHLCV data for {symbol}")
                     return True
                 
-                # Fetch data for each range
+                # Fetch data para cada rango faltante
                 total_records = 0
                 for start_date, end_date in ranges_to_fetch:
-                    records = self._fetch_ohlcv_range(symbol, start_date, end_date)
+                    # Convertir dates a datetime
+                    start_datetime = datetime.combine(start_date, datetime.min.time())
+                    end_datetime = datetime.combine(end_date, datetime.max.time())
+                    
+                    records = self._fetch_ohlcv_range(symbol, start_datetime, end_datetime)
                     total_records += records
             
             log.info(f"✅ Successfully fetched {total_records} OHLCV records for {symbol}")
@@ -405,7 +425,7 @@ class DataIngestion:
             return False
     
     def ingest_orderbook_data(self, symbol: str, overwrite: bool = False, days_back: int = None) -> bool:
-        """Ingest orderbook data - FIXED: Busca gaps igual que OHLCV"""
+        """Ingest orderbook data - FIXED: Usa detección mejorada de gaps"""
         log.info(f"Starting orderbook ingestion for {symbol} (overwrite={overwrite}, days_back={days_back})")
         
         try:
@@ -444,36 +464,19 @@ class DataIngestion:
                 total_records = self._fetch_orderbook_range(symbol, start_fetch, end_fetch)
                 
             else:
-                # Modo incremental - FIXED: Misma lógica que OHLCV
+                # Modo incremental - NUEVA LÓGICA MEJORADA
                 min_date, max_date = self.get_orderbook_data_range(symbol)
                 
-                if min_date and max_date:
-                    log.info(f"Existing orderbook data for {symbol}: {min_date.date()} to {max_date.date()}")
-                else:
-                    log.info(f"No existing orderbook data for {symbol}")
-                
-                # Determine what data to fetch - FIXED: Buscar gaps
-                ranges_to_fetch = []
-                
-                if not min_date:
-                    # No existing data, fetch based on days_back or default
-                    if days_back is None:
-                        days_back = 7  # Default for incremental mode (más conservador que OHLCV)
-                    start_fetch = max(available_start.date(), (available_end.date() - timedelta(days=days_back)))
-                    ranges_to_fetch.append((start_fetch, available_end.date()))
-                    log.info(f"No existing data - fetching last {days_back} days: {start_fetch} to {available_end.date()}")
-                else:
-                    # FIXED: Check for new data at the end (igual que OHLCV)
-                    if available_end.date() > max_date.date():
-                        gap_start = max_date.date() + timedelta(days=1)  # Start from next day
-                        ranges_to_fetch.append((gap_start, available_end.date()))
-                        log.info(f"New orderbook data available: {gap_start} to {available_end.date()}")
+                # Usar nueva función de detección de gaps
+                ranges_to_fetch = self._detect_missing_days(
+                    available_start, available_end, min_date, max_date, symbol, 'orderbook'
+                )
                 
                 if not ranges_to_fetch:
-                    log.info(f"No new orderbook data to fetch for {symbol}")
+                    log.info(f"No missing orderbook data for {symbol}")
                     return True
                 
-                # Fetch data for each range - FIXED: Similar a OHLCV
+                # Fetch data para cada rango faltante
                 total_records = 0
                 for start_date, end_date in ranges_to_fetch:
                     records = self._fetch_orderbook_range(symbol, start_date, end_date)
@@ -845,6 +848,64 @@ class DataIngestion:
        except Exception as e:
            log.error(f"Error inserting funding rates for {symbol}: {e}")
            return False
+    
+    def _log_final_summary(self, results: Dict[str, Dict[str, bool]], data_types: List[str]):
+        """Log final ingestion summary"""
+        total_symbols = len(results)
+        total_operations = total_symbols * len(data_types)
+        successful_operations = sum(
+            sum(1 for success in symbol_results.values() if success)
+            for symbol_results in results.values()
+        )
+        
+        log.info(f"📊 FINAL SUMMARY:")
+        log.info(f"  Symbols processed: {total_symbols}")
+        log.info(f"  Data types: {data_types}")
+        log.info(f"  Total operations: {successful_operations}/{total_operations}")
+        log.info(f"  Success rate: {successful_operations/total_operations*100:.1f}%")
+        
+        # Per data type summary
+        for data_type in data_types:
+            type_successes = sum(
+                1 for symbol_results in results.values() 
+                if symbol_results.get(data_type, False)
+            )
+            log.info(f"  {data_type.upper()}: {type_successes}/{total_symbols} symbols successful")
+        
+        # Show quick stats if available
+        self._log_quick_stats(list(results.keys()), data_types)
+    
+    def _log_quick_stats(self, symbols: List[str], data_types: List[str]):
+        """Log quick statistics from database"""
+        try:
+            with db_manager.get_session() as session:
+                for data_type in data_types:
+                    if data_type == 'ohlcv':
+                        for symbol in symbols:
+                            result = session.execute(text("""
+                                SELECT COUNT(*) as count 
+                                FROM ohlcv WHERE symbol = :symbol
+                            """), {'symbol': symbol}).fetchone()
+                            log.info(f"    {symbol}: {result.count:,} OHLCV records")
+                    
+                    elif data_type == 'orderbook':
+                        for symbol in symbols:
+                            result = session.execute(text("""
+                                SELECT COUNT(*) as count 
+                                FROM orderbook WHERE symbol = :symbol
+                            """), {'symbol': symbol}).fetchone()
+                            log.info(f"    {symbol}: {result.count:,} orderbook records")
+                    
+                    elif data_type == 'funding':
+                        for symbol in symbols:
+                            if "PERP_" in symbol:
+                                result = session.execute(text("""
+                                    SELECT COUNT(*) as count 
+                                    FROM funding_rates WHERE symbol = :symbol
+                                """), {'symbol': symbol}).fetchone()
+                                log.info(f"    {symbol}: {result.count:,} funding records")
+        except Exception as e:
+            log.debug(f"Could not fetch quick stats: {e}")
 
 # Global instance
 data_ingestion = DataIngestion()
