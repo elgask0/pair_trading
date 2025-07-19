@@ -220,52 +220,51 @@ class CoinAPIClient:
             log.debug(f"Coste: {cost} créditos")
     
     def get_orderbook_for_date(self, symbol: str, date_str: str) -> pd.DataFrame:
-        """MEJORADO: Con configuraciones más inteligentes y skip rápido"""
+        """SIMPLIFICADO: Solo configuración máxima - 100k registros, 10 niveles"""
         
         log.info(f"📊 Obteniendo orderbook para {symbol} en {date_str}")
         
         url = f"{self.base_url}/orderbooks/{symbol}/history"
         
-        # 🚀 MEJORADO: Configuraciones más diferenciadas
-        configs = [
-            {'date': date_str, 'limit': 800, 'limit_levels': 10, 'name': 'completo'},
-            {'date': date_str, 'limit': 300, 'limit_levels': 6, 'name': 'medio'}, 
-            {'date': date_str, 'limit': 100, 'limit_levels': 3, 'name': 'básico'}
-        ]
+        # 🎯 UNA SOLA CONFIGURACIÓN MÁXIMA
+        config = {
+            'date': date_str, 
+            'limit': 100000, 
+            'limit_levels': 10
+        }
         
         start_time = time.time()
+        context = f"orderbook {symbol} {date_str} (100k-10lvl)"
         
-        for i, config in enumerate(configs):
-            config_name = config.pop('name')  # Remove name from params
-            context = f"orderbook {symbol} {date_str} ({config_name})"
+        try:
+            data = self._make_request_with_retries(url, config, context)
             
-            try:
-                data = self._make_request_with_retries(url, config, context)
-                
-                if data and isinstance(data, list) and len(data) > 0:
-                    processed_df = self._process_orderbook_response(data, symbol, date_str)
-                    if not processed_df.empty:
-                        elapsed = time.time() - start_time
-                        levels_obtained = self._count_levels_in_df(processed_df)
-                        log.info(f"✅ {symbol} {date_str}: {len(processed_df)} válidos, "
-                               f"{levels_obtained:.1f} niveles, {elapsed:.1f}s")
-                        return processed_df
-                else:
-                    log.debug(f"Config {config_name}: Sin datos")
-                
-            except Exception as e:
-                log.warning(f"Error config {config_name}: {e}")
-                continue
+            if data and isinstance(data, list) and len(data) > 0:
+                processed_df = self._process_orderbook_response(data, symbol, date_str)
+                if not processed_df.empty:
+                    elapsed = time.time() - start_time
+                    levels_obtained = self._count_levels_in_df(processed_df)
+                    log.info(f"✅ {symbol} {date_str}: {len(processed_df):,} válidos, "
+                           f"{levels_obtained:.1f} niveles, {elapsed:.1f}s")
+                    
+                    # 📊 Log calidad de datos
+                    if len(processed_df) >= 50000:
+                        log.info(f"🎯 EXCELENTE: {len(processed_df):,} registros obtenidos")
+                    elif len(processed_df) >= 10000:
+                        log.info(f"✅ BUENO: {len(processed_df):,} registros obtenidos")
+                    else:
+                        log.warning(f"⚠️ BAJO: {len(processed_df):,} registros obtenidos")
+                    
+                    return processed_df
             
-            # MEJORADO: Pausas inteligentes
-            if i < len(configs) - 1:
-                base_pause = 1.0 if self.consecutive_failures < 2 else 3.0
-                pause = self._get_jittered_delay(base_pause)
-                time.sleep(pause)
-        
-        elapsed = time.time() - start_time
-        log.warning(f"❌ No datos para {symbol} en {date_str} ({elapsed:.1f}s)")
-        return pd.DataFrame()
+            elapsed = time.time() - start_time
+            log.warning(f"❌ No datos para {symbol} en {date_str} ({elapsed:.1f}s)")
+            return pd.DataFrame()
+            
+        except Exception as e:
+            elapsed = time.time() - start_time
+            log.error(f"💥 Error obteniendo {symbol} {date_str}: {e} ({elapsed:.1f}s)")
+            return pd.DataFrame()
     
     def _count_levels_in_df(self, df: pd.DataFrame) -> float:
         """MANTENER: Sin cambios (ya optimizado)"""
