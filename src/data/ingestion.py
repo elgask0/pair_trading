@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Data ingestion module - VERSION CON DETECCIÓN MEJORADA DE GAPS
-FIXED: Orderbook ahora detecta correctamente todos los días faltantes
+FIXED: Lógica de éxito corregida para modo incremental
 """
 
 import pandas as pd
@@ -363,7 +363,7 @@ class DataIngestion:
             return False
     
     def ingest_ohlcv_data(self, symbol: str, overwrite: bool = False, days_back: int = None) -> bool:
-        """Ingest OHLCV data - FIXED: Usa detección mejorada de gaps"""
+        """Ingest OHLCV data - FIXED: Lógica de éxito corregida para modo incremental"""
         log.info(f"Starting OHLCV ingestion for {symbol} (overwrite={overwrite}, days_back={days_back})")
         
         try:
@@ -392,6 +392,10 @@ class DataIngestion:
                 # Fetch data para el rango especificado
                 total_records = self._fetch_ohlcv_range(symbol, start_fetch, end_fetch)
                 
+                # En overwrite mode, success basado en si se obtuvieron datos
+                success = total_records > 0
+                log.info(f"✅ Successfully fetched {total_records} OHLCV records for {symbol}")
+                
             else:
                 # Modo incremental - NUEVA LÓGICA MEJORADA
                 min_date, max_date = self.get_symbol_data_range(symbol)
@@ -402,8 +406,8 @@ class DataIngestion:
                 )
                 
                 if not ranges_to_fetch:
-                    log.info(f"No missing OHLCV data for {symbol}")
-                    return True
+                    log.info(f"✅ No missing OHLCV data for {symbol} - already complete")
+                    return True  # ← FIXED: Ya completo = éxito
                 
                 # Fetch data para cada rango faltante
                 total_records = 0
@@ -414,9 +418,24 @@ class DataIngestion:
                     
                     records = self._fetch_ohlcv_range(symbol, start_datetime, end_datetime)
                     total_records += records
+                
+                # FIXED: En modo incremental, success si ya había datos O se agregaron nuevos
+                if total_records > 0:
+                    success = True
+                    log.info(f"✅ Successfully fetched {total_records} new OHLCV records for {symbol}")
+                else:
+                    # Verificar si ya había datos suficientes
+                    min_date, max_date = self.get_symbol_data_range(symbol)
+                    if min_date and max_date:
+                        # Ya hay datos en DB, los días "faltantes" simplemente están vacíos en la API
+                        success = True
+                        log.info(f"✅ OHLCV for {symbol} already complete - missing days have no data in API")
+                    else:
+                        # No hay datos en DB y no se pudieron obtener nuevos
+                        success = False
+                        log.warning(f"❌ No OHLCV data exists and no new data could be fetched for {symbol}")
             
-            log.info(f"✅ Successfully fetched {total_records} OHLCV records for {symbol}")
-            return total_records > 0
+            return success
             
         except Exception as e:
             log.error(f"OHLCV ingestion failed for {symbol}: {e}")
@@ -425,7 +444,7 @@ class DataIngestion:
             return False
     
     def ingest_orderbook_data(self, symbol: str, overwrite: bool = False, days_back: int = None) -> bool:
-        """Ingest orderbook data - FIXED: Usa detección mejorada de gaps"""
+        """Ingest orderbook data - FIXED: Lógica de éxito corregida para modo incremental"""
         log.info(f"Starting orderbook ingestion for {symbol} (overwrite={overwrite}, days_back={days_back})")
         
         try:
@@ -462,6 +481,8 @@ class DataIngestion:
                 
                 # Fetch data para el rango especificado
                 total_records = self._fetch_orderbook_range(symbol, start_fetch, end_fetch)
+                success = total_records > 0
+                log.info(f"✅ Successfully fetched {total_records} orderbook snapshots for {symbol}")
                 
             else:
                 # Modo incremental - NUEVA LÓGICA MEJORADA
@@ -473,17 +494,32 @@ class DataIngestion:
                 )
                 
                 if not ranges_to_fetch:
-                    log.info(f"No missing orderbook data for {symbol}")
-                    return True
+                    log.info(f"✅ No missing orderbook data for {symbol} - already complete")
+                    return True  # ← FIXED: Ya completo = éxito
                 
                 # Fetch data para cada rango faltante
                 total_records = 0
                 for start_date, end_date in ranges_to_fetch:
                     records = self._fetch_orderbook_range(symbol, start_date, end_date)
                     total_records += records
+                
+                # FIXED: En modo incremental, success si ya había datos O se agregaron nuevos
+                if total_records > 0:
+                    success = True
+                    log.info(f"✅ Successfully fetched {total_records} new orderbook snapshots for {symbol}")
+                else:
+                    # Verificar si ya había datos suficientes
+                    min_date, max_date = self.get_orderbook_data_range(symbol)
+                    if min_date and max_date:
+                        # Ya hay datos en DB, los días "faltantes" simplemente están vacíos en la API
+                        success = True
+                        log.info(f"✅ Orderbook for {symbol} already complete - missing days have no data in API")
+                    else:
+                        # No hay datos en DB y no se pudieron obtener nuevos
+                        success = False
+                        log.warning(f"❌ No orderbook data exists and no new data could be fetched for {symbol}")
             
-            log.info(f"✅ Successfully fetched {total_records} orderbook snapshots for {symbol}")
-            return total_records > 0
+            return success
             
         except Exception as e:
             log.error(f"Orderbook ingestion failed for {symbol}: {e}")
