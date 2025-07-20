@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Data ingestion module - FIXED FUNDING RATES LOGIC
-FIXED: Funding rates con detección inteligente y rangos realistas
+Data ingestion module - FIXED SYMBOL_INFO LOGIC
+FIXED: Usa tabla symbol_info de BD en lugar de CoinAPI endpoints rotos
 """
 
 import pandas as pd
@@ -21,11 +21,118 @@ from config.settings import settings
 log = get_ingestion_logger()
 
 class DataIngestion:
-    """Main data ingestion class - CON FUNDING RATES FIXED"""
+    """Main data ingestion class - CON SYMBOL_INFO DESDE BD"""
     
     def __init__(self):
         self.coinapi = coinapi_client
         self.mexc = mexc_client
+    
+    def get_symbol_info_from_db(self, symbol: str) -> Dict:
+        """NUEVO: Obtener symbol info desde BD en lugar de API"""
+        log.debug(f"Getting symbol info from DB for {symbol}")
+        
+        with db_manager.get_session() as session:
+            result = session.execute(text("""
+                SELECT symbol_id, exchange_id, symbol_type, 
+                       asset_id_base, asset_id_quote, data_start
+                FROM symbol_info 
+                WHERE symbol_id = :symbol
+            """), {'symbol': symbol}).fetchone()
+            
+            if not result:
+                # Crear datos básicos si no existe
+                log.warning(f"Symbol {symbol} not found in symbol_info table, creating basic info")
+                return self._create_basic_symbol_info_for_db(symbol)
+            
+            # Fecha final = hoy
+            end_date = datetime.now()
+            
+            return {
+                'symbol_id': result.symbol_id,
+                'exchange_id': result.exchange_id,
+                'symbol_type': result.symbol_type,
+                'asset_id_base': result.asset_id_base,
+                'asset_id_quote': result.asset_id_quote,
+                'data_start': result.data_start,
+                'data_end': end_date,
+                'data_quote_start': result.data_start,
+                'data_quote_end': end_date,
+                'data_orderbook_start': result.data_start,
+                'data_orderbook_end': end_date,
+                'data_trade_start': result.data_start,
+                'data_trade_end': end_date
+            }
+    
+    def get_available_date_range_from_db(self, symbol: str) -> Tuple[datetime, datetime]:
+        """NUEVO: Obtener rango de fechas desde BD"""
+        log.debug(f"Getting available date range from DB for {symbol}")
+        
+        symbol_info = self.get_symbol_info_from_db(symbol)
+        return symbol_info['data_start'], symbol_info['data_end']
+    
+    def _create_basic_symbol_info_for_db(self, symbol: str) -> Dict:
+        """NUEVO: Crear symbol info básico si no existe en BD"""
+        log.info(f"Creating basic symbol info for {symbol}")
+        
+        parts = symbol.split('_')
+        if len(parts) >= 4:
+            exchange_id = parts[0]
+            asset_base = parts[2]
+            asset_quote = parts[3]
+        else:
+            exchange_id = 'UNKNOWN'
+            asset_base = symbol
+            asset_quote = 'USDT'
+        
+        # Usar fechas conservadoras para evitar búsquedas masivas
+        now = datetime.now()
+        
+        # Para GIGA y SPX, usar fechas conocidas. Para otros, usar rango pequeño
+        if 'GIGA' in symbol:
+            data_start = datetime(2024, 11, 12)
+        elif 'SPX' in symbol:
+            data_start = datetime(2024, 10, 29)
+        else:
+            # Para símbolos nuevos, usar solo últimos 30 días
+            data_start = now - timedelta(days=30)
+        
+        basic_info = {
+            'symbol_id': symbol,
+            'exchange_id': exchange_id,
+            'symbol_type': 'FUTURES' if 'PERP' in symbol else 'SPOT',
+            'asset_id_base': asset_base,
+            'asset_id_quote': asset_quote,
+            'data_start': data_start,
+            'data_end': now
+        }
+        
+        # Insertar en BD para futuras consultas
+        try:
+            with db_manager.get_session() as session:
+                session.execute(text("""
+                    INSERT INTO symbol_info (
+                        symbol_id, exchange_id, symbol_type, asset_id_base, asset_id_quote, data_start
+                    ) VALUES (
+                        :symbol_id, :exchange_id, :symbol_type, :asset_id_base, :asset_id_quote, :data_start
+                    ) ON CONFLICT (symbol_id) DO NOTHING
+                """), basic_info)
+                session.commit()
+                log.info(f"✅ Created symbol_info entry for {symbol}")
+        except Exception as e:
+            log.warning(f"Could not insert symbol_info for {symbol}: {e}")
+        
+        return basic_info
+    
+    def update_symbol_info(self, symbol: str) -> bool:
+        """MODIFICADO: Symbol info ya está en BD - no hacer nada"""
+        log.debug(f"Using existing symbol info from DB for {symbol}")
+        # Verificar que existe en BD
+        try:
+            self.get_symbol_info_from_db(symbol)
+            return True
+        except Exception as e:
+            log.warning(f"Error checking symbol info for {symbol}: {e}")
+            return False
     
     def ingest_data(self, symbols: List[str], data_types: List[str] = None, 
                    overwrite: bool = False, days_back: int = None) -> Dict[str, Dict[str, bool]]:
@@ -72,7 +179,7 @@ class DataIngestion:
             
             symbol_results = {}
             
-            # 1. Update symbol info (lightweight operation)
+            # 1. Update symbol info (lightweight operation usando BD)
             log.info(f"📋 Updating symbol info for {symbol}...")
             self.update_symbol_info(symbol)
             
@@ -122,6 +229,175 @@ class DataIngestion:
         self._log_final_summary(results, data_types)
         
         return results
+    
+    def ingest_ohlcv_data(self, symbol: str, overwrite: bool = False, days_back: int = None) -> bool:
+        """Ingest OHLCV data - FIXED: Usa BD para rangos de fecha"""
+        log.info(f"Starting OHLCV ingestion for {symbol} (overwrite={overwrite}, days_back={days_back})")
+        
+        try:
+            # Get available data range from BD instead of API
+            available_start, available_end = self.get_available_date_range_from_db(symbol)
+            
+            if not available_start or not available_end:
+                log.warning(f"No available data range for {symbol} in DB")
+                return False
+            
+            log.info(f"📅 Using DB date range for {symbol}: {available_start.date()} to {available_end.date()}")
+            
+            if overwrite:
+                if days_back is None:
+                    # FIXED: Usar TODO el rango disponible desde BD
+                    start_fetch = available_start
+                    end_fetch = available_end
+                    log.info(f"OVERWRITE MODE: Fetching OHLCV data from DB range {start_fetch.date()} to {end_fetch.date()}")
+                else:
+                    # Usar días específicos
+                    start_fetch = available_end - timedelta(days=days_back)
+                    end_fetch = available_end
+                    log.info(f"OVERWRITE MODE: Fetching OHLCV {start_fetch.date()} to {end_fetch.date()}")
+                
+                # Eliminar datos existentes en el rango
+                self.delete_existing_data(symbol, 'ohlcv', start_fetch.isoformat(), end_fetch.isoformat())
+                
+                # Fetch data para el rango especificado
+                total_records = self._fetch_ohlcv_range(symbol, start_fetch, end_fetch)
+                
+                # En overwrite mode, success basado en si se obtuvieron datos
+                success = total_records > 0
+                log.info(f"✅ Successfully fetched {total_records} OHLCV records for {symbol}")
+                
+            else:
+                # Modo incremental - NUEVA LÓGICA MEJORADA
+                min_date, max_date = self.get_symbol_data_range(symbol)
+                
+                # Usar nueva función de detección de gaps
+                ranges_to_fetch = self._detect_missing_days(
+                    available_start, available_end, min_date, max_date, symbol, 'ohlcv'
+                )
+                
+                if not ranges_to_fetch:
+                    log.info(f"✅ No missing OHLCV data for {symbol} - already complete")
+                    return True  # ← FIXED: Ya completo = éxito
+                
+                # Fetch data para cada rango faltante
+                total_records = 0
+                for start_date, end_date in ranges_to_fetch:
+                    # Convertir dates a datetime
+                    start_datetime = datetime.combine(start_date, datetime.min.time())
+                    end_datetime = datetime.combine(end_date, datetime.max.time())
+                    
+                    records = self._fetch_ohlcv_range(symbol, start_datetime, end_datetime)
+                    total_records += records
+                
+                # FIXED: En modo incremental, success si ya había datos O se agregaron nuevos
+                if total_records > 0:
+                    success = True
+                    log.info(f"✅ Successfully fetched {total_records} new OHLCV records for {symbol}")
+                else:
+                    # Verificar si ya había datos suficientes
+                    min_date, max_date = self.get_symbol_data_range(symbol)
+                    if min_date and max_date:
+                        # Ya hay datos en DB, los días "faltantes" simplemente están vacíos en la API
+                        success = True
+                        log.info(f"✅ OHLCV for {symbol} already complete - missing days have no data in API")
+                    else:
+                        # No hay datos en DB y no se pudieron obtener nuevos
+                        success = False
+                        log.warning(f"❌ No OHLCV data exists and no new data could be fetched for {symbol}")
+            
+            return success
+            
+        except Exception as e:
+            log.error(f"OHLCV ingestion failed for {symbol}: {e}")
+            import traceback
+            log.error(traceback.format_exc())
+            return False
+    
+    def ingest_orderbook_data(self, symbol: str, overwrite: bool = False, days_back: int = None) -> bool:
+        """Ingest orderbook data - FIXED: Usa BD para rangos de fecha"""
+        log.info(f"Starting orderbook ingestion for {symbol} (overwrite={overwrite}, days_back={days_back})")
+        
+        try:
+            # Get available range from BD instead of API
+            available_start, available_end = self.get_available_date_range_from_db(symbol)
+            
+            if not available_start or not available_end:
+                log.warning(f"No available orderbook data range for {symbol} in DB")
+                return False
+            
+            log.info(f"📅 Using DB date range for {symbol}: {available_start.date()} to {available_end.date()}")
+            
+            if overwrite:
+                if days_back is None:
+                    # FIXED: Usar TODO el rango disponible desde BD
+                    start_fetch = available_start.date()
+                    end_fetch = available_end.date()
+                    log.info(f"OVERWRITE MODE: Fetching orderbook data from DB range {start_fetch} to {end_fetch}")
+                else:
+                    # Usar días específicos
+                    start_fetch = available_end.date() - timedelta(days=days_back)
+                    end_fetch = available_end.date()
+                    log.info(f"OVERWRITE MODE: Fetching orderbook {start_fetch} to {end_fetch}")
+                
+                # Eliminar datos existentes en el rango con fechas precisas
+                start_datetime = datetime.combine(start_fetch, datetime.min.time())
+                end_datetime = datetime.combine(end_fetch, datetime.max.time())
+                
+                deleted_count = self.delete_existing_data(
+                    symbol, 'orderbook', 
+                    start_datetime.isoformat(),
+                    end_datetime.isoformat()
+                )
+                
+                log.info(f"Deleted {deleted_count:,} existing orderbook records for overwrite")
+                
+                # Fetch data para el rango especificado
+                total_records = self._fetch_orderbook_range(symbol, start_fetch, end_fetch)
+                success = total_records > 0
+                log.info(f"✅ Successfully fetched {total_records} orderbook snapshots for {symbol}")
+                
+            else:
+                # Modo incremental - NUEVA LÓGICA MEJORADA
+                min_date, max_date = self.get_orderbook_data_range(symbol)
+                
+                # Usar nueva función de detección de gaps
+                ranges_to_fetch = self._detect_missing_days(
+                    available_start, available_end, min_date, max_date, symbol, 'orderbook'
+                )
+                
+                if not ranges_to_fetch:
+                    log.info(f"✅ No missing orderbook data for {symbol} - already complete")
+                    return True  # ← FIXED: Ya completo = éxito
+                
+                # Fetch data para cada rango faltante
+                total_records = 0
+                for start_date, end_date in ranges_to_fetch:
+                    records = self._fetch_orderbook_range(symbol, start_date, end_date)
+                    total_records += records
+                
+                # FIXED: En modo incremental, success si ya había datos O se agregaron nuevos
+                if total_records > 0:
+                    success = True
+                    log.info(f"✅ Successfully fetched {total_records} new orderbook snapshots for {symbol}")
+                else:
+                    # Verificar si ya había datos suficientes
+                    min_date, max_date = self.get_orderbook_data_range(symbol)
+                    if min_date and max_date:
+                        # Ya hay datos en DB, los días "faltantes" simplemente están vacíos en la API
+                        success = True
+                        log.info(f"✅ Orderbook for {symbol} already complete - missing days have no data in API")
+                    else:
+                        # No hay datos en DB y no se pudieron obtener nuevos
+                        success = False
+                        log.warning(f"❌ No orderbook data exists and no new data could be fetched for {symbol}")
+            
+            return success
+            
+        except Exception as e:
+            log.error(f"Orderbook ingestion failed for {symbol}: {e}")
+            import traceback
+            log.error(traceback.format_exc())
+            return False
     
     def ingest_funding_rates_single(self, symbol: str, overwrite: bool = False) -> bool:
         """
@@ -181,9 +457,7 @@ class DataIngestion:
             
             stats = session.execute(stats_query, {'symbol': symbol}).fetchone()
             
-            log.info(f"📊 Current funding data for {symbol}:")
-            log.info(f"  Records: {stats.total_records}")
-            log.info(f"  Days covered: {stats.total_days}")
+            log.info(f"📊 Current funding data: {stats.total_records:,} records, {stats.total_days} days")
             if stats.min_ts and stats.max_ts:
                 log.info(f"  Range: {stats.min_ts.date()} to {stats.max_ts.date()}")
         
@@ -193,7 +467,8 @@ class DataIngestion:
             
             # CRITERIO INTELIGENTE: Si tiene datos abundantes y recientes, probablemente está completo
             if stats.total_records >= 1000 and days_since_last <= 3:
-                log.info(f"✅ {symbol} funding appears complete: {stats.total_records} records, last update {days_since_last} days ago")
+                log.info(f"✅ {symbol} funding appears complete")
+                log.info(f"✅ No recent funding updates needed")
                 
                 # Solo verificar si necesita actualización reciente
                 recent_data = self._fetch_recent_funding_only(symbol)
@@ -263,11 +538,11 @@ class DataIngestion:
                             existing_min: datetime, existing_max: datetime, 
                             symbol: str, data_type: str) -> List[Tuple[datetime, datetime]]:
         """
-        NUEVA FUNCIÓN: Detecta todos los días faltantes en el rango completo
-        Retorna lista de rangos (start_date, end_date) que necesitan ser fetched
+        NUEVA FUNCIÓN: Detecta días faltantes usando rangos desde BD (no API)
+        Retorna lista de rangos que necesitan ser fetched - MÁS PRECISO
         """
         log.info(f"🔍 Detecting missing days for {symbol} {data_type}")
-        log.info(f"  Available range: {available_start.date()} to {available_end.date()}")
+        log.info(f"  DB available range: {available_start.date()} to {available_end.date()}")
         
         if existing_min and existing_max:
             log.info(f"  Existing range: {existing_min.date()} to {existing_max.date()}")
@@ -276,7 +551,7 @@ class DataIngestion:
         
         ranges_to_fetch = []
         
-        # Si no hay datos existentes, fetch todo el rango disponible
+        # Si no hay datos existentes, fetch todo el rango disponible DESDE BD
         if not existing_min or not existing_max:
             ranges_to_fetch.append((available_start.date(), available_end.date()))
             log.info(f"  No existing data - will fetch: {available_start.date()} to {available_end.date()}")
@@ -304,7 +579,7 @@ class DataIngestion:
             existing_days = set(row.day for row in result)
             log.info(f"  Found {len(existing_days)} existing days in DB")
         
-        # Generar set completo de días que deberían existir
+        # Generar set completo de días que deberían existir SEGÚN BD
         current_date = available_start.date()
         should_exist_days = set()
         
@@ -312,7 +587,7 @@ class DataIngestion:
             should_exist_days.add(current_date)
             current_date += timedelta(days=1)
         
-        log.info(f"  Should exist: {len(should_exist_days)} days")
+        log.info(f"  Should exist (per DB): {len(should_exist_days)} days")
         
         # Encontrar días faltantes
         missing_days = should_exist_days - existing_days
@@ -429,230 +704,6 @@ class DataIngestion:
         except Exception as e:
             log.error(f"Error eliminando datos {data_type} de {symbol}: {e}")
             return 0
-    
-    def update_symbol_info(self, symbol: str) -> bool:
-        """Update symbol information with robust error handling"""
-        log.debug(f"Updating symbol info for {symbol}")
-        
-        try:
-            symbol_info = self.coinapi.get_symbol_info(symbol)
-            
-            with db_manager.get_session() as session:
-                # Upsert symbol info
-                session.execute(text("""
-                    INSERT INTO symbol_info (
-                        symbol_id, exchange_id, symbol_type, asset_id_base, asset_id_quote,
-                        data_start, data_end, data_quote_start, data_quote_end,
-                        data_orderbook_start, data_orderbook_end,
-                        data_trade_start, data_trade_end
-                    ) VALUES (
-                        :symbol_id, :exchange_id, :symbol_type, :asset_id_base, :asset_id_quote,
-                        :data_start, :data_end, :data_quote_start, :data_quote_end,
-                        :data_orderbook_start, :data_orderbook_end,
-                        :data_trade_start, :data_trade_end
-                    ) ON CONFLICT (symbol_id) 
-                    DO UPDATE SET
-                        exchange_id = EXCLUDED.exchange_id,
-                        symbol_type = EXCLUDED.symbol_type,
-                        asset_id_base = EXCLUDED.asset_id_base,
-                        asset_id_quote = EXCLUDED.asset_id_quote,
-                        data_start = EXCLUDED.data_start,
-                        data_end = EXCLUDED.data_end,
-                        data_quote_start = EXCLUDED.data_quote_start,
-                        data_quote_end = EXCLUDED.data_quote_end,
-                        data_orderbook_start = EXCLUDED.data_orderbook_start,
-                        data_orderbook_end = EXCLUDED.data_orderbook_end,
-                        data_trade_start = EXCLUDED.data_trade_start,
-                        data_trade_end = EXCLUDED.data_trade_end,
-                        updated_at = CURRENT_TIMESTAMP
-                """), {
-                    'symbol_id': symbol,
-                    'exchange_id': symbol_info.get('exchange_id'),
-                    'symbol_type': symbol_info.get('symbol_type'),
-                    'asset_id_base': symbol_info.get('asset_id_base'),
-                    'asset_id_quote': symbol_info.get('asset_id_quote'),
-                    'data_start': symbol_info.get('data_start'),
-                    'data_end': symbol_info.get('data_end'),
-                    'data_quote_start': symbol_info.get('data_quote_start'),
-                    'data_quote_end': symbol_info.get('data_quote_end'),
-                    'data_orderbook_start': symbol_info.get('data_orderbook_start'),
-                    'data_orderbook_end': symbol_info.get('data_orderbook_end'),
-                    'data_trade_start': symbol_info.get('data_trade_start'),
-                    'data_trade_end': symbol_info.get('data_trade_end')
-                })
-                session.commit()
-            
-            log.debug(f"✅ Updated symbol info for {symbol}")
-            return True
-            
-        except Exception as e:
-            log.warning(f"Failed to update symbol info for {symbol}: {e}")
-            return False
-    
-    def ingest_ohlcv_data(self, symbol: str, overwrite: bool = False, days_back: int = None) -> bool:
-        """Ingest OHLCV data - FIXED: Lógica de éxito corregida para modo incremental"""
-        log.info(f"Starting OHLCV ingestion for {symbol} (overwrite={overwrite}, days_back={days_back})")
-        
-        try:
-            # Get available data range from API
-            available_start, available_end = self.coinapi.get_available_date_range(symbol)
-            
-            if not available_start or not available_end:
-                log.warning(f"No available data range for {symbol}")
-                return False
-            
-            if overwrite:
-                if days_back is None:
-                    # FIXED: Usar TODO el rango disponible
-                    start_fetch = available_start
-                    end_fetch = available_end
-                    log.info(f"OVERWRITE MODE: Fetching ALL AVAILABLE OHLCV data {start_fetch.date()} to {end_fetch.date()}")
-                else:
-                    # Usar días específicos
-                    start_fetch = available_end - timedelta(days=days_back)
-                    end_fetch = available_end
-                    log.info(f"OVERWRITE MODE: Fetching OHLCV {start_fetch.date()} to {end_fetch.date()}")
-                
-                # Eliminar datos existentes en el rango
-                self.delete_existing_data(symbol, 'ohlcv', start_fetch.isoformat(), end_fetch.isoformat())
-                
-                # Fetch data para el rango especificado
-                total_records = self._fetch_ohlcv_range(symbol, start_fetch, end_fetch)
-                
-                # En overwrite mode, success basado en si se obtuvieron datos
-                success = total_records > 0
-                log.info(f"✅ Successfully fetched {total_records} OHLCV records for {symbol}")
-                
-            else:
-                # Modo incremental - NUEVA LÓGICA MEJORADA
-                min_date, max_date = self.get_symbol_data_range(symbol)
-                
-                # Usar nueva función de detección de gaps
-                ranges_to_fetch = self._detect_missing_days(
-                    available_start, available_end, min_date, max_date, symbol, 'ohlcv'
-                )
-                
-                if not ranges_to_fetch:
-                    log.info(f"✅ No missing OHLCV data for {symbol} - already complete")
-                    return True  # ← FIXED: Ya completo = éxito
-                
-                # Fetch data para cada rango faltante
-                total_records = 0
-                for start_date, end_date in ranges_to_fetch:
-                    # Convertir dates a datetime
-                    start_datetime = datetime.combine(start_date, datetime.min.time())
-                    end_datetime = datetime.combine(end_date, datetime.max.time())
-                    
-                    records = self._fetch_ohlcv_range(symbol, start_datetime, end_datetime)
-                    total_records += records
-                
-                # FIXED: En modo incremental, success si ya había datos O se agregaron nuevos
-                if total_records > 0:
-                    success = True
-                    log.info(f"✅ Successfully fetched {total_records} new OHLCV records for {symbol}")
-                else:
-                    # Verificar si ya había datos suficientes
-                    min_date, max_date = self.get_symbol_data_range(symbol)
-                    if min_date and max_date:
-                        # Ya hay datos en DB, los días "faltantes" simplemente están vacíos en la API
-                        success = True
-                        log.info(f"✅ OHLCV for {symbol} already complete - missing days have no data in API")
-                    else:
-                        # No hay datos en DB y no se pudieron obtener nuevos
-                        success = False
-                        log.warning(f"❌ No OHLCV data exists and no new data could be fetched for {symbol}")
-            
-            return success
-            
-        except Exception as e:
-            log.error(f"OHLCV ingestion failed for {symbol}: {e}")
-            import traceback
-            log.error(traceback.format_exc())
-            return False
-    
-    def ingest_orderbook_data(self, symbol: str, overwrite: bool = False, days_back: int = None) -> bool:
-        """Ingest orderbook data - FIXED: Lógica de éxito corregida para modo incremental"""
-        log.info(f"Starting orderbook ingestion for {symbol} (overwrite={overwrite}, days_back={days_back})")
-        
-        try:
-            # Get available range
-            available_start, available_end = self.coinapi.get_available_date_range(symbol)
-            
-            if not available_start or not available_end:
-                log.warning(f"No available orderbook data range for {symbol}")
-                return False
-            
-            if overwrite:
-                if days_back is None:
-                    # FIXED: Usar TODO el rango disponible
-                    start_fetch = available_start.date()
-                    end_fetch = available_end.date()
-                    log.info(f"OVERWRITE MODE: Fetching ALL AVAILABLE orderbook data {start_fetch} to {end_fetch}")
-                else:
-                    # Usar días específicos
-                    start_fetch = available_end.date() - timedelta(days=days_back)
-                    end_fetch = available_end.date()
-                    log.info(f"OVERWRITE MODE: Fetching orderbook {start_fetch} to {end_fetch}")
-                
-                # Eliminar datos existentes en el rango con fechas precisas
-                start_datetime = datetime.combine(start_fetch, datetime.min.time())
-                end_datetime = datetime.combine(end_fetch, datetime.max.time())
-                
-                deleted_count = self.delete_existing_data(
-                    symbol, 'orderbook', 
-                    start_datetime.isoformat(),
-                    end_datetime.isoformat()
-                )
-                
-                log.info(f"Deleted {deleted_count:,} existing orderbook records for overwrite")
-                
-                # Fetch data para el rango especificado
-                total_records = self._fetch_orderbook_range(symbol, start_fetch, end_fetch)
-                success = total_records > 0
-                log.info(f"✅ Successfully fetched {total_records} orderbook snapshots for {symbol}")
-                
-            else:
-                # Modo incremental - NUEVA LÓGICA MEJORADA
-                min_date, max_date = self.get_orderbook_data_range(symbol)
-                
-                # Usar nueva función de detección de gaps
-                ranges_to_fetch = self._detect_missing_days(
-                    available_start, available_end, min_date, max_date, symbol, 'orderbook'
-                )
-                
-                if not ranges_to_fetch:
-                    log.info(f"✅ No missing orderbook data for {symbol} - already complete")
-                    return True  # ← FIXED: Ya completo = éxito
-                
-                # Fetch data para cada rango faltante
-                total_records = 0
-                for start_date, end_date in ranges_to_fetch:
-                    records = self._fetch_orderbook_range(symbol, start_date, end_date)
-                    total_records += records
-                
-                # FIXED: En modo incremental, success si ya había datos O se agregaron nuevos
-                if total_records > 0:
-                    success = True
-                    log.info(f"✅ Successfully fetched {total_records} new orderbook snapshots for {symbol}")
-                else:
-                    # Verificar si ya había datos suficientes
-                    min_date, max_date = self.get_orderbook_data_range(symbol)
-                    if min_date and max_date:
-                        # Ya hay datos en DB, los días "faltantes" simplemente están vacíos en la API
-                        success = True
-                        log.info(f"✅ Orderbook for {symbol} already complete - missing days have no data in API")
-                    else:
-                        # No hay datos en DB y no se pudieron obtener nuevos
-                        success = False
-                        log.warning(f"❌ No orderbook data exists and no new data could be fetched for {symbol}")
-            
-            return success
-            
-        except Exception as e:
-            log.error(f"Orderbook ingestion failed for {symbol}: {e}")
-            import traceback
-            log.error(traceback.format_exc())
-            return False
     
     def ingest_funding_rates(self, symbols: List[str], overwrite: bool = False) -> Dict[str, bool]:
         """
