@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Data ingestion module - VERSION CON DETECCIÓN MEJORADA DE GAPS
-FIXED: Lógica de éxito corregida para modo incremental
-UPDATED: Funding rates con missing days logic
+Data ingestion module - FIXED FUNDING RATES LOGIC
+FIXED: Funding rates con detección inteligente y rangos realistas
 """
 
 import pandas as pd
@@ -22,7 +21,7 @@ from config.settings import settings
 log = get_ingestion_logger()
 
 class DataIngestion:
-    """Main data ingestion class - CON DETECCIÓN MEJORADA DE GAPS"""
+    """Main data ingestion class - CON FUNDING RATES FIXED"""
     
     def __init__(self):
         self.coinapi = coinapi_client
@@ -32,15 +31,6 @@ class DataIngestion:
                    overwrite: bool = False, days_back: int = None) -> Dict[str, Dict[str, bool]]:
         """
         Función principal de ingesta con parámetros selectivos - FIXED
-        
-        Args:
-            symbols: Lista de símbolos a procesar
-            data_types: Lista de tipos de datos ['ohlcv', 'orderbook', 'funding'] o None para todos
-            overwrite: Si True, sobreescribe datos existentes en lugar de modo incremental
-            days_back: Días hacia atrás para ingestar. Si None en overwrite mode, usa TODOS los datos disponibles
-            
-        Returns:
-            Dict con resultados por símbolo y tipo de datos
         """
         
         # Tipos de datos disponibles
@@ -101,8 +91,8 @@ class DataIngestion:
                         
                     elif data_type == 'funding':
                         if "PERP_" in symbol:
-                            funding_results = self.ingest_funding_rates([symbol], overwrite=overwrite)
-                            success = funding_results.get(symbol, False)
+                            # FIXED: Usar función específica para funding con nueva lógica
+                            success = self.ingest_funding_rates_single(symbol, overwrite=overwrite)
                             symbol_results['funding'] = success
                         else:
                             log.info(f"⏭️ Skipping funding rates for {symbol} (not a perpetual contract)")
@@ -132,6 +122,142 @@ class DataIngestion:
         self._log_final_summary(results, data_types)
         
         return results
+    
+    def ingest_funding_rates_single(self, symbol: str, overwrite: bool = False) -> bool:
+        """
+        NUEVA FUNCIÓN: Ingesta funding rates para un símbolo con lógica inteligente
+        """
+        log.info(f"Starting SMART funding rates ingestion for {symbol} (overwrite={overwrite})")
+        
+        try:
+            if overwrite:
+                # Modo overwrite: eliminar todo y fetch todo disponible
+                deleted_count = self.delete_existing_data(symbol, 'funding')
+                log.info(f"Deleted {deleted_count:,} existing funding records for overwrite")
+                
+                # Fetch ALL available data
+                funding_data = self.mexc.get_funding_rate_history(symbol)
+                
+                if funding_data.empty:
+                    log.warning(f"No funding rate data obtained for {symbol} in overwrite mode")
+                    return False
+                
+                # Insert data
+                success = self._ingest_symbol_funding_rates(symbol, funding_data)
+                if success:
+                    log.info(f"✅ Successfully ingested {len(funding_data)} funding records for {symbol}")
+                return success
+                
+            else:
+                # NUEVA LÓGICA INCREMENTAL INTELIGENTE
+                return self._ingest_funding_incremental_smart(symbol)
+                
+        except Exception as e:
+            log.error(f"Error in funding rates ingestion for {symbol}: {e}")
+            import traceback
+            log.error(traceback.format_exc())
+            return False
+    
+    def _ingest_funding_incremental_smart(self, symbol: str) -> bool:
+        """
+        NUEVA FUNCIÓN: Lógica incremental inteligente para funding rates
+        """
+        log.info(f"🧠 Smart incremental funding ingestion for {symbol}")
+        
+        # 1. Verificar datos existentes
+        min_date, max_date = self.get_funding_data_range(symbol)
+        
+        with db_manager.get_session() as session:
+            # Obtener estadísticas de datos existentes
+            stats_query = text("""
+                SELECT 
+                    COUNT(*) as total_records,
+                    COUNT(DISTINCT DATE(timestamp)) as total_days,
+                    MIN(timestamp) as min_ts,
+                    MAX(timestamp) as max_ts
+                FROM funding_rates 
+                WHERE symbol = :symbol
+            """)
+            
+            stats = session.execute(stats_query, {'symbol': symbol}).fetchone()
+            
+            log.info(f"📊 Current funding data for {symbol}:")
+            log.info(f"  Records: {stats.total_records}")
+            log.info(f"  Days covered: {stats.total_days}")
+            if stats.min_ts and stats.max_ts:
+                log.info(f"  Range: {stats.min_ts.date()} to {stats.max_ts.date()}")
+        
+        # 2. Si hay datos recientes y abundantes, probablemente está completo
+        if stats.total_records > 0 and stats.max_ts:
+            days_since_last = (datetime.now() - stats.max_ts).days
+            
+            # CRITERIO INTELIGENTE: Si tiene datos abundantes y recientes, probablemente está completo
+            if stats.total_records >= 1000 and days_since_last <= 3:
+                log.info(f"✅ {symbol} funding appears complete: {stats.total_records} records, last update {days_since_last} days ago")
+                
+                # Solo verificar si necesita actualización reciente
+                recent_data = self._fetch_recent_funding_only(symbol)
+                if not recent_data.empty:
+                    inserted = self._ingest_symbol_funding_rates(symbol, recent_data)
+                    if inserted:
+                        log.info(f"✅ Added {len(recent_data)} recent funding records for {symbol}")
+                    return True
+                else:
+                    log.info(f"✅ No recent funding updates needed for {symbol}")
+                    return True
+            
+            # Si hay datos pero no son tan recientes, fetch solo datos recientes
+            elif stats.total_records > 100:
+                log.info(f"📅 {symbol} has {stats.total_records} records, fetching recent updates only")
+                recent_data = self._fetch_recent_funding_only(symbol)
+                
+                if not recent_data.empty:
+                    inserted = self._ingest_symbol_funding_rates(symbol, recent_data)
+                    if inserted:
+                        log.info(f"✅ Added {len(recent_data)} recent funding records for {symbol}")
+                    return True
+                else:
+                    log.info(f"✅ No recent updates available for {symbol}")
+                    return True
+        
+        # 3. Si hay pocos datos o ninguno, fetch historial completo
+        log.info(f"📥 {symbol} needs complete funding history - fetching all available data")
+        funding_data = self.mexc.get_funding_rate_history(symbol)
+        
+        if funding_data.empty:
+            log.warning(f"No funding rate data obtained for {symbol}")
+            # Si ya había algunos datos, no es un fallo total
+            return stats.total_records > 0
+        
+        # Insert data
+        success = self._ingest_symbol_funding_rates(symbol, funding_data)
+        if success:
+            log.info(f"✅ Successfully ingested {len(funding_data)} funding records for {symbol}")
+        
+        return success
+    
+    def _fetch_recent_funding_only(self, symbol: str, days_back: int = 7) -> pd.DataFrame:
+        """
+        NUEVA FUNCIÓN: Fetch solo funding rates recientes
+        """
+        try:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days_back)
+            
+            log.info(f"🔍 Fetching recent funding for {symbol}: last {days_back} days")
+            
+            recent_data = self.mexc.get_funding_rate_history_range(symbol, start_date, end_date)
+            
+            if not recent_data.empty:
+                log.info(f"📥 Found {len(recent_data)} recent funding records for {symbol}")
+            else:
+                log.info(f"📭 No recent funding data for {symbol}")
+            
+            return recent_data
+            
+        except Exception as e:
+            log.warning(f"Error fetching recent funding for {symbol}: {e}")
+            return pd.DataFrame()
     
     def _detect_missing_days(self, available_start: datetime, available_end: datetime, 
                             existing_min: datetime, existing_max: datetime, 
@@ -222,98 +348,6 @@ class DataIngestion:
         for i, (start, end) in enumerate(ranges_to_fetch):
             days_in_range = (end - start).days + 1
             log.info(f"    Range {i+1}: {start} to {end} ({days_in_range} days)")
-        
-        return ranges_to_fetch
-    
-    def _detect_missing_days_funding(self, available_start: datetime, available_end: datetime, 
-                                   existing_min: datetime, existing_max: datetime, 
-                                   symbol: str) -> List[Tuple[datetime, datetime]]:
-        """
-        NUEVA FUNCIÓN: Detecta días faltantes para funding rates (mismo patrón que OHLCV)
-        """
-        log.info(f"🔍 Detecting missing funding days for {symbol}")
-        log.info(f"  Available range: {available_start.date()} to {available_end.date()}")
-        
-        if existing_min and existing_max:
-            log.info(f"  Existing range: {existing_min.date()} to {existing_max.date()}")
-        else:
-            log.info(f"  No existing funding data")
-        
-        ranges_to_fetch = []
-        
-        # Si no hay datos existentes, fetch todo
-        if not existing_min or not existing_max:
-            ranges_to_fetch.append((available_start, available_end))
-            log.info(f"  No existing data - will fetch: {available_start.date()} to {available_end.date()}")
-            return ranges_to_fetch
-        
-        # Verificar qué días existen en DB
-        with db_manager.get_session() as session:
-            existing_days_query = text("""
-                SELECT DISTINCT DATE(timestamp) as day
-                FROM funding_rates
-                WHERE symbol = :symbol
-                AND timestamp >= :start_date
-                AND timestamp <= :end_date
-                ORDER BY day
-            """)
-            
-            result = session.execute(existing_days_query, {
-                'symbol': symbol,
-                'start_date': available_start,
-                'end_date': available_end
-            }).fetchall()
-            
-            existing_days = set(row.day for row in result)
-            log.info(f"  Found {len(existing_days)} existing days in DB")
-        
-        # Generar días esperados
-        current_date = available_start.date()
-        should_exist_days = set()
-        
-        while current_date <= available_end.date():
-            should_exist_days.add(current_date)
-            current_date += timedelta(days=1)
-        
-        log.info(f"  Should exist: {len(should_exist_days)} days")
-        
-        # Encontrar días faltantes
-        missing_days = should_exist_days - existing_days
-        
-        if not missing_days:
-            log.info(f"  ✅ No missing days for {symbol} funding")
-            return ranges_to_fetch
-        
-        log.info(f"  ❌ Missing {len(missing_days)} days for {symbol} funding")
-        
-        # Agrupar días consecutivos (mismo código que OHLCV)
-        missing_days_sorted = sorted(missing_days)
-        
-        if missing_days_sorted:
-            range_start = missing_days_sorted[0]
-            range_end = missing_days_sorted[0]
-            
-            for day in missing_days_sorted[1:]:
-                if day == range_end + timedelta(days=1):
-                    range_end = day
-                else:
-                    ranges_to_fetch.append((
-                        datetime.combine(range_start, datetime.min.time()),
-                        datetime.combine(range_end, datetime.max.time())
-                    ))
-                    range_start = day
-                    range_end = day
-            
-            ranges_to_fetch.append((
-                datetime.combine(range_start, datetime.min.time()),
-                datetime.combine(range_end, datetime.max.time())
-            ))
-        
-        # Log rangos
-        log.info(f"  📋 Will fetch {len(ranges_to_fetch)} ranges:")
-        for i, (start, end) in enumerate(ranges_to_fetch):
-            days_in_range = (end.date() - start.date()).days + 1
-            log.info(f"    Range {i+1}: {start.date()} to {end.date()} ({days_in_range} days)")
         
         return ranges_to_fetch
     
@@ -622,8 +656,7 @@ class DataIngestion:
     
     def ingest_funding_rates(self, symbols: List[str], overwrite: bool = False) -> Dict[str, bool]:
         """
-        MEJORADO: Ingest funding rates CON DETECCIÓN DE MISSING DAYS
-        Ahora usa la misma lógica que OHLCV y orderbook
+        LEGACY FUNCTION: Mantener compatibilidad pero usar nueva lógica
         """
         log.info(f"Starting funding rates ingestion for {len(symbols)} symbols (overwrite={overwrite})")
         
@@ -638,46 +671,8 @@ class DataIngestion:
             log.info(f"Ingesting funding rates for {symbol}")
             
             try:
-                if overwrite:
-                    # Modo overwrite: eliminar todo y fetch todo
-                    deleted_count = self.delete_existing_data(symbol, 'funding')
-                    log.info(f"Deleted {deleted_count:,} existing funding records for overwrite")
-                    
-                    # Fetch ALL available data
-                    funding_data = self.mexc.get_funding_rate_history(symbol)
-                    
-                else:
-                    # NUEVO: Modo incremental con detección de missing days
-                    min_date, max_date = self.get_funding_data_range(symbol)
-                    
-                    # Define available range (funding típicamente 1-2 años)
-                    available_end = datetime.now()
-                    available_start = available_end - timedelta(days=730)  # 2 años
-                    
-                    # Usar misma lógica que OHLCV/orderbook
-                    ranges_to_fetch = self._detect_missing_days_funding(
-                        available_start, available_end, min_date, max_date, symbol
-                    )
-                    
-                    if not ranges_to_fetch:
-                        log.info(f"✅ No missing funding data for {symbol} - already complete")
-                        results[symbol] = True
-                        continue
-                    
-                    # Fetch only missing ranges
-                    funding_data = pd.DataFrame()
-                    for start_date, end_date in ranges_to_fetch:
-                        range_data = self.mexc.get_funding_rate_history_range(symbol, start_date, end_date)
-                        if not range_data.empty:
-                            funding_data = pd.concat([funding_data, range_data], ignore_index=True)
-                
-                if funding_data.empty:
-                    log.warning(f"No funding rate data obtained for {symbol}")
-                    results[symbol] = False
-                    continue
-                
-                # Insert funding rates
-                success = self._ingest_symbol_funding_rates(symbol, funding_data)
+                # Usar nueva función inteligente
+                success = self.ingest_funding_rates_single(symbol, overwrite=overwrite)
                 results[symbol] = success
                 
                 # Small delay between symbols
