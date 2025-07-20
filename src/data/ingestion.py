@@ -2,6 +2,7 @@
 """
 Data ingestion module - VERSION CON DETECCIÓN MEJORADA DE GAPS
 FIXED: Lógica de éxito corregida para modo incremental
+UPDATED: Funding rates con missing days logic
 """
 
 import pandas as pd
@@ -221,6 +222,98 @@ class DataIngestion:
         for i, (start, end) in enumerate(ranges_to_fetch):
             days_in_range = (end - start).days + 1
             log.info(f"    Range {i+1}: {start} to {end} ({days_in_range} days)")
+        
+        return ranges_to_fetch
+    
+    def _detect_missing_days_funding(self, available_start: datetime, available_end: datetime, 
+                                   existing_min: datetime, existing_max: datetime, 
+                                   symbol: str) -> List[Tuple[datetime, datetime]]:
+        """
+        NUEVA FUNCIÓN: Detecta días faltantes para funding rates (mismo patrón que OHLCV)
+        """
+        log.info(f"🔍 Detecting missing funding days for {symbol}")
+        log.info(f"  Available range: {available_start.date()} to {available_end.date()}")
+        
+        if existing_min and existing_max:
+            log.info(f"  Existing range: {existing_min.date()} to {existing_max.date()}")
+        else:
+            log.info(f"  No existing funding data")
+        
+        ranges_to_fetch = []
+        
+        # Si no hay datos existentes, fetch todo
+        if not existing_min or not existing_max:
+            ranges_to_fetch.append((available_start, available_end))
+            log.info(f"  No existing data - will fetch: {available_start.date()} to {available_end.date()}")
+            return ranges_to_fetch
+        
+        # Verificar qué días existen en DB
+        with db_manager.get_session() as session:
+            existing_days_query = text("""
+                SELECT DISTINCT DATE(timestamp) as day
+                FROM funding_rates
+                WHERE symbol = :symbol
+                AND timestamp >= :start_date
+                AND timestamp <= :end_date
+                ORDER BY day
+            """)
+            
+            result = session.execute(existing_days_query, {
+                'symbol': symbol,
+                'start_date': available_start,
+                'end_date': available_end
+            }).fetchall()
+            
+            existing_days = set(row.day for row in result)
+            log.info(f"  Found {len(existing_days)} existing days in DB")
+        
+        # Generar días esperados
+        current_date = available_start.date()
+        should_exist_days = set()
+        
+        while current_date <= available_end.date():
+            should_exist_days.add(current_date)
+            current_date += timedelta(days=1)
+        
+        log.info(f"  Should exist: {len(should_exist_days)} days")
+        
+        # Encontrar días faltantes
+        missing_days = should_exist_days - existing_days
+        
+        if not missing_days:
+            log.info(f"  ✅ No missing days for {symbol} funding")
+            return ranges_to_fetch
+        
+        log.info(f"  ❌ Missing {len(missing_days)} days for {symbol} funding")
+        
+        # Agrupar días consecutivos (mismo código que OHLCV)
+        missing_days_sorted = sorted(missing_days)
+        
+        if missing_days_sorted:
+            range_start = missing_days_sorted[0]
+            range_end = missing_days_sorted[0]
+            
+            for day in missing_days_sorted[1:]:
+                if day == range_end + timedelta(days=1):
+                    range_end = day
+                else:
+                    ranges_to_fetch.append((
+                        datetime.combine(range_start, datetime.min.time()),
+                        datetime.combine(range_end, datetime.max.time())
+                    ))
+                    range_start = day
+                    range_end = day
+            
+            ranges_to_fetch.append((
+                datetime.combine(range_start, datetime.min.time()),
+                datetime.combine(range_end, datetime.max.time())
+            ))
+        
+        # Log rangos
+        log.info(f"  📋 Will fetch {len(ranges_to_fetch)} ranges:")
+        for i, (start, end) in enumerate(ranges_to_fetch):
+            days_in_range = (end.date() - start.date()).days + 1
+            log.info(f"    Range {i+1}: {start.date()} to {end.date()} ({days_in_range} days)")
         
         return ranges_to_fetch
     
@@ -528,7 +621,10 @@ class DataIngestion:
             return False
     
     def ingest_funding_rates(self, symbols: List[str], overwrite: bool = False) -> Dict[str, bool]:
-        """Ingest funding rates - CON OPCIÓN DE SOBREESCRITURA MEJORADA"""
+        """
+        MEJORADO: Ingest funding rates CON DETECCIÓN DE MISSING DAYS
+        Ahora usa la misma lógica que OHLCV y orderbook
+        """
         log.info(f"Starting funding rates ingestion for {len(symbols)} symbols (overwrite={overwrite})")
         
         results = {}
@@ -543,15 +639,40 @@ class DataIngestion:
             
             try:
                 if overwrite:
-                    # Eliminar todos los funding rates existentes
+                    # Modo overwrite: eliminar todo y fetch todo
                     deleted_count = self.delete_existing_data(symbol, 'funding')
                     log.info(f"Deleted {deleted_count:,} existing funding records for overwrite")
-                
-                # Get funding rate history from MEXC
-                funding_data = self.mexc.get_funding_rate_history(symbol)
+                    
+                    # Fetch ALL available data
+                    funding_data = self.mexc.get_funding_rate_history(symbol)
+                    
+                else:
+                    # NUEVO: Modo incremental con detección de missing days
+                    min_date, max_date = self.get_funding_data_range(symbol)
+                    
+                    # Define available range (funding típicamente 1-2 años)
+                    available_end = datetime.now()
+                    available_start = available_end - timedelta(days=730)  # 2 años
+                    
+                    # Usar misma lógica que OHLCV/orderbook
+                    ranges_to_fetch = self._detect_missing_days_funding(
+                        available_start, available_end, min_date, max_date, symbol
+                    )
+                    
+                    if not ranges_to_fetch:
+                        log.info(f"✅ No missing funding data for {symbol} - already complete")
+                        results[symbol] = True
+                        continue
+                    
+                    # Fetch only missing ranges
+                    funding_data = pd.DataFrame()
+                    for start_date, end_date in ranges_to_fetch:
+                        range_data = self.mexc.get_funding_rate_history_range(symbol, start_date, end_date)
+                        if not range_data.empty:
+                            funding_data = pd.concat([funding_data, range_data], ignore_index=True)
                 
                 if funding_data.empty:
-                    log.warning(f"No funding rate data for {symbol}")
+                    log.warning(f"No funding rate data obtained for {symbol}")
                     results[symbol] = False
                     continue
                 
