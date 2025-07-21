@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Data ingestion module - FIXED SYMBOL_INFO LOGIC
+Data ingestion module - FIXED SYMBOL_INFO LOGIC + CREATED_AT TIMESTAMPS
 FIXED: Usa tabla symbol_info de BD en lugar de CoinAPI endpoints rotos
+FIXED: Añade created_at timestamp en todas las inserciones de datos
 """
 
 import pandas as pd
@@ -21,7 +22,7 @@ from config.settings import settings
 log = get_ingestion_logger()
 
 class DataIngestion:
-    """Main data ingestion class - CON SYMBOL_INFO DESDE BD"""
+    """Main data ingestion class - CON SYMBOL_INFO DESDE BD + CREATED_AT TIMESTAMPS"""
     
     def __init__(self):
         self.coinapi = coinapi_client
@@ -860,13 +861,15 @@ class DataIngestion:
             return 0
     
     def _insert_ohlcv_data(self, symbol: str, df: pd.DataFrame) -> int:
-        """Insert OHLCV data into database - ROBUST VERSION"""
+        """Insert OHLCV data into database - FIXED: CON CREATED_AT TIMESTAMP"""
         if df.empty:
             return 0
         
         try:
             with db_manager.get_session() as session:
                 records = []
+                insert_timestamp = datetime.now()  # ← NUEVO: timestamp único para toda la inserción
+                
                 for timestamp, row in df.iterrows():
                    try:
                        record = {
@@ -876,7 +879,8 @@ class DataIngestion:
                            'high': float(row['high']),
                            'low': float(row['low']),
                            'close': float(row['close']),
-                           'volume': float(row['volume'])
+                           'volume': float(row['volume']),
+                           'created_at': insert_timestamp  # ← NUEVO: añadir created_at
                        }
                        
                        # Validar datos básicos
@@ -891,17 +895,21 @@ class DataIngestion:
                        continue
                
                 if records:
+                   # ← MODIFICADO: Query incluye created_at
                    session.execute(text("""
-                       INSERT INTO ohlcv (symbol, timestamp, open, high, low, close, volume)
-                       VALUES (:symbol, :timestamp, :open, :high, :low, :close, :volume)
+                       INSERT INTO ohlcv (symbol, timestamp, open, high, low, close, volume, created_at)
+                       VALUES (:symbol, :timestamp, :open, :high, :low, :close, :volume, :created_at)
                        ON CONFLICT (symbol, timestamp) DO UPDATE SET
                            open = EXCLUDED.open,
                            high = EXCLUDED.high,
                            low = EXCLUDED.low,
                            close = EXCLUDED.close,
                            volume = EXCLUDED.volume
+                           -- NO actualizar created_at en conflictos (mantener timestamp original)
                    """), records)
                    session.commit()
+                   
+                   log.debug(f"✅ Inserted {len(records)} OHLCV records for {symbol} with created_at")
                
             return len(records)
                
@@ -910,19 +918,21 @@ class DataIngestion:
             return 0
    
     def _insert_orderbook_data(self, symbol: str, df: pd.DataFrame) -> int:
-       """Insert orderbook data ROBUSTO - Version 3.0"""
+       """Insert orderbook data - FIXED: CON CREATED_AT TIMESTAMP"""
        if df.empty:
            return 0
        
        try:
            with db_manager.get_session() as session:
                records = []
+               insert_timestamp = datetime.now()  # ← NUEVO: timestamp único para toda la inserción
                
                for timestamp, row in df.iterrows():
                    try:
                        record = {
                            'symbol': symbol,
-                           'timestamp': timestamp.to_pydatetime() if hasattr(timestamp, 'to_pydatetime') else timestamp
+                           'timestamp': timestamp.to_pydatetime() if hasattr(timestamp, 'to_pydatetime') else timestamp,
+                           'created_at': insert_timestamp  # ← NUEVO: añadir created_at
                        }
                        
                        # Agregar niveles bid/ask (1-10)
@@ -965,15 +975,15 @@ class DataIngestion:
                        continue
                
                if records:
-                   # Construir query dinámica
+                   # ← AUTOMÁTICO: created_at ya está en el record, se incluye automáticamente
                    columns = list(records[0].keys())
                    placeholders = ', '.join([f':{col}' for col in columns])
                    columns_str = ', '.join(columns)
                    
-                   # Para sobreescritura usamos UPSERT
+                   # Para sobreescritura usamos UPSERT pero SIN actualizar created_at
                    update_clauses = []
                    for col in columns:
-                       if col not in ['symbol', 'timestamp']:
+                       if col not in ['symbol', 'timestamp', 'created_at']:  # ← EXCLUIR created_at del UPDATE
                            update_clauses.append(f"{col} = EXCLUDED.{col}")
                    
                    insert_query = f"""
@@ -986,7 +996,7 @@ class DataIngestion:
                    result = session.execute(text(insert_query), records)
                    session.commit()
                    
-                   log.debug(f"✅ Insertados {len(records)} orderbook records para {symbol}")
+                   log.debug(f"✅ Inserted {len(records)} orderbook records for {symbol} with created_at")
                    return len(records)
                else:
                    log.debug(f"No hay records válidos para {symbol}")
@@ -999,10 +1009,11 @@ class DataIngestion:
            return 0
    
     def _ingest_symbol_funding_rates(self, symbol: str, funding_df: pd.DataFrame) -> bool:
-       """Insert funding rates for a specific symbol - ROBUST VERSION"""
+       """Insert funding rates for a specific symbol - FIXED: CON CREATED_AT TIMESTAMP"""
        try:
            with db_manager.get_session() as session:
                records = []
+               insert_timestamp = datetime.now()  # ← NUEVO: timestamp único para toda la inserción
                
                for _, row in funding_df.iterrows():
                    try:
@@ -1027,7 +1038,8 @@ class DataIngestion:
                            'symbol': symbol,
                            'timestamp': timestamp,
                            'funding_rate': float(row['funding_rate']),
-                           'collect_cycle': int(row.get('collect_cycle', 28800))
+                           'collect_cycle': int(row.get('collect_cycle', 28800)),
+                           'created_at': insert_timestamp  # ← NUEVO: añadir created_at
                        })
                        
                    except Exception as e:
@@ -1035,16 +1047,18 @@ class DataIngestion:
                        continue
                
                if records:
+                   # ← MODIFICADO: Query incluye created_at
                    session.execute(text("""
-                       INSERT INTO funding_rates (symbol, timestamp, funding_rate, collect_cycle)
-                       VALUES (:symbol, :timestamp, :funding_rate, :collect_cycle)
+                       INSERT INTO funding_rates (symbol, timestamp, funding_rate, collect_cycle, created_at)
+                       VALUES (:symbol, :timestamp, :funding_rate, :collect_cycle, :created_at)
                        ON CONFLICT (symbol, timestamp) DO UPDATE SET
                            funding_rate = EXCLUDED.funding_rate,
                            collect_cycle = EXCLUDED.collect_cycle
+                           -- NO actualizar created_at (mantener timestamp original)
                    """), records)
                    session.commit()
                    
-                   log.info(f"✅ Inserted {len(records)} funding rate records for {symbol}")
+                   log.info(f"✅ Inserted {len(records)} funding rate records for {symbol} with created_at")
                
                return True
                
