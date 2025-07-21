@@ -3,6 +3,7 @@
 🔍 ENHANCED DATA INTEGRITY DIAGNOSIS + SURGICAL REPAIR - COMPLETE VERSION
 Analiza datos + verifica contra API + repara automáticamente datos faltantes
 FIXED: Ahora repara también días con datos insuficientes detectados por API
+FIXED: Lógica adaptativa para funding rates + exclusión del día actual para orderbook
 """
 
 import sys
@@ -204,11 +205,18 @@ class EnhancedDataDiagnosis:
             return {'error': str(e)}
     
     def _diagnose_orderbook_enhanced(self, symbol: str, start_date: datetime, end_date: datetime, verify_api: bool) -> Dict:
-        """Diagnóstico orderbook con verificación de API - MEJORADO"""
+        """Diagnóstico orderbook con verificación de API - MEJORADO CON EXCLUSIÓN DEL DÍA ACTUAL"""
         log.info(f"\n📊 ENHANCED ORDERBOOK DIAGNOSIS")
         log.info(f"{'='*50}")
         
         try:
+            # NUEVO: Excluir el día de hoy para orderbook (la API no puede obtener datos del día actual)
+            today = datetime.now().date()
+            if end_date.date() >= today:
+                original_end_date = end_date
+                end_date = datetime.combine(today - timedelta(days=1), datetime.max.time())
+                log.info(f"📅 Excluyendo día actual para orderbook: {original_end_date.date()} → {end_date.date()}")
+            
             # Diagnóstico básico primero
             basic_diagnosis = self._diagnose_orderbook_basic(symbol, start_date, end_date)
             
@@ -238,6 +246,11 @@ class EnhancedDataDiagnosis:
             if sample_missing:
                 log.info(f"  Verificando {len(sample_missing)} días faltantes en API orderbook...")
                 for day in sample_missing:
+                    # NUEVO: Saltar si es hoy o futuro
+                    if isinstance(day, date) and day >= today:
+                        log.info(f"  ⏭️ Saltando {day} (día actual o futuro)")
+                        continue
+                    
                     api_result = self._check_orderbook_api_for_date(symbol, day)
                     api_verification['missing_days_checked'].append({
                         'date': day,
@@ -263,6 +276,11 @@ class EnhancedDataDiagnosis:
                     else:
                         day = day_info
                         current_count = 0
+                    
+                    # NUEVO: Saltar si es hoy o futuro
+                    if isinstance(day, date) and day >= today:
+                        log.info(f"  ⏭️ Saltando {day} (día actual o futuro)")
+                        continue
                     
                     api_result = self._check_orderbook_api_for_date(symbol, day)
                     
@@ -393,6 +411,12 @@ class EnhancedDataDiagnosis:
             for day_info in all_orderbook_repair_days:
                 try:
                     day = day_info['date']
+                    
+                    # NUEVO: Saltar si es día actual o futuro (no se puede reparar)
+                    today = datetime.now().date()
+                    if isinstance(day, date) and day >= today:
+                        log.info(f"  ⏭️ Saltando {day} (día actual o futuro - no disponible en API)")
+                        continue
                     
                     # Determinar tipo de repair
                     if day_info in missing_orderbook_days:
@@ -600,7 +624,7 @@ class EnhancedDataDiagnosis:
         missing_checked = api_verification.get('missing_days_checked', [])
         if missing_checked:
             api_has_data = sum(1 for d in missing_checked if d['api_has_data'])
-            log.info(f"  API tiene datos para: {api_has_data}/{len(missing_checked)} días faltantes")
+            log.info(f"  Días orderbook escasos verificados: {len(missing_checked)}")
             
             if api_has_data > 0:
                 log.warning(f"  ⚠️ HAY {api_has_data} días con orderbook disponible en API que no tenemos")
@@ -617,7 +641,6 @@ class EnhancedDataDiagnosis:
                 marker = "🚨" if day_info.get('has_significant_discrepancy', False) else "ℹ️"
                 log.info(f"    {marker} {day_info['date']}: BD={day_info['current_snapshots']}, API={day_info['api_snapshots']}")
 
-    # [RESTO DE FUNCIONES SIN CAMBIOS - manteniendo todas las funciones existentes]
     def _diagnose_funding_enhanced(self, symbol: str, start_date: datetime, end_date: datetime, verify_api: bool) -> Dict:
         """Diagnóstico funding rates con verificación de MEXC API"""
         log.info(f"\n📊 ENHANCED FUNDING DIAGNOSIS")
@@ -649,7 +672,7 @@ class EnhancedDataDiagnosis:
             return {'error': str(e)}
     
     def _diagnose_funding_basic(self, symbol: str, start_date: datetime, end_date: datetime) -> Dict:
-        """Diagnóstico funding básico"""
+        """Diagnóstico funding básico - FIXED: LÓGICA ADAPTATIVA"""
         with db_manager.get_session() as session:
             stats_query = text("""
                 SELECT 
@@ -679,21 +702,82 @@ class EnhancedDataDiagnosis:
                     'status': 'NO_DATA'
                 }
             
+            # NUEVO: Detectar patrón de frecuencia real
+            frequency_pattern = self._detect_funding_frequency_pattern(symbol, session, start_date, end_date)
+            
             total_days = (end_date - start_date).days + 1
-            expected_per_day = 3  # Cada 8 horas
-            total_expected = total_days * expected_per_day
+            
+            # FIXED: Usar frecuencia detectada en lugar de asumir 3/día
+            if frequency_pattern['avg_per_day'] > 0:
+                expected_per_day = frequency_pattern['avg_per_day']
+                total_expected = int(total_days * expected_per_day)
+            else:
+                # Fallback: usar promedio real de días con datos
+                expected_per_day = stats.total_records / max(1, stats.days_with_data)
+                total_expected = stats.total_records  # Si no hay patrón claro, asumir que lo que hay es correcto
+            
             coverage_pct = (stats.total_records / total_expected * 100) if total_expected > 0 else 0
             
             log.info(f"📈 FUNDING BÁSICO: {stats.total_records:,} registros ({coverage_pct:.2f}%)")
+            log.info(f"📊 Patrón detectado: {frequency_pattern['description']}")
             
             return {
                 'total_records': stats.total_records,
                 'expected_records': total_expected,
                 'coverage_pct': coverage_pct,
-                'missing_records': total_expected - stats.total_records,
+                'missing_records': max(0, total_expected - stats.total_records),
                 'days_with_data': stats.days_with_data,
-                'avg_funding_rate': stats.avg_funding_rate
+                'avg_funding_rate': stats.avg_funding_rate,
+                'frequency_pattern': frequency_pattern
             }
+    
+    def _detect_funding_frequency_pattern(self, symbol: str, session, start_date: datetime, end_date: datetime) -> Dict:
+        """NUEVO: Detectar patrón de frecuencia real de funding rates"""
+        
+        # Analizar registros por día para detectar patrón
+        daily_analysis = session.execute(text("""
+            SELECT 
+                DATE(timestamp) as day,
+                COUNT(*) as records_per_day,
+                STRING_AGG(EXTRACT(HOUR FROM timestamp)::text, ',' ORDER BY timestamp) as hours
+            FROM funding_rates 
+            WHERE symbol = :symbol
+            AND timestamp BETWEEN :start_date AND :end_date
+            GROUP BY DATE(timestamp)
+            ORDER BY day
+        """), {'symbol': symbol, 'start_date': start_date, 'end_date': end_date}).fetchall()
+        
+        if not daily_analysis:
+            return {'avg_per_day': 3, 'description': 'Sin datos - asumiendo 3/día (cada 8h)'}
+        
+        # Calcular estadísticas
+        daily_counts = [row.records_per_day for row in daily_analysis]
+        avg_per_day = sum(daily_counts) / len(daily_counts)
+        
+        # Detectar patrón predominante
+        count_3_per_day = sum(1 for c in daily_counts if c == 3)
+        count_6_per_day = sum(1 for c in daily_counts if c == 6)
+        total_days = len(daily_counts)
+        
+        # Determinar descripción del patrón
+        if count_6_per_day > count_3_per_day and count_6_per_day / total_days > 0.6:
+            pattern_desc = f"Principalmente 6/día (cada 4h): {count_6_per_day}/{total_days} días ({count_6_per_day/total_days*100:.1f}%)"
+            expected_avg = 6
+        elif count_3_per_day > count_6_per_day and count_3_per_day / total_days > 0.6:
+            pattern_desc = f"Principalmente 3/día (cada 8h): {count_3_per_day}/{total_days} días ({count_3_per_day/total_days*100:.1f}%)"
+            expected_avg = 3
+        else:
+            pattern_desc = f"Patrón mixto: {count_3_per_day} días 3/día, {count_6_per_day} días 6/día, promedio {avg_per_day:.1f}/día"
+            expected_avg = avg_per_day
+        
+        return {
+            'avg_per_day': expected_avg,
+            'description': pattern_desc,
+            'days_with_3': count_3_per_day,
+            'days_with_6': count_6_per_day,
+            'total_days': total_days,
+            'actual_avg': avg_per_day
+        }
     
     def _verify_funding_with_mexc(self, symbol: str, start_date: datetime, end_date: datetime) -> Dict:
         """Verificar funding rates con MEXC API"""
@@ -841,8 +925,14 @@ class EnhancedDataDiagnosis:
             }
     
     def _diagnose_orderbook_basic(self, symbol: str, start_date: datetime, end_date: datetime) -> Dict:
-        """Diagnóstico orderbook básico"""
+        """Diagnóstico orderbook básico - FIXED: EXCLUYE DÍA ACTUAL"""
         with db_manager.get_session() as session:
+            # NUEVO: Ajustar end_date para excluir el día actual
+            today = datetime.now().date()
+            if end_date.date() >= today:
+                end_date = datetime.combine(today - timedelta(days=1), datetime.max.time())
+                log.debug(f"📅 Ajustando end_date para orderbook (excluyendo hoy): {end_date.date()}")
+            
             stats_query = text("""
                 SELECT 
                     COUNT(*) as total_records,
@@ -873,8 +963,6 @@ class EnhancedDataDiagnosis:
                     'status': 'NO_DATA'
                 }
             
-            total_days = (end_date - start_date).days + 1
-            
             # Análisis diario
             daily_query = text("""
                 SELECT 
@@ -893,7 +981,7 @@ class EnhancedDataDiagnosis:
                 'end_date': end_date
             })
             
-            # Detectar días sin datos
+            # Detectar días sin datos (excluyendo hoy)
             all_dates = pd.date_range(start=start_date.date(), end=end_date.date(), freq='D')
             dates_with_data = set(pd.to_datetime(daily_df['date']).dt.date) if not daily_df.empty else set()
             missing_dates = set(all_dates.date) - dates_with_data
@@ -912,8 +1000,14 @@ class EnhancedDataDiagnosis:
             }
     
     def _get_problematic_orderbook_days(self, symbol: str, start_date: datetime, end_date: datetime) -> Tuple[List[date], List[Dict]]:
-        """Obtener días faltantes y días con pocos snapshots"""
+        """Obtener días faltantes y días con pocos snapshots - FIXED: EXCLUYE HOY"""
         with db_manager.get_session() as session:
+            # NUEVO: Ajustar end_date para excluir el día actual
+            today = datetime.now().date()
+            if end_date.date() >= today:
+                end_date = datetime.combine(today - timedelta(days=1), datetime.max.time())
+                log.debug(f"📅 Ajustando end_date para orderbook problemático (excluyendo hoy): {end_date.date()}")
+            
             daily_query = text("""
                 SELECT 
                     DATE(timestamp) as date,
@@ -931,7 +1025,7 @@ class EnhancedDataDiagnosis:
                 'end_date': end_date
             })
             
-            # Días faltantes
+            # Días faltantes (excluyendo hoy)
             all_dates = pd.date_range(start=start_date.date(), end=end_date.date(), freq='D')
             dates_with_data = set(pd.to_datetime(daily_df['date']).dt.date) if not daily_df.empty else set()
             missing_days = sorted(list(set(all_dates.date) - dates_with_data))
@@ -1151,15 +1245,20 @@ class EnhancedDataDiagnosis:
         if len(days_list) <= max_samples:
             return days_list
         
+        # NUEVO: Filtrar el día de hoy automáticamente
+        today = datetime.now().date()
+        
         # Manejar lista de dates o lista de dicts
         if days_list and isinstance(days_list[0], dict):
             # Lista de dicts (sparse days)
-            recent_days = [d for d in days_list if d['date'] >= (datetime.now().date() - timedelta(days=30))]
-            older_days = [d for d in days_list if d not in recent_days]
+            filtered_days = [d for d in days_list if d['date'] < today]
+            recent_days = [d for d in filtered_days if d['date'] >= (today - timedelta(days=30))]
+            older_days = [d for d in filtered_days if d not in recent_days]
         else:
             # Lista de dates (missing days)
-            recent_days = [d for d in days_list if isinstance(d, date) and d >= (datetime.now().date() - timedelta(days=30))]
-            older_days = [d for d in days_list if d not in recent_days]
+            filtered_days = [d for d in days_list if isinstance(d, date) and d < today]
+            recent_days = [d for d in filtered_days if d >= (today - timedelta(days=30))]
+            older_days = [d for d in filtered_days if d not in recent_days]
         
         # Priorizar días recientes
         sample = recent_days[:max_samples//2] if recent_days else []
@@ -1370,6 +1469,11 @@ class EnhancedDataDiagnosis:
                 if assessment:
                     overall_grade = assessment.get('overall_grade', 'UNKNOWN')
                     log.info(f"  Calidad general: {overall_grade}")
+                
+                # NUEVO: Mostrar patrón de frecuencia detectado
+                frequency_pattern = funding.get('frequency_pattern', {})
+                if frequency_pattern:
+                    log.info(f"  Patrón detectado: {frequency_pattern.get('description', 'N/A')}")
                 
                 # API insights
                 api_verification = funding.get('api_verification', {})
