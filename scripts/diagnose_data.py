@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🔍 ENHANCED DATA INTEGRITY DIAGNOSIS - API VERIFICATION VERSION
-Analiza datos + verifica contra API para determinar si gaps son reales o problemas de ingesta
+🔍 ENHANCED DATA INTEGRITY DIAGNOSIS + SURGICAL REPAIR
+Analiza datos + verifica contra API + repara automáticamente datos faltantes
 """
 
 import sys
@@ -22,6 +22,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.database.connection import db_manager
 from src.data.coinapi_client import coinapi_client
 from src.data.mexc_client import mexc_client
+from src.data.ingestion import data_ingestion
 from src.utils.logger import setup_logger
 from config.settings import settings
 
@@ -29,19 +30,29 @@ from config.settings import settings
 log = setup_logger("enhanced_data_diagnosis")
 
 class EnhancedDataDiagnosis:
-    """Diagnóstico completo con verificación de API"""
+    """Diagnóstico completo con verificación de API y surgical repair"""
     
-    def __init__(self):
+    def __init__(self, enable_surgical_repair: bool = False):
         self.results = defaultdict(dict)
         self.coinapi = coinapi_client
         self.mexc = mexc_client
+        self.ingestion = data_ingestion
+        self.enable_surgical_repair = enable_surgical_repair
         
         # Control de rate limiting para API calls
         self.api_call_delay = 0.5  # 500ms entre calls
         self.max_sample_days = 10  # Máximo días a verificar por símbolo
         
+        # Contadores para surgical repair
+        self.repair_stats = {
+            'symbols_repaired': 0,
+            'total_ohlcv_repaired': 0,
+            'total_orderbook_repaired': 0,
+            'repair_failures': 0
+        }
+        
     def diagnose_symbol_enhanced(self, symbol: str, verify_api: bool = True) -> Dict:
-        """Diagnóstico completo para un símbolo con verificación de API"""
+        """Diagnóstico completo para un símbolo con verificación de API y optional repair"""
         log.info(f"\n{'='*80}")
         log.info(f"🔍 ENHANCED DIAGNOSIS: {symbol}")
         log.info(f"{'='*80}")
@@ -75,10 +86,259 @@ class EnhancedDataDiagnosis:
             log.info(f"ℹ️ {symbol} no es perpetuo - saltando funding rates")
             results['funding_rates'] = {'status': 'N/A - Not perpetual'}
         
+        # SURGICAL REPAIR si está habilitado
+        if self.enable_surgical_repair and verify_api:
+            repair_results = self._execute_surgical_repair(symbol, results)
+            results['surgical_repair'] = repair_results
+        
         # Resumen general mejorado
         self._log_enhanced_summary(results)
         
         return results
+    
+    def _execute_surgical_repair(self, symbol: str, diagnosis_results: Dict) -> Dict:
+        """Ejecuta surgical repair basado en los resultados del diagnóstico"""
+        log.info(f"\n🔧 INICIANDO SURGICAL REPAIR PARA {symbol}")
+        log.info(f"{'='*60}")
+        
+        repair_results = {
+            'ohlcv_repair': {'attempted': False, 'success': False, 'records_added': 0},
+            'orderbook_repair': {'attempted': False, 'success': False, 'records_added': 0},
+            'pre_repair_stats': {},
+            'post_repair_stats': {}
+        }
+        
+        # Capturar estadísticas pre-repair
+        repair_results['pre_repair_stats'] = self._get_data_stats(symbol)
+        
+        # OHLCV Repair
+        ohlcv_results = diagnosis_results.get('ohlcv', {})
+        ohlcv_api = ohlcv_results.get('api_verification', {})
+        missing_ohlcv_days = [d for d in ohlcv_api.get('missing_days_checked', []) if d['api_has_data']]
+        
+        if missing_ohlcv_days:
+            log.info(f"🔧 OHLCV REPAIR: {len(missing_ohlcv_days)} días con datos disponibles en API")
+            repair_results['ohlcv_repair']['attempted'] = True
+            
+            for day_info in missing_ohlcv_days:
+                try:
+                    day = day_info['date']
+                    records_added = self._repair_ohlcv_day(symbol, day)
+                    repair_results['ohlcv_repair']['records_added'] += records_added
+                    
+                    if records_added > 0:
+                        log.info(f"  ✅ {day}: +{records_added} registros OHLCV")
+                    else:
+                        log.warning(f"  ⚠️ {day}: No se pudieron obtener datos OHLCV")
+                        
+                except Exception as e:
+                    log.error(f"  ❌ Error reparando OHLCV {day}: {e}")
+                    
+                time_module.sleep(0.3)  # Rate limiting
+            
+            if repair_results['ohlcv_repair']['records_added'] > 0:
+                repair_results['ohlcv_repair']['success'] = True
+                self.repair_stats['total_ohlcv_repaired'] += repair_results['ohlcv_repair']['records_added']
+        
+        # Orderbook Repair
+        orderbook_results = diagnosis_results.get('orderbook', {})
+        orderbook_api = orderbook_results.get('api_verification', {})
+        missing_orderbook_days = [d for d in orderbook_api.get('missing_days_checked', []) if d['api_has_data']]
+        
+        if missing_orderbook_days:
+            log.info(f"🔧 ORDERBOOK REPAIR: {len(missing_orderbook_days)} días con datos disponibles en API")
+            repair_results['orderbook_repair']['attempted'] = True
+            
+            for day_info in missing_orderbook_days:
+                try:
+                    day = day_info['date']
+                    records_added = self._repair_orderbook_day(symbol, day)
+                    repair_results['orderbook_repair']['records_added'] += records_added
+                    
+                    if records_added > 0:
+                        log.info(f"  ✅ {day}: +{records_added} snapshots orderbook")
+                    else:
+                        log.warning(f"  ⚠️ {day}: No se pudieron obtener datos orderbook")
+                        
+                except Exception as e:
+                    log.error(f"  ❌ Error reparando orderbook {day}: {e}")
+                    
+                time_module.sleep(0.8)  # Rate limiting más agresivo para orderbook
+            
+            if repair_results['orderbook_repair']['records_added'] > 0:
+                repair_results['orderbook_repair']['success'] = True
+                self.repair_stats['total_orderbook_repaired'] += repair_results['orderbook_repair']['records_added']
+        
+        # Capturar estadísticas post-repair
+        repair_results['post_repair_stats'] = self._get_data_stats(symbol)
+        
+        # Log resultados del repair
+        self._log_repair_results(symbol, repair_results)
+        
+        # Actualizar contador global
+        if repair_results['ohlcv_repair']['success'] or repair_results['orderbook_repair']['success']:
+            self.repair_stats['symbols_repaired'] += 1
+        
+        return repair_results
+    
+    def _repair_ohlcv_day(self, symbol: str, target_date) -> int:
+        """Repara datos OHLCV para un día específico"""
+        try:
+            # Convertir fecha
+            if isinstance(target_date, str):
+                target_datetime = datetime.strptime(target_date, "%Y-%m-%d")
+            else:
+                target_datetime = datetime.combine(target_date, datetime.min.time())
+            
+            start_day = target_datetime.replace(hour=0, minute=0, second=0)
+            end_day = target_datetime.replace(hour=23, minute=59, second=59)
+            
+            log.debug(f"    📊 Reparando OHLCV: {symbol} - {target_date}")
+            
+            # Eliminar datos existentes para ese día (si los hay)
+            with db_manager.get_session() as session:
+                delete_query = text("""
+                    DELETE FROM ohlcv 
+                    WHERE symbol = :symbol 
+                    AND DATE(timestamp) = :target_date
+                """)
+                
+                deleted_count = session.execute(delete_query, {
+                    'symbol': symbol,
+                    'target_date': target_date
+                }).rowcount
+                session.commit()
+                
+                if deleted_count > 0:
+                    log.debug(f"    🗑️ Eliminados {deleted_count} registros OHLCV existentes")
+            
+            # Obtener datos frescos de la API
+            df = self.coinapi.get_ohlcv_for_date(symbol, target_date.isoformat())
+            
+            if not df.empty:
+                # Insertar datos usando la función existente
+                records_count = self.ingestion._insert_ohlcv_data(symbol, df)
+                return records_count
+            else:
+                log.debug(f"    ❌ No se obtuvieron datos OHLCV de API para {target_date}")
+                return 0
+                
+        except Exception as e:
+            log.error(f"Error reparando OHLCV {target_date}: {e}")
+            return 0
+    
+    def _repair_orderbook_day(self, symbol: str, target_date) -> int:
+        """Repara datos orderbook para un día específico"""
+        try:
+            log.debug(f"    📊 Reparando orderbook: {symbol} - {target_date}")
+            
+            # Eliminar datos existentes para ese día (si los hay)
+            with db_manager.get_session() as session:
+                delete_query = text("""
+                    DELETE FROM orderbook 
+                    WHERE symbol = :symbol 
+                    AND DATE(timestamp) = :target_date
+                """)
+                
+                deleted_count = session.execute(delete_query, {
+                    'symbol': symbol,
+                    'target_date': target_date
+                }).rowcount
+                session.commit()
+                
+                if deleted_count > 0:
+                    log.debug(f"    🗑️ Eliminados {deleted_count} snapshots orderbook existentes")
+            
+            # Obtener datos frescos de la API
+            df = self.coinapi.get_orderbook_for_date(symbol, target_date.isoformat())
+            
+            if not df.empty:
+                # Insertar datos usando la función existente
+                records_count = self.ingestion._insert_orderbook_data(symbol, df)
+                return records_count
+            else:
+                log.debug(f"    ❌ No se obtuvieron datos orderbook de API para {target_date}")
+                return 0
+                
+        except Exception as e:
+            log.error(f"Error reparando orderbook {target_date}: {e}")
+            return 0
+    
+    def _get_data_stats(self, symbol: str) -> Dict:
+        """Obtiene estadísticas actuales de datos para un símbolo"""
+        stats = {}
+        
+        with db_manager.get_session() as session:
+            # OHLCV stats
+            ohlcv_result = session.execute(text("""
+                SELECT 
+                    COUNT(*) as total_records,
+                    MIN(timestamp) as min_date,
+                    MAX(timestamp) as max_date,
+                    COUNT(DISTINCT DATE(timestamp)) as days_with_data
+                FROM ohlcv 
+                WHERE symbol = :symbol
+            """), {'symbol': symbol}).fetchone()
+            
+            stats['ohlcv'] = {
+                'total_records': ohlcv_result.total_records or 0,
+                'days_with_data': ohlcv_result.days_with_data or 0,
+                'min_date': ohlcv_result.min_date,
+                'max_date': ohlcv_result.max_date
+            }
+            
+            # Orderbook stats
+            orderbook_result = session.execute(text("""
+                SELECT 
+                    COUNT(*) as total_records,
+                    MIN(timestamp) as min_date,
+                    MAX(timestamp) as max_date,
+                    COUNT(DISTINCT DATE(timestamp)) as days_with_data
+                FROM orderbook 
+                WHERE symbol = :symbol
+            """), {'symbol': symbol}).fetchone()
+            
+            stats['orderbook'] = {
+                'total_records': orderbook_result.total_records or 0,
+                'days_with_data': orderbook_result.days_with_data or 0,
+                'min_date': orderbook_result.min_date,
+                'max_date': orderbook_result.max_date
+            }
+        
+        return stats
+    
+    def _log_repair_results(self, symbol: str, repair_results: Dict):
+        """Log resultados del surgical repair"""
+        log.info(f"\n📊 SURGICAL REPAIR RESULTS - {symbol}")
+        log.info(f"{'='*50}")
+        
+        pre_stats = repair_results['pre_repair_stats']
+        post_stats = repair_results['post_repair_stats']
+        
+        # OHLCV repair results
+        ohlcv_repair = repair_results['ohlcv_repair']
+        if ohlcv_repair['attempted']:
+            log.info(f"🔧 OHLCV REPAIR:")
+            log.info(f"  Pre-repair: {pre_stats['ohlcv']['total_records']:,} registros")
+            log.info(f"  Post-repair: {post_stats['ohlcv']['total_records']:,} registros")
+            log.info(f"  Registros añadidos: +{ohlcv_repair['records_added']:,}")
+            log.info(f"  Estado: {'✅ ÉXITO' if ohlcv_repair['success'] else '❌ FALLO'}")
+        
+        # Orderbook repair results
+        orderbook_repair = repair_results['orderbook_repair']
+        if orderbook_repair['attempted']:
+            log.info(f"🔧 ORDERBOOK REPAIR:")
+            log.info(f"  Pre-repair: {pre_stats['orderbook']['total_records']:,} snapshots")
+            log.info(f"  Post-repair: {post_stats['orderbook']['total_records']:,} snapshots")
+            log.info(f"  Snapshots añadidos: +{orderbook_repair['records_added']:,}")
+            log.info(f"  Estado: {'✅ ÉXITO' if orderbook_repair['success'] else '❌ FALLO'}")
+        
+        # Overall improvement
+        total_improvement = ohlcv_repair['records_added'] + orderbook_repair['records_added']
+        if total_improvement > 0:
+            log.info(f"✅ TOTAL IMPROVEMENT: +{total_improvement:,} registros/snapshots")
+        else:
+            log.info(f"ℹ️ No se encontraron datos adicionales para reparar")
     
     def _get_symbol_date_range(self, symbol: str) -> Optional[Tuple[datetime, datetime]]:
         """Obtener rango de fechas - data_end siempre es hoy"""
@@ -384,7 +644,7 @@ class EnhancedDataDiagnosis:
             }
     
     def _diagnose_orderbook_enhanced(self, symbol: str, start_date: datetime, end_date: datetime, verify_api: bool) -> Dict:
-        """Diagnóstico orderbook con verificación de API"""
+        """Diagnóstico orderbook con verificación de API - FIXED"""
         log.info(f"\n📊 ENHANCED ORDERBOOK DIAGNOSIS")
         log.info(f"{'='*50}")
         
@@ -1010,6 +1270,22 @@ class EnhancedDataDiagnosis:
                 else:
                     log.error(f"  ❌ MEXC API no disponible")
         
+        # Surgical Repair Summary
+        if 'surgical_repair' in results:
+            repair = results['surgical_repair']
+            log.info(f"\n🔧 SURGICAL REPAIR:")
+            
+            ohlcv_repair = repair.get('ohlcv_repair', {})
+            orderbook_repair = repair.get('orderbook_repair', {})
+            
+            if ohlcv_repair.get('attempted'):
+                status = '✅ ÉXITO' if ohlcv_repair.get('success') else '❌ FALLO'
+                log.info(f"  OHLCV: +{ohlcv_repair.get('records_added', 0)} registros - {status}")
+            
+            if orderbook_repair.get('attempted'):
+                status = '✅ ÉXITO' if orderbook_repair.get('success') else '❌ FALLO'
+                log.info(f"  Orderbook: +{orderbook_repair.get('records_added', 0)} snapshots - {status}")
+        
         # Overall recommendations
         log.info(f"\n💡 RECOMENDACIONES PRIORITARIAS:")
         
@@ -1029,20 +1305,46 @@ class EnhancedDataDiagnosis:
         
         log.info(f"\n✅ Enhanced diagnosis completado para {symbol}")
         log.info(f"{'='*80}\n")
+    
+    def log_global_surgical_summary(self):
+        """Log resumen global del surgical repair"""
+        if self.enable_surgical_repair:
+            log.info(f"\n{'='*80}")
+            log.info(f"🔧 SURGICAL REPAIR GLOBAL SUMMARY")
+            log.info(f"{'='*80}")
+            log.info(f"  Símbolos reparados: {self.repair_stats['symbols_repaired']}")
+            log.info(f"  Total OHLCV records añadidos: {self.repair_stats['total_ohlcv_repaired']:,}")
+            log.info(f"  Total orderbook snapshots añadidos: {self.repair_stats['total_orderbook_repaired']:,}")
+            log.info(f"  Fallos de reparación: {self.repair_stats['repair_failures']}")
+            
+            total_repairs = self.repair_stats['total_ohlcv_repaired'] + self.repair_stats['total_orderbook_repaired']
+            if total_repairs > 0:
+                log.info(f"✅ SURGICAL REPAIR EXITOSO: +{total_repairs:,} registros/snapshots totales")
+            else:
+                log.info(f"ℹ️ No se encontraron datos adicionales que reparar")
 
 def main():
-    """Función principal del diagnóstico mejorado"""
-    parser = argparse.ArgumentParser(description="🔍 Enhanced data integrity diagnosis with API verification")
+    """Función principal del diagnóstico mejorado con surgical repair"""
+    parser = argparse.ArgumentParser(description="🔍 Enhanced data integrity diagnosis with API verification + surgical repair")
     parser.add_argument("--symbol", type=str, help="Analizar símbolo específico")
     parser.add_argument("--no-api", action="store_true", help="Saltar verificación de API")
     parser.add_argument("--quick", action="store_true", help="Análisis rápido (menos verificaciones de API)")
+    parser.add_argument("--surgical-repair", action="store_true", help="🔧 Ejecutar surgical repair automático para datos faltantes")
+    parser.add_argument("--dry-run", action="store_true", help="Solo mostrar qué se repararía, no ejecutar")
     
     args = parser.parse_args()
     
     log.info("🔍 INICIANDO ENHANCED DIAGNOSIS CON VERIFICACIÓN DE API")
+    if args.surgical_repair:
+        if args.dry_run:
+            log.info("🔧 MODO: Surgical repair DRY RUN (solo simulación)")
+        else:
+            log.info("🔧 MODO: Surgical repair ACTIVO (reparará datos automáticamente)")
     log.info(f"Timestamp: {datetime.now()}")
     
     verify_api = not args.no_api
+    enable_repair = args.surgical_repair and not args.dry_run
+    
     if not verify_api:
         log.info("⚠️ Saltando verificación de API (modo --no-api)")
     elif args.quick:
@@ -1069,8 +1371,8 @@ def main():
         log.error("No hay símbolos para analizar")
         return False
     
-    # Crear diagnóstico mejorado
-    diagnosis = EnhancedDataDiagnosis()
+    # Crear diagnóstico mejorado con surgical repair
+    diagnosis = EnhancedDataDiagnosis(enable_surgical_repair=enable_repair)
     all_results = {}
     
     # Analizar cada símbolo
@@ -1123,11 +1425,22 @@ def main():
     log.info(f"  Días con datos disponibles en API no ingresados: {total_api_missing_days}")
     log.info(f"  Símbolos con problemas de ingesta detectados: {symbols_with_api_issues}")
     
+    # Log global surgical repair summary
+    diagnosis.log_global_surgical_summary()
+    
     if verify_api:
-        if total_api_missing_days > 0:
+        if enable_repair:
+            if diagnosis.repair_stats['symbols_repaired'] > 0:
+                log.info(f"\n✅ SURGICAL REPAIR EXITOSO")
+                log.info(f"  {diagnosis.repair_stats['symbols_repaired']} símbolos reparados")
+                log.info(f"  +{diagnosis.repair_stats['total_ohlcv_repaired']:,} registros OHLCV")
+                log.info(f"  +{diagnosis.repair_stats['total_orderbook_repaired']:,} snapshots orderbook")
+            else:
+                log.info(f"\n✅ NO SE DETECTARON PROBLEMAS DE INGESTA QUE REPARAR")
+        elif total_api_missing_days > 0:
             log.error(f"\n❌ PROBLEMAS DE INGESTA DETECTADOS:")
             log.error(f"  {total_api_missing_days} días tienen datos en API que no fueron ingresados")
-            log.error(f"  Ejecutar re-ingesta para estos períodos específicos")
+            log.error(f"  Ejecutar con --surgical-repair para reparar automáticamente")
         else:
             log.info(f"\n✅ NO SE DETECTARON PROBLEMAS DE INGESTA")
             log.info(f"  Los gaps en datos corresponden a falta de datos en las APIs")
