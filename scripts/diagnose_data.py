@@ -4,6 +4,7 @@
 Analiza datos + verifica contra API + repara automáticamente datos faltantes
 FIXED: Ahora repara también días con datos insuficientes detectados por API
 FIXED: Lógica adaptativa para funding rates + exclusión del día actual para orderbook
+UPDATED: Usa base de datos en lugar de YAML para obtener símbolos
 """
 
 import sys
@@ -1562,22 +1563,43 @@ def main():
     elif args.quick:
         log.info("⚡ Modo rápido - verificaciones limitadas de API")
     
-    # Obtener símbolos a analizar
+# UPDATED: Obtener símbolos desde symbol_info table
     if args.symbol:
         symbols = [args.symbol]
         log.info(f"Analizando símbolo específico: {args.symbol}")
     else:
-        try:
-            active_pairs = settings.get_active_pairs()
-            symbols = []
-            for pair in active_pairs:
-                symbols.extend([pair.symbol1, pair.symbol2])
-            symbols = list(set(symbols))
-            log.info(f"Analizando todos los símbolos activos: {len(symbols)}")
-        except Exception as e:
-            log.error(f"Error cargando símbolos: {e}")
-            symbols = ['MEXCFTS_PERP_GIGA_USDT', 'MEXCFTS_PERP_SPX_USDT']
-            log.info(f"Usando símbolos por defecto: {symbols}")
+        log.info("🔍 Getting symbols from symbol_info table...")
+        
+        # Simplificado: obtener todos los símbolos de symbol_info
+        symbols = settings.get_symbols_from_db()
+        
+        if symbols:
+            log.info(f"✅ Found {len(symbols)} symbols in symbol_info table")
+            log.info(f"📋 Data source: Database (symbol_info table)")
+        else:
+            # Fallback: use YAML (for cases where DB is not populated yet)
+            log.warning("⚠️ No symbols found in database, falling back to YAML configuration...")
+            try:
+                active_pairs = settings.get_active_pairs()
+                symbols = []
+                for pair in active_pairs:
+                    symbols.extend([pair.symbol1, pair.symbol2])
+                symbols = list(set(symbols))
+                log.info(f"✅ Found {len(symbols)} symbols from YAML configuration")
+                log.info(f"📋 Data source: YAML configuration (fallback)")
+            except Exception as yaml_error:
+                log.error(f"Failed to load symbols from YAML: {yaml_error}")
+                # Ultimate fallback
+                symbols = ['MEXCFTS_PERP_GIGA_USDT', 'MEXCFTS_PERP_SPX_USDT']
+                log.warning(f"Using default symbols: {symbols}")
+                log.info(f"📋 Data source: Hardcoded defaults")        
+        # Log data source
+        if settings.get_active_symbols_from_db():
+            log.info(f"📋 Data source: Database (active symbols from active pairs)")
+        elif settings.get_symbols_from_db():
+            log.info(f"📋 Data source: Database (all available symbols)")
+        else:
+            log.info(f"📋 Data source: YAML configuration (fallback)")
     
     if not symbols:
         log.error("No hay símbolos para analizar")

@@ -2,6 +2,7 @@
 """
 Data ingestion script - CON PARÁMETROS SELECTIVOS Y SOBREESCRITURA
 FIXED: days_back como None por defecto para usar todos los datos en overwrite mode
+UPDATED: Usa base de datos en lugar de YAML para obtener símbolos
 """
 
 import sys
@@ -68,16 +69,64 @@ def main():
         # Get symbols to process
         if args.symbol:
             symbols = [args.symbol]
+            log.info(f"Processing specific symbol: {args.symbol}")
         else:
-            active_pairs = settings.get_active_pairs()
-            symbols = list(set([pair.symbol1 for pair in active_pairs] + [pair.symbol2 for pair in active_pairs]))
+            # UPDATED: Use database instead of YAML
+            log.info("🔍 Getting symbols from database...")
+            
+            # Try to get active symbols from database first
+            symbols = settings.get_active_symbols_from_db()
+            
+            if symbols:
+                log.info(f"✅ Found {len(symbols)} active symbols in database")
+            else:
+                # Fallback: get all symbols from database
+                log.info("⚠️ No active symbols found, trying all symbols in database...")
+                symbols = settings.get_symbols_from_db()
+                
+                if symbols:
+                    log.info(f"✅ Found {len(symbols)} total symbols in database")
+                else:
+                    # Final fallback: use YAML (for cases where DB is not populated yet)
+                    log.warning("⚠️ No symbols found in database, falling back to YAML configuration...")
+                    try:
+                        active_pairs = settings.get_active_pairs()
+                        symbols = list(set([pair.symbol1 for pair in active_pairs] + [pair.symbol2 for pair in active_pairs]))
+                        log.info(f"✅ Found {len(symbols)} symbols from YAML configuration")
+                    except Exception as yaml_error:
+                        log.error(f"Failed to load symbols from YAML: {yaml_error}")
+                        # Ultimate fallback
+                        symbols = ['MEXCFTS_PERP_GIGA_USDT', 'MEXCFTS_PERP_SPX_USDT']
+                        log.warning(f"Using default symbols: {symbols}")
         
         if not symbols:
             log.error("No symbols to process")
             return False
         
-        symbol_names = [s.split('_')[-2] if '_' in s else s for s in symbols]
-        log.info(f"Processing {len(symbols)} symbols: {symbol_names}")
+        # Display symbol names nicely
+        symbol_names = []
+        for s in symbols:
+            if '_' in s:
+                # Extract meaningful part (e.g., MEXCFTS_PERP_GIGA_USDT -> GIGA)
+                parts = s.split('_')
+                if len(parts) >= 3:
+                    symbol_names.append(parts[-2])  # Get GIGA from MEXCFTS_PERP_GIGA_USDT
+                else:
+                    symbol_names.append(s)
+            else:
+                symbol_names.append(s)
+        
+        log.info(f"📊 Processing {len(symbols)} symbols: {symbol_names}")
+        
+        # Log data source
+        if args.symbol:
+            log.info(f"📋 Data source: Manual symbol specification")
+        elif settings.get_active_symbols_from_db():
+            log.info(f"📋 Data source: Database (active symbols from active pairs)")
+        elif settings.get_symbols_from_db():
+            log.info(f"📋 Data source: Database (all available symbols)")
+        else:
+            log.info(f"📋 Data source: YAML configuration (fallback)")
         
         # FIXED: Pasar days_back como None si no se especifica para usar todos los datos
         run_ingestion_args = {
@@ -87,7 +136,10 @@ def main():
             'days_back': args.days_back  # Esto será None si no se especifica
         }
         
-        log.info(f"Ingestion parameters: overwrite={args.force_overwrite}, days_back={args.days_back}")
+        log.info(f"⚙️ Ingestion parameters:")
+        log.info(f"   - Overwrite: {args.force_overwrite}")
+        log.info(f"   - Days back: {args.days_back if args.days_back else 'ALL AVAILABLE'}")
+        log.info(f"   - Data types: {data_types if data_types else 'ALL (ohlcv, orderbook, funding)'}")
         
         # Run ingestion with new unified function
         results = data_ingestion.ingest_data(**run_ingestion_args)

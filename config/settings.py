@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import yaml
 import os
 from pathlib import Path
@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     def database_url(self) -> str:
         return f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
     
+    # ========================================
+    # YAML-BASED FUNCTIONS (for setup_database.py only)
+    # ========================================
+    
     def _load_symbols_config(self) -> Dict:
         """Load symbols configuration from YAML file"""
         config_path = Path(self.SYMBOLS_CONFIG_FILE)
@@ -88,7 +92,7 @@ class Settings(BaseSettings):
             return yaml.safe_load(file)
     
     def get_trading_pairs(self) -> List[TradingPairConfig]:
-        """Get all configured trading pairs from YAML file"""
+        """Get all configured trading pairs from YAML file (for initial setup only)"""
         config = self._load_symbols_config()
         pairs = []
         
@@ -98,19 +102,11 @@ class Settings(BaseSettings):
         return pairs
     
     def get_active_pairs(self) -> List[TradingPairConfig]:
-        """Get only active trading pairs"""
+        """Get only active trading pairs from YAML (for initial setup only)"""
         return [pair for pair in self.get_trading_pairs() if pair.is_active]
     
-    def get_pair_config(self, symbol1: str, symbol2: str) -> TradingPairConfig:
-        """Get configuration for specific pair"""
-        for pair in self.get_trading_pairs():
-            if (pair.symbol1 == symbol1 and pair.symbol2 == symbol2) or \
-               (pair.symbol1 == symbol2 and pair.symbol2 == symbol1):
-                return pair
-        raise ValueError(f"No configuration found for pair {symbol1}/{symbol2}")
-    
     def get_all_symbols(self) -> List[str]:
-        """Get all unique symbols from all pairs"""
+        """Get all unique symbols from all pairs in YAML (for initial setup only)"""
         symbols = set()
         for pair in self.get_trading_pairs():
             symbols.add(pair.symbol1)
@@ -118,12 +114,115 @@ class Settings(BaseSettings):
         return list(symbols)
     
     def get_active_symbols(self) -> List[str]:
-        """Get all unique symbols from active pairs only"""
+        """Get all unique symbols from active pairs only in YAML (for initial setup only)"""
         symbols = set()
         for pair in self.get_active_pairs():
             symbols.add(pair.symbol1)
             symbols.add(pair.symbol2)
         return list(symbols)
+    
+    # ========================================
+    # DATABASE-BASED FUNCTIONS (for production scripts)
+    # ========================================
+    
+    def get_symbols_from_db(self) -> List[str]:
+        """Get all symbols from symbol_info table"""
+        try:
+            from src.database.connection import db_manager
+            from sqlalchemy import text
+            
+            with db_manager.get_session() as session:
+                result = session.execute(text("""
+                    SELECT DISTINCT symbol_id 
+                    FROM symbol_info 
+                    ORDER BY symbol_id
+                """)).fetchall()
+                
+                symbols = [row.symbol_id for row in result]
+                return symbols
+                
+        except Exception as e:
+            print(f"Warning: Could not get symbols from DB: {e}")
+            return []
+    
+    def get_active_symbols_from_db(self) -> List[str]:
+        """Get all symbols from symbol_info table (for diagnosis, all symbols are active)"""
+        return self.get_symbols_from_db()
+    
+    def symbol_exists_in_db(self, symbol: str) -> bool:
+        """Check if symbol exists in symbol_info table"""
+        try:
+            from src.database.connection import db_manager
+            from sqlalchemy import text
+            
+            with db_manager.get_session() as session:
+                result = session.execute(text("""
+                    SELECT 1 FROM symbol_info 
+                    WHERE symbol_id = :symbol 
+                    LIMIT 1
+                """), {'symbol': symbol}).fetchone()
+                
+                return result is not None
+                
+        except Exception as e:
+            print(f"Warning: Could not check symbol in DB: {e}")
+            return False
+    
+    def get_symbol_info_from_db(self, symbol: str) -> Optional[Dict]:
+        """Get symbol information from database"""
+        try:
+            from src.database.connection import db_manager
+            from sqlalchemy import text
+            
+            with db_manager.get_session() as session:
+                result = session.execute(text("""
+                    SELECT symbol_id, exchange_id, symbol_type, asset_id_base, 
+                           asset_id_quote, data_start
+                    FROM symbol_info 
+                    WHERE symbol_id = :symbol
+                """), {'symbol': symbol}).fetchone()
+                
+                if result:
+                    return {
+                        'symbol_id': result.symbol_id,
+                        'exchange_id': result.exchange_id,
+                        'symbol_type': result.symbol_type,
+                        'asset_id_base': result.asset_id_base,
+                        'asset_id_quote': result.asset_id_quote,
+                        'data_start': result.data_start
+                    }
+                
+                return None
+                
+        except Exception as e:
+            print(f"Warning: Could not get symbol info from DB: {e}")
+            return None
+    
+    # ========================================
+    # UTILITY FUNCTIONS
+    # ========================================
+    
+    def use_database_mode(self) -> bool:
+        """Check if database is available and should be used"""
+        try:
+            symbols = self.get_symbols_from_db()
+            return len(symbols) > 0
+        except:
+            return False
+    
+    def get_best_available_symbols(self) -> List[str]:
+        """Get symbols from best available source (DB first, then YAML fallback)"""
+        # Try database first
+        symbols = self.get_symbols_from_db()
+        if symbols:
+            return symbols
+        
+        # Fallback to YAML
+        try:
+            return self.get_active_symbols()
+        except:
+            # Ultimate fallback
+            return ['MEXCFTS_PERP_GIGA_USDT', 'MEXCFTS_PERP_SPX_USDT']
     
     class Config:
         env_file = ".env"
