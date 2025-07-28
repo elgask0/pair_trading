@@ -57,12 +57,12 @@ def setup_logger(script_name: str = None):
         compression="zip"
     )
     
-    # Always add to general trading.log with simple format
+    # Always add to general trading.log with FIXED format (sin script_name)
     if script_name != "trading":  # Evitar duplicados
         loguru_logger.add(
             str(logs_dir / "trading.log"),
             level="INFO",  # Only important messages go to general log
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {script_name} - {message}",
+            format=f"{script_name} | {{time:YYYY-MM-DD HH:mm:ss}} | {{level: <8}} | {{name}}:{{function}} - {{message}}",
             rotation="10 MB",
             retention="30 days",
             compression="zip"
