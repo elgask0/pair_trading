@@ -19,10 +19,11 @@ warnings.filterwarnings('ignore')
 # Ensure project root is on PYTHONPATH for imports
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 from src.database.connection import db_manager
-from src.utils.logger import get_validation_logger
 from config.settings import settings
 
-log = get_validation_logger()
+from src.utils.logger import get_logger
+log = get_logger()
+
 plt.style.use('default')
 plt.rcParams['figure.facecolor'] = 'white'
 plt.rcParams['font.size'] = 9

@@ -20,9 +20,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.database.connection import db_manager
 from src.data.coinapi_client import coinapi_client
 from config.settings import settings
-from src.utils.logger import setup_logger
+from src.utils.logger import get_logger
 
-log = setup_logger("choose_symbols")
+log = get_logger()
 
 class InteractiveSymbolChooser:
     """Selector interactivo de símbolos usando CoinAPI + Editor de fechas"""

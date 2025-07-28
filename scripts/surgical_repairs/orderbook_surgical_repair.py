@@ -19,10 +19,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.database.connection import db_manager
 from src.data.ingestion import data_ingestion
-from src.utils.logger import get_ingestion_logger
 from config.settings import settings
 
-log = get_ingestion_logger()
+from src.utils.logger import get_logger
+log = get_logger()
 
 class OrderbookSurgicalRepair:
     """Reparación quirúrgica de orderbook post-abril 12, 2025"""

@@ -26,11 +26,10 @@ from src.database.connection import db_manager
 from src.data.coinapi_client import coinapi_client
 from src.data.mexc_client import mexc_client
 from src.data.ingestion import data_ingestion
-from src.utils.logger import setup_logger
 from config.settings import settings
 
-# Setup dedicated logger for diagnosis
-log = setup_logger("enhanced_data_diagnosis")
+from src.utils.logger import get_logger
+log = get_logger()
 
 class EnhancedDataDiagnosis:
     """Diagnóstico completo con verificación de API y surgical repair - COMPLETE"""

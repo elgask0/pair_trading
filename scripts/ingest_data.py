@@ -12,10 +12,10 @@ from pathlib import Path
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data.ingestion import data_ingestion
-from src.utils.logger import get_ingestion_logger
 from config.settings import settings
 
-log = get_ingestion_logger()
+from src.utils.logger import get_logger
+log = get_logger()
 
 def main():
     parser = argparse.ArgumentParser(description="Data ingestion with selective options and overwrite")

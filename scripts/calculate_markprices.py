@@ -15,10 +15,10 @@ from typing import Dict, List, Optional, Tuple
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.database.connection import db_manager
-from src.utils.logger import get_validation_logger
 from config.settings import settings
 
-log = get_validation_logger()
+from src.utils.logger import get_logger
+log = get_logger()
 
 def diagnose_data_gaps(symbol: str) -> Dict:
     """Diagnosticar gaps en los datos de orderbook y mark prices"""

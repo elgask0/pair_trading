@@ -27,12 +27,13 @@ from sqlalchemy import text
 # Database imports
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.database.connection import db_manager 
-from src.utils.logger import setup_logger
+from src.utils.log import get_log
+log = get_log()
 
 # Setup
 plt.style.use('seaborn-v0_8')
 sns.set_palette("husl")
-logger = setup_logger(__name__)
+
 
 # Try to import advanced statistical packages
 try:
@@ -41,10 +42,10 @@ try:
     from statsmodels.tsa.vector_ar.vecm import coint_johansen
     from arch.unitroot import PhillipsPerron
     ADVANCED_STATS = True
-    logger.info("Advanced statistical packages loaded successfully")
+    log.info("Advanced statistical packages loaded successfully")
 except ImportError:
     ADVANCED_STATS = False
-    logger.warning("Advanced statistical packages not available. Install with: pip install statsmodels arch")
+    log.warning("Advanced statistical packages not available. Install with: pip install statsmodels arch")
 
 def create_analysis_directories(base_dir: str) -> dict:
     """Create directory structure for analysis outputs"""
@@ -66,7 +67,7 @@ def create_analysis_directories(base_dir: str) -> dict:
         window_dir = os.path.join(directories['windows'], f'{window}d')
         os.makedirs(window_dir, exist_ok=True)
     
-    logger.info(f"Created analysis directory structure in: {base_dir}")
+    log.info(f"Created analysis directory structure in: {base_dir}")
     return directories
 
 def load_ohlcv_data(symbol: str, limit: int = None) -> pd.DataFrame:
@@ -92,7 +93,7 @@ def load_ohlcv_data(symbol: str, limit: int = None) -> pd.DataFrame:
             )
             
             if df.empty:
-                logger.warning(f"No OHLCV data found for symbol: {symbol}")
+                log.warning(f"No OHLCV data found for symbol: {symbol}")
                 return df
             
             # Ensure index is datetime
@@ -101,30 +102,30 @@ def load_ohlcv_data(symbol: str, limit: int = None) -> pd.DataFrame:
             
             df = df.sort_index()
             
-            logger.info(f"Loaded {len(df):,} OHLCV records for {symbol}")
+            log.info(f"Loaded {len(df):,} OHLCV records for {symbol}")
             return df
             
     except Exception as e:
-        logger.error(f"Error loading OHLCV data for {symbol}: {e}")
+        log.error(f"Error loading OHLCV data for {symbol}: {e}")
         return pd.DataFrame()
 
 def create_minute_alignment_optimized(df1: pd.DataFrame, df2: pd.DataFrame, 
                                     symbol1: str, symbol2: str) -> pd.DataFrame:
     """Create optimized minute-level alignment of two price series using OHLCV close"""
     try:
-        logger.info(f"\n🔄 OPTIMIZED ALIGNMENT: {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV Close)")
+        log.info(f"\n🔄 OPTIMIZED ALIGNMENT: {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV Close)")
         
         # Find overlap period
         start_time = max(df1.index.min(), df2.index.min())
         end_time = min(df1.index.max(), df2.index.max())
         
-        logger.info(f"  Overlap period: {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}")
+        log.info(f"  Overlap period: {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}")
         
         # Filter to overlap period
         df1_overlap = df1[(df1.index >= start_time) & (df1.index <= end_time)].copy()
         df2_overlap = df2[(df2.index >= start_time) & (df2.index <= end_time)].copy()
         
-        logger.info(f"  Data in overlap: {symbol1.split('_')[-2]}={len(df1_overlap):,}, {symbol2.split('_')[-2]}={len(df2_overlap):,}")
+        log.info(f"  Data in overlap: {symbol1.split('_')[-2]}={len(df1_overlap):,}, {symbol2.split('_')[-2]}={len(df2_overlap):,}")
         
         # Create minute-level index
         minute_index = pd.date_range(start=start_time, end=end_time, freq='1T')
@@ -143,7 +144,7 @@ def create_minute_alignment_optimized(df1: pd.DataFrame, df2: pd.DataFrame,
         combined_clean = combined.dropna()
         
         if combined_clean.empty:
-            logger.error("No overlapping data points found after alignment")
+            log.error("No overlapping data points found after alignment")
             return pd.DataFrame()
         
         # Calculate statistics
@@ -151,24 +152,24 @@ def create_minute_alignment_optimized(df1: pd.DataFrame, df2: pd.DataFrame,
         coverage_pct = (len(combined_clean) / total_possible_minutes) * 100
         utilization_pct = (len(combined_clean) / (len(df1_overlap) + len(df2_overlap))) * 200  # *200 because we're comparing against sum of both
         
-        logger.info(f"  Final aligned points: {len(combined_clean):,}")
-        logger.info(f"  Coverage: {coverage_pct:.1f}% of possible minutes")
-        logger.info(f"  Data utilization: {utilization_pct:.1f}% of original data")
+        log.info(f"  Final aligned points: {len(combined_clean):,}")
+        log.info(f"  Coverage: {coverage_pct:.1f}% of possible minutes")
+        log.info(f"  Data utilization: {utilization_pct:.1f}% of original data")
         
         return combined_clean
         
     except Exception as e:
-        logger.error(f"Error in alignment: {e}")
+        log.error(f"Error in alignment: {e}")
         return pd.DataFrame()
 
 def calculate_comprehensive_stats(df: pd.DataFrame, symbol1: str, symbol2: str) -> dict:
     """Calculate comprehensive statistical measures"""
     try:
-        logger.info(f"\n📈 COMPREHENSIVE STATISTICS: {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV)")
-        logger.info(f"Using {len(df):,} clean data points")
+        log.info(f"\n📈 COMPREHENSIVE STATISTICS: {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV)")
+        log.info(f"Using {len(df):,} clean data points")
         
         if len(df) < 100:
-            logger.warning("Insufficient data for reliable statistics")
+            log.warning("Insufficient data for reliable statistics")
             return {}
         
         # Get column names
@@ -231,11 +232,11 @@ def calculate_comprehensive_stats(df: pd.DataFrame, symbol1: str, symbol2: str) 
             signal_strength = "VERY STRONG"
         
         # Log key results
-        logger.info(f"  Regression: {y_col.split('_')[0]} = {alpha:.6f} + {beta:.6f} × {x_col.split('_')[0]}")
-        logger.info(f"  R²: {r_squared:.4f}, Correlation: {correlation:.4f}")
-        logger.info(f"  Current Z-score: {zscore_current:.2f}")
-        logger.info(f"  Half-life: {half_life_days:.1f} days")
-        logger.info(f"  Signal: {signal_strength} {signal}")
+        log.info(f"  Regression: {y_col.split('_')[0]} = {alpha:.6f} + {beta:.6f} × {x_col.split('_')[0]}")
+        log.info(f"  R²: {r_squared:.4f}, Correlation: {correlation:.4f}")
+        log.info(f"  Current Z-score: {zscore_current:.2f}")
+        log.info(f"  Half-life: {half_life_days:.1f} days")
+        log.info(f"  Signal: {signal_strength} {signal}")
         
         results = {
             'correlation': correlation,
@@ -257,8 +258,8 @@ def calculate_comprehensive_stats(df: pd.DataFrame, symbol1: str, symbol2: str) 
         return results
         
     except Exception as e:
-        logger.error(f"Error calculating comprehensive stats: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        log.error(f"Error calculating comprehensive stats: {e}")
+        log.error(f"Traceback: {traceback.format_exc()}")
         return {}
 
 def calculate_rolling_stats(df: pd.DataFrame, window_days: int, symbol1: str, symbol2: str) -> dict:
@@ -267,14 +268,14 @@ def calculate_rolling_stats(df: pd.DataFrame, window_days: int, symbol1: str, sy
         window_minutes = window_days * 24 * 60
         
         if len(df) < window_minutes:
-            logger.warning(f"Not enough data for {window_days}-day window")
+            log.warning(f"Not enough data for {window_days}-day window")
             return None
         
         # Get column names
         cols = df.columns.tolist()
         x_col, y_col = cols[0], cols[1]
         
-        logger.info(f"  Calculating rolling stats for {window_days}d window (window={window_minutes} minutes)")
+        log.info(f"  Calculating rolling stats for {window_days}d window (window={window_minutes} minutes)")
         
         # Calculate rolling correlations
         rolling_corr = df[x_col].rolling(window=window_minutes).corr(df[y_col])
@@ -319,7 +320,7 @@ def calculate_rolling_stats(df: pd.DataFrame, window_days: int, symbol1: str, sy
                 
                 return pd.Series(result, index=series.index)
             except Exception as e:
-                logger.error(f"Error in rolling zscore calculation: {e}")
+                log.error(f"Error in rolling zscore calculation: {e}")
                 return pd.Series([np.nan] * len(series), index=series.index)
         
         # Calculate rolling z-scores
@@ -366,13 +367,13 @@ def calculate_rolling_stats(df: pd.DataFrame, window_days: int, symbol1: str, sy
             results['zscore_std'] = results['zscore'].std()
             results['zscore_current'] = results['zscore'].iloc[-1]
         
-        logger.info(f"  Rolling stats calculated: {len(results['correlation'])} correlation points, {len(results['zscore'])} zscore points")
+        log.info(f"  Rolling stats calculated: {len(results['correlation'])} correlation points, {len(results['zscore'])} zscore points")
         
         return results
         
     except Exception as e:
-        logger.error(f"Error calculating rolling stats for {window_days}d window: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        log.error(f"Error calculating rolling stats for {window_days}d window: {e}")
+        log.error(f"Traceback: {traceback.format_exc()}")
         return None
 
 def calculate_hurst_exponent(spread_series):
@@ -417,7 +418,7 @@ def calculate_hurst_exponent(spread_series):
         return hurst
         
     except Exception as e:
-        logger.warning(f"Error calculating Hurst exponent: {e}")
+        log.warning(f"Error calculating Hurst exponent: {e}")
         return np.nan
 
 def calculate_variance_ratio(spread_series, k=2):
@@ -460,13 +461,13 @@ def calculate_variance_ratio(spread_series, k=2):
         return vr
         
     except Exception as e:
-        logger.warning(f"Error calculating variance ratio: {e}")
+        log.warning(f"Error calculating variance ratio: {e}")
         return np.nan
 
 def calculate_advanced_spread_metrics(df: pd.DataFrame, window_days: int) -> dict:
     """Calculate advanced spread metrics"""
     try:
-        logger.info(f"Calculating advanced metrics for {window_days}-day window...")
+        log.info(f"Calculating advanced metrics for {window_days}-day window...")
         
         window_minutes = window_days * 24 * 60
         
@@ -533,13 +534,13 @@ def calculate_advanced_spread_metrics(df: pd.DataFrame, window_days: int) -> dic
         return metrics
         
     except Exception as e:
-        logger.error(f"Error calculating advanced spread metrics: {e}")
+        log.error(f"Error calculating advanced spread metrics: {e}")
         return {}
 
 def create_overview_figure(df: pd.DataFrame, comprehensive_stats: dict, symbol1: str, symbol2: str, output_path: str):
     """Create comprehensive overview figure - OHLCV VERSION"""
     try:
-        logger.info(f"Creating overview figure for {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV)")
+        log.info(f"Creating overview figure for {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV)")
         
         # Create figure with subplots
         fig = plt.figure(figsize=(20, 16))
@@ -679,20 +680,20 @@ def create_overview_figure(df: pd.DataFrame, comprehensive_stats: dict, symbol1:
         plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
         plt.close()
         
-        logger.info(f"Overview figure saved: {output_path}")
+        log.info(f"Overview figure saved: {output_path}")
         
     except Exception as e:
-        logger.error(f"Error creating overview figure: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        log.error(f"Error creating overview figure: {e}")
+        log.error(f"Traceback: {traceback.format_exc()}")
 
 def create_window_figure(df: pd.DataFrame, rolling_data: dict, window_days: int, 
                        symbol1: str, symbol2: str, output_path: str):
     """Create figure for specific rolling window analysis"""
     try:
-        logger.info(f"Creating {window_days}-day window figure for {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV)")
+        log.info(f"Creating {window_days}-day window figure for {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV)")
         
         if not rolling_data or len(rolling_data.get('correlation', [])) == 0:
-            logger.warning(f"No data available for {window_days}-day window figure")
+            log.warning(f"No data available for {window_days}-day window figure")
             return
         
         # Create figure
@@ -774,22 +775,22 @@ def create_window_figure(df: pd.DataFrame, rolling_data: dict, window_days: int,
         plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
         plt.close()
         
-        logger.info(f"{window_days}-day window figure saved: {output_path}")
+        log.info(f"{window_days}-day window figure saved: {output_path}")
         
     except Exception as e:
-        logger.error(f"Error creating window figure: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        log.error(f"Error creating window figure: {e}")
+        log.error(f"Traceback: {traceback.format_exc()}")
 
 def create_comparison_figure(all_rolling_data: dict, symbol1: str, symbol2: str, output_path: str):
     """Create comparison figure across all windows"""
     try:
-        logger.info(f"Creating comparison figure for all windows: {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV)")
+        log.info(f"Creating comparison figure for all windows: {symbol1.split('_')[-2]} vs {symbol2.split('_')[-2]} (OHLCV)")
         
         # Filter valid data
         valid_windows = {k: v for k, v in all_rolling_data.items() if v is not None and len(v.get('correlation', [])) > 0}
         
         if not valid_windows:
-            logger.warning("No valid rolling data for comparison figure")
+            log.warning("No valid rolling data for comparison figure")
             return
         
         # Create figure
@@ -887,22 +888,22 @@ def create_comparison_figure(all_rolling_data: dict, symbol1: str, symbol2: str,
         plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
         plt.close()
         
-        logger.info(f"Comparison figure saved: {output_path}")
+        log.info(f"Comparison figure saved: {output_path}")
         
     except Exception as e:
-        logger.error(f"Error creating comparison figure: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        log.error(f"Error creating comparison figure: {e}")
+        log.error(f"Traceback: {traceback.format_exc()}")
 
 def create_advanced_metrics_table(all_rolling_data: dict, s1: str, s2: str, output_dir: str):
     """Create advanced metrics comparison table"""
     try:
-        logger.info(f"Creating advanced metrics table for {s1.split('_')[-2]} vs {s2.split('_')[-2]} (OHLCV)")
+        log.info(f"Creating advanced metrics table for {s1.split('_')[-2]} vs {s2.split('_')[-2]} (OHLCV)")
         
         # Filter valid data
         valid_data = {k: v for k, v in all_rolling_data.items() if v is not None}
         
         if not valid_data:
-            logger.warning("No valid rolling data for advanced metrics table")
+            log.warning("No valid rolling data for advanced metrics table")
             return None
         
         # Create figure
@@ -951,7 +952,7 @@ def create_advanced_metrics_table(all_rolling_data: dict, s1: str, s2: str, outp
                         row.append("N/A")
                 except Exception as e:
                     row.append("ERROR")
-                    logger.warning(f"Error processing {metric} for {window}d window: {e}")
+                    log.warning(f"Error processing {metric} for {window}d window: {e}")
             table_data.append(row)
         
         # Create headers
@@ -1021,18 +1022,18 @@ def create_advanced_metrics_table(all_rolling_data: dict, s1: str, s2: str, outp
         plt.savefig(filepath, dpi=300, bbox_inches='tight', facecolor='white')
         plt.close()
         
-        logger.info(f"Advanced metrics table saved: {filepath}")
+        log.info(f"Advanced metrics table saved: {filepath}")
         return filepath
         
     except Exception as e:
-        logger.error(f"Error creating advanced metrics table: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        log.error(f"Error creating advanced metrics table: {e}")
+        log.error(f"Traceback: {traceback.format_exc()}")
         return None
 
 def create_complete_analysis(symbol1: str, symbol2: str) -> dict:
     """Create complete pair analysis with all metrics and visualizations using OHLCV data"""
     try:
-        logger.info(f"Creating complete OHLCV analysis for {symbol1} / {symbol2}")
+        log.info(f"Creating complete OHLCV analysis for {symbol1} / {symbol2}")
         
         # Create directory structure
         s1_short = symbol1.split('_')[-2]
@@ -1041,28 +1042,28 @@ def create_complete_analysis(symbol1: str, symbol2: str) -> dict:
         directories = create_analysis_directories(base_dir)
         
         # Load OHLCV data
-        logger.info("Loading OHLCV close price data...")
+        log.info("Loading OHLCV close price data...")
         df1 = load_ohlcv_data(symbol1)
         df2 = load_ohlcv_data(symbol2)
         
         if df1.empty or df2.empty:
-            logger.error("Failed to load OHLCV data for one or both symbols")
+            log.error("Failed to load OHLCV data for one or both symbols")
             return {}
         
-        logger.info(f"OHLCV data loaded: {s1_short}={len(df1):,}, {s2_short}={len(df2):,}")
+        log.info(f"OHLCV data loaded: {s1_short}={len(df1):,}, {s2_short}={len(df2):,}")
         
         # Align data
         aligned_df = create_minute_alignment_optimized(df1, df2, symbol1, symbol2)
         
         if aligned_df.empty:
-            logger.error("Failed to align OHLCV data")
+            log.error("Failed to align OHLCV data")
             return {}
         
         # Calculate comprehensive statistics
         comprehensive_stats = calculate_comprehensive_stats(aligned_df, symbol1, symbol2)
         
         if not comprehensive_stats:
-            logger.error("Failed to calculate comprehensive statistics")
+            log.error("Failed to calculate comprehensive statistics")
             return {}
         
         # Create overview figure
@@ -1070,12 +1071,12 @@ def create_complete_analysis(symbol1: str, symbol2: str) -> dict:
         create_overview_figure(aligned_df, comprehensive_stats, symbol1, symbol2, overview_path)
         
         # Calculate rolling statistics for different windows - usar ventanas más pequeñas
-        logger.info("Calculating rolling statistics with advanced metrics for all windows...")
+        log.info("Calculating rolling statistics with advanced metrics for all windows...")
         windows = [1, 3, 7, 15, 30]  # Ventanas más pequeñas para OHLCV
         all_rolling_data = {}
         
         for window in windows:
-            logger.info(f"  Processing {window}-day window with advanced analysis...")
+            log.info(f"  Processing {window}-day window with advanced analysis...")
             
             # Calculate rolling stats
             rolling_stats = calculate_rolling_stats(aligned_df, window, symbol1, symbol2)
@@ -1092,7 +1093,7 @@ def create_complete_analysis(symbol1: str, symbol2: str) -> dict:
                 window_path = os.path.join(directories['windows'], f'{window}d', f"rolling_ohlcv_{window}d_{s1_short}_{s2_short}.png")
                 create_window_figure(aligned_df, rolling_stats, window, symbol1, symbol2, window_path)
             else:
-                logger.warning(f"No data available for {window}-day window")
+                log.warning(f"No data available for {window}-day window")
                 all_rolling_data[window] = None
         
         # Create comparison figure
@@ -1116,15 +1117,15 @@ def create_complete_analysis(symbol1: str, symbol2: str) -> dict:
             }
         }
         
-        logger.info(f"✅ Complete OHLCV analysis finished for {s1_short} vs {s2_short}")
-        logger.info(f"📊 Generated {len([f for f in results['files'].values() if f])} main files")
-        logger.info(f"📁 Output directory: {base_dir}")
+        log.info(f"✅ Complete OHLCV analysis finished for {s1_short} vs {s2_short}")
+        log.info(f"📊 Generated {len([f for f in results['files'].values() if f])} main files")
+        log.info(f"📁 Output directory: {base_dir}")
         
         return results
         
     except Exception as e:
-        logger.error(f"Error in complete OHLCV analysis: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        log.error(f"Error in complete OHLCV analysis: {e}")
+        log.error(f"Traceback: {traceback.format_exc()}")
         return {}
 
 def main():
@@ -1138,20 +1139,20 @@ def main():
         args = parser.parse_args()
         
         # Log analysis start
-        logger.info("🔬 Starting ADVANCED STATISTICAL Pair Analysis (OHLCV)")
-        logger.info(f"Symbols: {args.symbol1} / {args.symbol2}")
-        logger.info("Data Source: OHLCV Close Prices")
-        logger.info("Rolling Windows: 1, 3, 7, 15, 30 days")
+        log.info("🔬 Starting ADVANCED STATISTICAL Pair Analysis (OHLCV)")
+        log.info(f"Symbols: {args.symbol1} / {args.symbol2}")
+        log.info("Data Source: OHLCV Close Prices")
+        log.info("Rolling Windows: 1, 3, 7, 15, 30 days")
         
         if ADVANCED_STATS:
-            logger.info("Advanced Tests: ADF, PP, KPSS, Engle-Granger, Johansen")
-        logger.info("Trading Metrics: Hurst, Half-life, Variance Ratio, etc.")
+            log.info("Advanced Tests: ADF, PP, KPSS, Engle-Granger, Johansen")
+        log.info("Trading Metrics: Hurst, Half-life, Variance Ratio, etc.")
         
         # Run complete analysis
         results = create_complete_analysis(args.symbol1, args.symbol2)
         
         if results:
-            logger.info("🎉 OHLCV Analysis completed successfully!")
+            log.info("🎉 OHLCV Analysis completed successfully!")
             
             # Print summary
             stats = results['comprehensive_stats']
@@ -1171,17 +1172,17 @@ def main():
             print(f"="*60)
             
         else:
-            logger.error("❌ OHLCV Analysis failed - no results generated")
+            log.error("❌ OHLCV Analysis failed - no results generated")
             return 1
             
         return 0
         
     except KeyboardInterrupt:
-        logger.info("Analysis interrupted by user")
+        log.info("Analysis interrupted by user")
         return 1
     except Exception as e:
-        logger.error(f"❌ OHLCV Analysis failed: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        log.error(f"❌ OHLCV Analysis failed: {e}")
+        log.error(f"Traceback: {traceback.format_exc()}")
         return 1
 
 if __name__ == "__main__":

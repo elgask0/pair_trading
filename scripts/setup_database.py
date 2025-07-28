@@ -19,9 +19,8 @@ from src.database.migrations import (
 )
 from src.database.models import Symbol, PairConfiguration
 from config.settings import settings
-from src.utils.logger import get_setup_logger
-
-log = get_setup_logger()
+from src.utils.logger import get_logger
+log = get_logger()
 
 def setup_symbols():
     """Initialize symbols table with trading pairs"""

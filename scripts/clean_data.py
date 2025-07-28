@@ -17,10 +17,10 @@ from typing import Dict, List
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.database.connection import db_manager
 from src.database.migrations import add_data_quality_columns, check_data_quality_schema
-from src.utils.logger import get_validation_logger
 from config.settings import settings
 
-log = get_validation_logger()
+from src.utils.logger import get_logger
+log = get_logger()
 
 def ensure_data_quality_schema():
     """Ensure data quality columns exist"""

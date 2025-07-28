@@ -11,9 +11,8 @@ import subprocess
 from pathlib import Path
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.utils.logger import get_setup_logger
-
-log = get_setup_logger()
+from src.utils.logger import get_logger
+log = get_logger()
 
 def run_script(script_path, args: list = None) -> bool:
     """Ejecutar un script y retornar si fue exitoso"""
