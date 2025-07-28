@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Enhanced liquidity analysis script - IMPROVED VERSION
+Enhanced liquidity analysis script - IMPROVED VERSION WITH DATABASE SYMBOL SOURCING
 Analyzes market liquidity using ALL available orderbook data with comprehensive slippage analysis
+UPDATED: Uses database (symbol_info table) instead of YAML for symbol sourcing
 """
 
 import sys
@@ -347,7 +348,7 @@ def plot_slippage_boxplots(ax, analysis_results: Dict, side: str, metric: str):
             labels.append(f'${size}')
     
     if slippage_data:
-        bp = ax.boxplot(slippage_data, labels=labels, patch_artist=True, showfliers=False)
+        bp = ax.boxplot(slippage_data, tick_labels=labels, patch_artist=True, showfliers=False)
         
         # Color the boxes
         colors = ['lightblue' if side == 'buy' else 'lightcoral' for _ in bp['boxes']]
@@ -674,83 +675,127 @@ def generate_enhanced_report(symbol: str, analysis_results: Dict):
                     log.warning(f"    ⚠️ Significant bias toward {bias} side")
 
 def main():
-   """Main enhanced analysis function"""
-   import argparse
-   
-   parser = argparse.ArgumentParser(description="Enhanced liquidity analysis with comprehensive slippage metrics")
-   parser.add_argument("--symbol", type=str, help="Specific symbol to analyze")
-   parser.add_argument("--max-records", type=int, default=100000, help="Maximum records to analyze (default: 100k)")
-   parser.add_argument("--no-plots", action="store_true", help="Skip plot generation")
-   
-   args = parser.parse_args()
-   
-   log.info("Starting enhanced liquidity analysis...")
-   
-   # Get symbols to analyze
-   if args.symbol:
-       symbols = [args.symbol]
-   else:
-       try:
-           active_pairs = settings.get_active_pairs()
-           symbols = []
-           for pair in active_pairs:
-               symbols.extend([pair.symbol1, pair.symbol2])
-           symbols = list(set(symbols))
-       except Exception as e:
-           log.error(f"Could not load symbols from config: {e}")
-           symbols = ['MEXCFTS_PERP_GIGA_USDT', 'MEXCFTS_PERP_SPX_USDT']
-   
-   if not symbols:
-       log.error("No symbols to analyze")
-       return False
-   
-   log.info(f"Analyzing enhanced liquidity for {len(symbols)} symbols")
-   
-   # Create plots directory
-   plots_dir = Path("plots")
-   plots_dir.mkdir(exist_ok=True)
-   
-   try:
-       for symbol in symbols:
-           log.info(f"\n{'='*80}")
-           log.info(f"ENHANCED ANALYSIS: {symbol}")
-           log.info(f"{'='*80}")
-           
-           # Load ALL available data
-           orderbook_df = load_all_orderbook_data(symbol, args.max_records)
-           
-           if len(orderbook_df) == 0:
-               log.warning(f"No orderbook data for {symbol}")
-               continue
-           
-           # Enhanced slippage analysis
-           analysis_results = analyze_comprehensive_slippage(symbol, orderbook_df)
-           
-           # Generate enhanced visualizations
-           if not args.no_plots:
-               create_enhanced_visualization(symbol, analysis_results)
-           
-           # Generate enhanced report
-           generate_enhanced_report(symbol, analysis_results)
-       
-       log.info(f"\n🎉 Enhanced liquidity analysis completed!")
-       log.info(f"Key improvements:")
-       log.info(f"  ✅ Analyzed ALL available data (not just 7 days)")
-       log.info(f"  ✅ Box plots show slippage distributions")
-       log.info(f"  ✅ Bidirectional analysis (buy vs sell)")
-       log.info(f"  ✅ Extended order sizes (100-10000 USD)")
-       log.info(f"  ✅ Comprehensive quality grading")
-       log.info(f"  ✅ Market structure insights")
-       log.info(f"Check plots/ directory for enhanced visualizations")
-       
-       return True
-       
-   except Exception as e:
-       log.error(f"Enhanced liquidity analysis failed: {e}")
-       import traceback
-       log.error(traceback.format_exc())
-       return False
+    """Main enhanced analysis function - UPDATED WITH DATABASE SYMBOL SOURCING"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Enhanced liquidity analysis with comprehensive slippage metrics")
+    parser.add_argument("--symbol", type=str, help="Specific symbol to analyze")
+    parser.add_argument("--max-records", type=int, default=100000, help="Maximum records to analyze (default: 100k)")
+    parser.add_argument("--no-plots", action="store_true", help="Skip plot generation")
+    
+    args = parser.parse_args()
+    
+    log.info("Starting enhanced liquidity analysis...")
+    
+    # UPDATED: Get symbols from database (same logic as ingest_data.py)
+    if args.symbol:
+        symbols = [args.symbol]
+        log.info(f"Analyzing specific symbol: {args.symbol}")
+    else:
+        log.info("🔍 Getting symbols from database...")
+        
+        # Try to get active symbols from database first
+        symbols = settings.get_active_symbols_from_db()
+        
+        if symbols:
+            log.info(f"✅ Found {len(symbols)} active symbols in database")
+        else:
+            # Fallback: get all symbols from database
+            log.info("⚠️ No active symbols found, trying all symbols in database...")
+            symbols = settings.get_symbols_from_db()
+            
+            if symbols:
+                log.info(f"✅ Found {len(symbols)} total symbols in database")
+            else:
+                # Final fallback: use YAML (for cases where DB is not populated yet)
+                log.warning("⚠️ No symbols found in database, falling back to YAML configuration...")
+                try:
+                    active_pairs = settings.get_active_pairs()
+                    symbols = list(set([pair.symbol1 for pair in active_pairs] + [pair.symbol2 for pair in active_pairs]))
+                    log.info(f"✅ Found {len(symbols)} symbols from YAML configuration")
+                except Exception as yaml_error:
+                    log.error(f"Failed to load symbols from YAML: {yaml_error}")
+                    # Ultimate fallback
+                    symbols = ['MEXCFTS_PERP_GIGA_USDT', 'MEXCFTS_PERP_SPX_USDT']
+                    log.warning(f"Using default symbols: {symbols}")
+    
+    # Log data source
+    if args.symbol:
+        log.info(f"📋 Data source: Manual symbol specification")
+    elif settings.get_active_symbols_from_db():
+        log.info(f"📋 Data source: Database (active symbols from active pairs)")
+    elif settings.get_symbols_from_db():
+        log.info(f"📋 Data source: Database (all available symbols)")
+    else:
+        log.info(f"📋 Data source: YAML configuration (fallback)")
+    
+    if not symbols:
+        log.error("No symbols to analyze")
+        return False
+    
+    log.info(f"Analyzing enhanced liquidity for {len(symbols)} symbols")
+    
+    # Display symbol names nicely
+    symbol_names = []
+    for s in symbols:
+        if '_' in s:
+            # Extract meaningful part (e.g., MEXCFTS_PERP_GIGA_USDT -> GIGA)
+            parts = s.split('_')
+            if len(parts) >= 3:
+                symbol_names.append(parts[-2])  # Get GIGA from MEXCFTS_PERP_GIGA_USDT
+            else:
+                symbol_names.append(s)
+        else:
+            symbol_names.append(s)
+    
+    log.info(f"📊 Processing symbols: {symbol_names}")
+    
+    # Create plots directory
+    plots_dir = Path("plots")
+    plots_dir.mkdir(exist_ok=True)
+    
+    try:
+        for symbol in symbols:
+            log.info(f"\n{'='*80}")
+            log.info(f"ENHANCED ANALYSIS: {symbol}")
+            log.info(f"{'='*80}")
+            
+            # Load ALL available data
+            orderbook_df = load_all_orderbook_data(symbol, args.max_records)
+            
+            if len(orderbook_df) == 0:
+                log.warning(f"No orderbook data for {symbol}")
+                continue
+            
+            # Enhanced slippage analysis
+            analysis_results = analyze_comprehensive_slippage(symbol, orderbook_df)
+            
+            # Generate enhanced visualizations
+            if not args.no_plots:
+                create_enhanced_visualization(symbol, analysis_results)
+            
+            # Generate enhanced report
+            generate_enhanced_report(symbol, analysis_results)
+        
+        log.info(f"\n🎉 Enhanced liquidity analysis completed!")
+        log.info(f"Key improvements:")
+        log.info(f"  ✅ Analyzed ALL available data (not just 7 days)")
+        log.info(f"  ✅ Box plots show slippage distributions")
+        log.info(f"  ✅ Bidirectional analysis (buy vs sell)")
+        log.info(f"  ✅ Extended order sizes (100-10000 USD)")
+        log.info(f"  ✅ Comprehensive quality grading")
+        log.info(f"  ✅ Market structure insights")
+        log.info(f"  ✅ Uses database for symbol sourcing")
+        log.info(f"Check plots/ directory for enhanced visualizations")
+        
+        return True
+        
+    except Exception as e:
+        log.error(f"Enhanced liquidity analysis failed: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+        return False
 
 if __name__ == "__main__":
-   success = main()
-   sys.exit(0 if success else 1)
+    success = main()
+    sys.exit(0 if success else 1)
