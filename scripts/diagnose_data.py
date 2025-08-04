@@ -29,7 +29,7 @@ from src.data.ingestion import data_ingestion
 from config.settings import settings
 
 from src.utils.logger import get_logger
-log = get_logger()
+log = get_logger("diagnose_data")
 
 class EnhancedDataDiagnosis:
     """Diagnóstico completo con verificación de API y surgical repair - COMPLETE"""
