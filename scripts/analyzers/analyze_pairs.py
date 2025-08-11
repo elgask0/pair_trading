@@ -52,12 +52,12 @@ plt.rcParams['figure.dpi'] = 100
 def timer(description: str):
     """Context manager for timing operations"""
     start_time = time.time()
-    log.info(f"⏳ {description}...")
+    log.info(f"[START] {description}")
     try:
         yield
     finally:
         elapsed = time.time() - start_time
-        log.info(f"✅ {description} completed in {elapsed:.2f}s")
+        log.info(f"[END] {description} | elapsed={elapsed:.2f}s")
 
 # ========== CONFIGURATION ==========
 DEFAULT_WINDOWS = [3, 5, 7, 10, 15, 20, 30]  # Extended windows
@@ -68,7 +68,7 @@ Z_STOP_THRESHOLD = 4.0
 
 @dataclass
 class TrafficLightThresholds:
-    """SUPER RELAXED thresholds for high-volatility memecoins"""
+    """Thresholds (pre-reviewed)"""
     # Beta stability
     beta_blue: float = 0.05      
     beta_green: float = 0.20     
@@ -143,7 +143,7 @@ def adf_gls_test(series: pd.Series) -> Tuple[float, float]:
         return result[0], result[1]
 
 def johansen_cointegration_test(price1: pd.Series, price2: pd.Series) -> Dict:
-    """IMPROVED: Johansen cointegration test with realistic thresholds for memecoins"""
+    """Johansen cointegration test"""
     try:
         from statsmodels.tsa.vector_ar.vecm import coint_johansen
         
@@ -180,7 +180,7 @@ def johansen_cointegration_test(price1: pd.Series, price2: pd.Series) -> Dict:
             trace_crit_1pct = 16.0   # Reduced from 20.262
             eigen_crit_5pct = 11.0   # Reduced from 14.265  
             eigen_crit_1pct = 15.0   # Reduced from 18.520
-            log.warning(f"      Using relaxed critical values for memecoin cointegration")
+            log.warning("[COINTEGRATION] using fallback critical values (library criticals unavailable)")
         
         # IMPROVED: More nuanced cointegration strength assessment
         trace_stat = float(result.lr1[0])
@@ -334,7 +334,7 @@ def resample_data(df: pd.DataFrame, resample_minutes: int) -> pd.DataFrame:
     if resample_minutes <= 1:
         return df
     
-    log.info(f"    Resampling from 1min to {resample_minutes}min...")
+    log.info(f"[RESAMPLE] from=1min to={resample_minutes}min")
     
     resample_rule = f'{resample_minutes}min'
     
@@ -351,7 +351,7 @@ def resample_data(df: pd.DataFrame, resample_minutes: int) -> pd.DataFrame:
     resampled['log_returns'] = np.log(resampled['close'] / resampled['close'].shift(1))
     resampled['log_close'] = np.log(resampled['close'])
     
-    log.info(f"    Resampled: {len(df)} -> {len(resampled)} records")
+    log.info(f"[RESAMPLE] in={len(df)} out={len(resampled)}")
     
     return resampled
 
@@ -522,7 +522,7 @@ class DualPeriodPairAnalyzer:
     
     def load_ohlcv_data(self, symbol: str) -> pd.DataFrame:
         """Load and resample OHLCV data for a symbol"""
-        log.info(f"  Loading data for {symbol}...")
+        log.info(f"[DATA] load symbol={symbol} days={self.days} resample={self.resample_minutes}min")
         
         cutoff = datetime.utcnow() - timedelta(days=self.days)
         
@@ -541,8 +541,8 @@ class DualPeriodPairAnalyzer:
                 log.warning(f"  No data found for {symbol}")
                 return pd.DataFrame()
             
-            log.info(f"    Period: {result.min_ts} to {result.max_ts}")
-            log.info(f"    Records: {result.total_records:,}")
+            log.info(f"[DATA] available_period start={result.min_ts} end={result.max_ts}")
+            log.info(f"[DATA] records={result.total_records:,}")
             
             query = text("""
                 SELECT 
@@ -567,7 +567,7 @@ class DualPeriodPairAnalyzer:
                 df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
                 df['log_close'] = np.log(df['close'])
             
-            log.info(f"    Final records: {len(df):,}")
+            log.info(f"[DATA] final_records={len(df):,} | freq={self.resample_minutes}min")
             
             return df
     
@@ -579,7 +579,7 @@ class DualPeriodPairAnalyzer:
         common_index = self.df1.index.intersection(self.df2.index)
         
         if len(common_index) < MIN_OBSERVATIONS:
-            log.error(f"  Insufficient common data: {len(common_index)}")
+            log.error(f"[ALIGN] insufficient_common n={len(common_index)} min_required={MIN_OBSERVATIONS} symbols={self.symbol1_short},{self.symbol2_short}")
             return False
         
         # Full period data
@@ -606,14 +606,14 @@ class DualPeriodPairAnalyzer:
         self.results.period_3m_start = self.aligned_data_3m.index[0] if len(self.aligned_data_3m) > 0 else cutoff_3m
         self.results.period_3m_observations = len(self.aligned_data_3m)
         
-        log.info(f"  Aligned full period: {len(self.aligned_data):,} timestamps")
-        log.info(f"  Aligned 3-month period: {len(self.aligned_data_3m):,} timestamps")
+        log.info(f"[ALIGN] full n={len(self.aligned_data):,} start={self.aligned_data.index[0]} end={self.aligned_data.index[-1]}")
+        log.info(f"[ALIGN] 3m n={len(self.aligned_data_3m):,} start={self.aligned_data_3m.index[0] if len(self.aligned_data_3m)>0 else 'n/a'} end={self.aligned_data.index[-1]}")
         
         return True
     
     def run_cointegration_analysis(self):
         """Run Johansen cointegration test"""
-        log.info(f"    Running cointegration analysis...")
+        log.info(f"[COINTEGRATION] start | pair={self.pair_name} | n={len(self.aligned_data)} | from={self.results.data_start:%Y-%m-%d} to={self.results.data_end:%Y-%m-%d}")
         
         log_price1 = self.aligned_data[f'{self.symbol1_short}_log_close']
         log_price2 = self.aligned_data[f'{self.symbol2_short}_log_close']
@@ -622,15 +622,13 @@ class DualPeriodPairAnalyzer:
         
         if 'error' not in self.results.cointegration_results:
             coint = self.results.cointegration_results
-            log.info(f"      Cointegration: {coint['cointegration_strength']} "
-                    f"(Trace: {coint['trace_stat']:.3f} vs Crit: {coint['trace_crit_5pct']:.3f})")
-            log.info(f"      Trace Ratio: {coint.get('trace_ratio', 0):.2f} (>0.4 = acceptable for memecoins)")
+            log.info(f"[COINTEGRATION] strength={coint['cointegration_strength']} trace={coint['trace_stat']:.3f} crit5={coint['trace_crit_5pct']:.3f} eigen={coint['eigen_stat']:.3f} eigen_crit5={coint['eigen_crit_5pct']:.3f} trace_ratio={coint.get('trace_ratio', 0):.2f}")
         else:
-            log.warning(f"      Cointegration test failed: {self.results.cointegration_results['error']}")
+            log.warning(f"[COINTEGRATION] failed | error={self.results.cointegration_results['error']}")
     
     def analyze_window(self, window_days: int, data: pd.DataFrame, period_type: str) -> WindowMetrics:
         """Enhanced window analysis with signal quality metrics"""
-        log.info(f"    Analyzing {window_days}d window for {period_type} period...")
+        log.info(f"[WINDOW] start window_days={window_days} period={period_type} periods={window_days * 24 * 60 // self.resample_minutes} freq={self.resample_minutes}min")
         
         metrics = WindowMetrics(window_days=window_days, period_type=period_type)
         window_periods = window_days * 24 * 60 // self.resample_minutes
@@ -652,14 +650,14 @@ class DualPeriodPairAnalyzer:
         metrics.r_squared = res.rsquared.dropna()
         
         if len(metrics.beta) < MIN_OBSERVATIONS:
-            log.warning(f"      Insufficient data after rolling window for {window_days}d")
+            log.warning(f"[WINDOW] insufficient_after_rolling window_days={window_days} period={period_type} have={len(metrics.beta)} need>={MIN_OBSERVATIONS}")
             return metrics
         
         # Calculate spread
         common_index = metrics.alpha.index.intersection(metrics.beta.index).intersection(log_price1.index).intersection(log_price2.index)
         
         if len(common_index) < MIN_OBSERVATIONS:
-            log.warning(f"      Insufficient aligned data for spread calculation for {window_days}d")
+            log.warning(f"[WINDOW] insufficient_for_spread window_days={window_days} period={period_type} aligned={len(common_index)} need>={MIN_OBSERVATIONS}")
             return metrics
         
         aligned_alpha = metrics.alpha.loc[common_index]
@@ -714,7 +712,7 @@ class DualPeriodPairAnalyzer:
             metrics.kpss_statistic = kpss_result[0]
             metrics.kpss_pvalue = kpss_result[1]
         except Exception as e:
-            log.warning(f"      KPSS test failed for {window_days}d: {e}")
+            log.warning(f"[STATS] kpss_failed window_days={window_days} period={period_type} err={e}")
         
         # ===== 3. MEAN REVERSION METRICS =====
         # Traditional half-life (OLS method)
@@ -741,7 +739,7 @@ class DualPeriodPairAnalyzer:
             ).dropna()
             metrics.corr_spearman_mean = metrics.correlation_spearman.mean()
         except Exception as e:
-            log.warning(f"      Spearman correlation failed for {window_days}d: {e}")
+            log.warning(f"[STATS] spearman_failed window_days={window_days} period={period_type} err={e}")
             metrics.corr_spearman_mean = np.nan
         
         # ===== 5. ENHANCED AUTOCORRELATION ANALYSIS =====
@@ -771,14 +769,14 @@ class DualPeriodPairAnalyzer:
                     log.debug(f"      Ljung-Box: stat={metrics.ljung_box_statistic:.4f}, p-val={metrics.ljung_box_pvalue:.4f}")
                     
                 except Exception as e:
-                    log.warning(f"      Ljung-Box test failed for {window_days}d: {type(e).__name__}: {str(e)}")
+                    log.warning(f"[STATS] ljung_box_failed window_days={window_days} period={period_type} err={type(e).__name__}: {str(e)}")
                     metrics.ljung_box_pvalue = np.nan
                     metrics.ljung_box_statistic = np.nan
             else:
-                log.warning(f"      Insufficient data for Ljung-Box test: {len(metrics.spread.dropna())} observations")
+                log.warning(f"[STATS] ljung_box_insufficient n={len(metrics.spread.dropna())}")
                 
         except Exception as e:
-            log.warning(f"      Autocorrelation analysis failed for {window_days}d: {e}")
+            log.warning(f"[STATS] acf_failed window_days={window_days} period={period_type} err={e}")
         
         # ===== 6. TRADING ZONES ANALYSIS =====
         if len(metrics.zscore.dropna()) > 0:
@@ -1035,11 +1033,11 @@ class DualPeriodPairAnalyzer:
             
             if not coint.get('cointegrated_5pct', False):
                 if coint.get('cointegrated_relaxed', False):  # NEW: Check relaxed threshold
-                    warnings.append(f"📊 Moderate cointegration detected (Ratio: {trace_ratio:.2f}, acceptable for memecoins)")
+                    warnings.append(f"Moderate cointegration detected (trace_ratio={trace_ratio:.2f})")
                 else:
-                    warnings.append(f"📊 Weak cointegration (Ratio: {trace_ratio:.2f} < 0.4 threshold)")
+                    warnings.append(f"Weak cointegration (trace_ratio={trace_ratio:.2f} < 0.4)")
         else:
-            warnings.append(f"🔧 Cointegration test needs attention: {self.results.cointegration_results['error']}")
+            warnings.append(f"Cointegration test needs attention: {self.results.cointegration_results['error']}")
         
         # KPSS Warnings (more nuanced)
         kpss_red_count = 0
@@ -1048,9 +1046,9 @@ class DualPeriodPairAnalyzer:
                 kpss_red_count += 1
         
         if kpss_red_count == len(self.results.full_period_metrics):
-            warnings.append(f"⚠️  All windows show non-stationarity (KPSS < {thresholds.kpss_yellow}). Normal for high-volatility memecoins.")
+            warnings.append(f"All windows show non-stationarity (KPSS < {thresholds.kpss_yellow}).")
         elif kpss_red_count > len(self.results.full_period_metrics) // 2:
-            warnings.append(f"⚠️  {kpss_red_count}/{len(self.results.full_period_metrics)} windows have stationarity concerns")
+            warnings.append(f"{kpss_red_count}/{len(self.results.full_period_metrics)} windows have stationarity concerns")
         
         # Signal Quality Warnings (more targeted)
         low_quality_windows = []
@@ -1062,39 +1060,36 @@ class DualPeriodPairAnalyzer:
                     low_quality_windows.append(f"{window}d")
         
         if low_quality_windows:
-            warnings.append(f"📡 Signal quality concerns: {', '.join(low_quality_windows)} windows")
+            warnings.append(f"Signal quality concerns: {', '.join(low_quality_windows)} windows")
         
         # Data Quality Warnings
         if self.results.period_3m_observations < 1000:
-            warnings.append(f"📅 Limited recent data: {self.results.period_3m_observations:,} 3M observations")
+            warnings.append(f"Limited recent data: {self.results.period_3m_observations:,} 3M observations")
         
         self.results.warnings = warnings
     
     def analyze_all_windows(self):
         """Enhanced analysis including cointegration and validation"""
-        log.info(f"\nAnalyzing pair: {self.pair_name}")
-        log.info(f"  Windows: {self.windows} days")
-        log.info(f"  Resample: {self.resample_minutes} min")
-        log.info(f"  Z-score method: {self.robust_zscore_method}")
+        log.info(f"[ANALYZE] pair={self.pair_name} windows={self.windows} resample={self.resample_minutes}min zscore_method={self.robust_zscore_method}")
         
         # Run cointegration analysis first
         with timer("Cointegration analysis"):
             self.run_cointegration_analysis()
         
         # Analyze full period
-        log.info(f"\n=== FULL PERIOD ANALYSIS ===")
+        log.info("[ANALYZE] phase=FULL")
         for window in self.windows:
             metrics = self.analyze_window(window, self.aligned_data, "FULL")
             self.results.full_period_metrics[window] = metrics
         
         # Analyze 3-month period
         if len(self.aligned_data_3m) >= MIN_OBSERVATIONS:
-            log.info(f"\n=== 3-MONTH PERIOD ANALYSIS ===")
+            log.info("[ANALYZE] phase=3M")
             for window in self.windows:
                 metrics = self.analyze_window(window, self.aligned_data_3m, "3M")
                 self.results.three_month_metrics[window] = metrics
         else:
-            log.warning("Insufficient data for 3-month analysis")
+            log.warning(f"[ANALYZE] 3M insufficient_data obs={len(self.aligned_data_3m)} min_required={MIN_OBSERVATIONS}")
         
         # Validate pair quality and generate warnings
         self.validate_pair_quality()
@@ -1116,7 +1111,7 @@ class DualPeriodPairAnalyzer:
         
         if best_window_full:
             self.results.best_full_window = best_window_full
-            log.info(f"Best full period window: {best_window_full}d (score: {best_score_full:.2f})")
+            log.info(f"[SELECT] best_full_window={best_window_full}d score={best_score_full:.2f}")
         
         # Best 3-month window
         best_score_3m = float('inf')
@@ -1129,7 +1124,7 @@ class DualPeriodPairAnalyzer:
         
         if best_window_3m:
             self.results.best_3m_window = best_window_3m
-            log.info(f"Best 3-month window: {best_window_3m}d (score: {best_score_3m:.2f})")
+            log.info(f"[SELECT] best_3m_window={best_window_3m}d score={best_score_3m:.2f}")
     
     def assess_overall_suitability(self):
         """Assess overall pair suitability for both periods"""
@@ -1167,7 +1162,7 @@ class DualPeriodPairAnalyzer:
     
     def create_comprehensive_visualization(self):
         """FIXED: Create enhanced visualization with proper layout spacing"""
-        log.info(f"\nCreating comprehensive dual-period visualization...")
+        log.info(f"[PLOT] start comprehensive_visualization pair={self.pair_name}")
         
         plots_dir = Path("plots") / "pair_analysis"
         plots_dir.mkdir(parents=True, exist_ok=True)
@@ -1242,7 +1237,7 @@ class DualPeriodPairAnalyzer:
                    facecolor='white', edgecolor='none')
         plt.close()
         
-        log.info(f"Enhanced visualization saved: plots/pair_analysis/{filename}")
+        log.info(f"[PLOT] saved path=plots/pair_analysis/{filename}")
     
     # ========== PLOTTING METHODS (IMPROVED) ==========
     
@@ -1524,7 +1519,7 @@ class DualPeriodPairAnalyzer:
             data = [
                 ['Johansen Trace', f"{coint['trace_stat']:.3f}", f"{coint['trace_crit_5pct']:.3f}", 
                  f"{trace_ratio:.2f}", coint['cointegration_strength']],
-                ['Relaxed Threshold', '0.40', '1.00', 
+                ['Custom Threshold', '0.40', '1.00', 
                  f"{trace_ratio:.2f}", 'Pass' if trace_ratio >= 0.4 else 'Fail']
             ]
             
@@ -1543,7 +1538,7 @@ class DualPeriodPairAnalyzer:
                 elif 'Moderate' in result or 'Weak-Moderate' in result:
                     result_cell.set_facecolor('lightyellow')
                 elif 'Weak' in result and trace_ratio >= 0.4:
-                    result_cell.set_facecolor('lightblue')  # Acceptable for memecoins
+                    result_cell.set_facecolor('lightblue')
                 else:
                     result_cell.set_facecolor('lightcoral')
             
@@ -1553,7 +1548,7 @@ class DualPeriodPairAnalyzer:
                 table[(0, j)].set_text_props(weight='bold', color='white', fontsize=7)
             
             # Add interpretation note
-            interpretation = f"Memecoin-Adjusted: {'✅ ACCEPTABLE' if trace_ratio >= 0.4 else '❌ WEAK'}"
+            interpretation = f"Threshold rule: {'ACCEPTABLE' if trace_ratio >= 0.4 else 'WEAK'}"
             ax.text(0.5, 0.15, interpretation, ha='center', va='center', 
                    transform=ax.transAxes, fontsize=10, weight='bold',
                    bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.8))
@@ -1563,7 +1558,7 @@ class DualPeriodPairAnalyzer:
                    ha='center', va='center', transform=ax.transAxes, fontsize=10,
                    bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.8))
         
-        ax.set_title('Cointegration Analysis\n(Memecoin-Adjusted)', fontweight='bold', fontsize=12, pad=20)
+        ax.set_title('Cointegration Analysis', fontweight='bold', fontsize=12, pad=20)
     
     def plot_signal_quality_dashboard(self, ax):
         """ENHANCED: Plot signal quality dashboard with time conversion (properly spaced)"""
@@ -1740,10 +1735,10 @@ class DualPeriodPairAnalyzer:
             coint = self.results.cointegration_results
             trace_ratio = coint.get('trace_ratio', 0)
             
-            summary_text += f"COINTEGRATION ANALYSIS (MEMECOIN-ADJUSTED):\n"
+            summary_text += f"COINTEGRATION ANALYSIS:\n"
             summary_text += f"  STATUS: {coint['cointegration_strength']} cointegration detected\n"
             summary_text += f"  Johansen Trace: {coint['trace_stat']:.3f} (Critical 5%: {coint['trace_crit_5pct']:.3f})\n"
-            summary_text += f"  Trace Ratio: {trace_ratio:.2f} ({'✅ ACCEPTABLE' if trace_ratio >= 0.4 else '❌ WEAK'} for memecoins)\n"
+            summary_text += f"  Trace Ratio: {trace_ratio:.2f} ({'ACCEPTABLE' if trace_ratio >= 0.4 else 'WEAK'})\n"
             summary_text += f"  Traditional Test: {'PASSED' if coint['cointegrated_5pct'] else 'FAILED'}\n"
             summary_text += f"  Relaxed Test: {'✅ PASSED' if coint.get('cointegrated_relaxed', False) else '❌ FAILED'} (Ratio ≥ 0.4)\n"
         else:
