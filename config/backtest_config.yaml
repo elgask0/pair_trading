@@ -8,51 +8,51 @@ symbol2: "MEXCFTS_PERP_POPCAT_USDT"
 
 # Backtest Period
 start_date: 2024-12-01
-end_date: 2025-08-09
+end_date: 2025-08-01
 
 # ===========================
 # CAPITAL & RISK MANAGEMENT
 # ===========================
 initial_capital: 10000
-position_size: 0.05  # 5% of capital per trade (conservative for testing)
-max_positions: 1     # Maximum simultaneous positions
+position_size: 0.1
+max_positions: 1
 
 # ===========================
 # EXECUTION CONFIGURATION
 # ===========================
 execution:
-  commission_bps: 2.0           # 0.02% - Exchange taker fee
-  use_orderbook: false           # Use real orderbook for dynamic slippage
-  fallback_slippage_bps: 10.0    # 0.05% - Used when orderbook data unavailable
-  max_participation_rate: 0.1   # Max 10% of volume per trade
+  commission_bps: 2.0
+  use_orderbook: false
+  fallback_slippage_bps: 0.01
+  max_participation_rate: 0.10
+  # Tolerancia temporal para casar vela con orderbook (en segundos):
+  # si lo omites, se usa la mitad de resample_minutes.
+  orderbook_time_tolerance_seconds: 450   # 7.5 min (para velas de 15m)
 
 # ===========================
 # DATA CONFIGURATION
 # ===========================
 data:
-  resample_minutes: 15  # 15-minute bars for smoother signals
+  resample_minutes: 15
 
 # ===========================
 # PAIRS STRATEGY PARAMETERS
 # ===========================
 strategy:
-  # Window Configuration (7 days, no rebalancing)
-  lookback_window: 7            # 7-day window for z-score calculation
-  hedge_ratio_window: 7         # Use same 7-day window for hedge ratio
-  rebalance_frequency: 999999   # Effectively never rebalance (set very high)
-  
-  # Entry/Exit Thresholds
-  entry_threshold: 1.75         # Enter when |z-score| > 1.75
-  exit_threshold: 0.25          # Exit when z-score crosses 0.25
-  stop_loss_threshold: 4.0      # Stop loss at |z-score| > 4.0
-  
-  # Quality Filters
-  min_correlation: 0.5          # Minimum correlation required
-  use_robust_zscore: true       # Use MAD-based robust z-score
-  
-  # Additional Parameters (optional)
-  signal_confirmation_bars: 0   # No confirmation needed (0 = immediate execution)
-  max_holding_periods: 0        # No maximum holding period (0 = unlimited)
+  # Ventanas EN DÍAS (no barras)
+  lookback_window: 7
+  hedge_ratio_window: 7
+  rebalance_frequency: "never"   # muy alto = no rebalancea
+
+  entry_threshold: 2
+  exit_threshold: 0.5
+  stop_loss_threshold: 4.0
+
+  min_correlation: 0.5
+  use_robust_zscore: true
+
+  signal_confirmation_bars: 0
+  max_holding_periods: 0
 
 # ===========================
 # LOGGING & OUTPUT
@@ -63,14 +63,3 @@ output:
   save_equity_curve: true
   generate_plots: true
   verbose: true
-
-# ===========================
-# NOTES
-# ===========================
-# This configuration uses:
-# - 7-day lookback window with NO rebalancing (fixed hedge ratio)
-# - Conservative 5% position sizing for testing
-# - Real orderbook data for accurate slippage calculation
-# - Entry at |z| > 1.75 (slightly relaxed for more signals)
-# - Exit at z crosses 0.25 (partial mean reversion)
-# - Stop loss at |z| > 4.0 (extreme moves)
