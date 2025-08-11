@@ -70,9 +70,9 @@ Z_STOP_THRESHOLD = 4.0
 class TrafficLightThresholds:
     """Thresholds (pre-reviewed)"""
     # Beta stability
-    beta_blue: float = 0.05      
-    beta_green: float = 0.20     
-    beta_yellow: float = 0.35    
+    beta_blue: float = 0.10      
+    beta_green: float = 0.30     
+    beta_yellow: float = 0.50    
     
     # R-squared
     r2_blue: float = 0.80        
@@ -143,83 +143,99 @@ def adf_gls_test(series: pd.Series) -> Tuple[float, float]:
         return result[0], result[1]
 
 def johansen_cointegration_test(price1: pd.Series, price2: pd.Series) -> Dict:
-    """Johansen cointegration test"""
+    """Johansen cointegration test with proper alignment and critical values.
+
+    - Aligns the two series on their common index and drops any remaining NaNs
+    - Automatically selects k_ar_diff using VAR.select_order (fallback to 1)
+    - Uses the correct statsmodels attributes for critical values across versions
+      (supports both legacy lr1/lr2,cvt/cvm and newer trace_stat/max_eig_stat APIs)
+    """
     try:
         from statsmodels.tsa.vector_ar.vecm import coint_johansen
-        
-        # Prepare data
-        data = np.column_stack([price1.dropna(), price2.dropna()])
-        
-        # Ensure we have enough data
-        if len(data) < 50:
-            return {'error': 'Insufficient data for cointegration test'}
-        
-        # Run Johansen test
-        result = coint_johansen(data, det_order=0, k_ar_diff=1)
-        
-        # IMPROVED: Handle different statsmodels versions with better fallback
+
+        # 1) Align by index to avoid misalignment from independent dropna()
+        df = pd.concat([price1.rename("p1"), price2.rename("p2")], axis=1).dropna()
+        if len(df) < 50:
+            return {"error": "Insufficient data for cointegration test"}
+
+        # 2) Choose number of lagged differences via VAR order selection
+        #    (k_ar in VAR corresponds to k_ar_diff in Johansen)
+        k_ar_diff = 1
         try:
-            # Try new format first (cvt and cve attributes)
-            if hasattr(result, 'cvt') and hasattr(result, 'cve'):
-                trace_crit_5pct = result.cvt[0, 1]
-                trace_crit_1pct = result.cvt[0, 2]
-                eigen_crit_5pct = result.cve[0, 1] 
-                eigen_crit_1pct = result.cve[0, 2]
-            elif hasattr(result, 'critical_values'):
-                trace_crit_5pct = result.critical_values[0][1]
-                trace_crit_1pct = result.critical_values[0][2]
-                eigen_crit_5pct = result.critical_values[1][1]
-                eigen_crit_1pct = result.critical_values[1][2]
-            else:
-                raise AttributeError("No critical values found")
-                
-        except (AttributeError, IndexError, TypeError):
-            # IMPROVED: More realistic fallback values for memecoins
-            # These are more lenient than traditional academic values
-            trace_crit_5pct = 12.0   # Reduced from 15.495 (more permissive)
-            trace_crit_1pct = 16.0   # Reduced from 20.262
-            eigen_crit_5pct = 11.0   # Reduced from 14.265  
-            eigen_crit_1pct = 15.0   # Reduced from 18.520
-            log.warning("[COINTEGRATION] using fallback critical values (library criticals unavailable)")
-        
-        # IMPROVED: More nuanced cointegration strength assessment
-        trace_stat = float(result.lr1[0])
-        eigen_stat = float(result.lr2[0])
-        
-        # Calculate cointegration strength ratio
-        trace_ratio = trace_stat / trace_crit_5pct
-        eigen_ratio = eigen_stat / eigen_crit_5pct
-        
-        # IMPROVED: More realistic interpretation for memecoins
-        if trace_ratio >= 1.0:  # Above 5% critical value
-            if trace_stat > trace_crit_1pct:
-                strength = "Strong"
-            else:
-                strength = "Moderate"
-        elif trace_ratio >= 0.7:  # 70% of critical value (more lenient)
+            maxlags = min(12, max(1, len(df) // 50))
+            sel = sm.tsa.VAR(df).select_order(maxlags=maxlags)
+            # Prefer BIC, then AIC, then HQIC, then FPE
+            selected = [sel.selected_orders.get(key) for key in ("bic", "aic", "hqic", "fpe")]
+            k_ar = next((int(v) for v in selected if v is not None and int(v) >= 0), 1)
+            k_ar_diff = max(1, k_ar)
+        except Exception:
+            # Keep default of 1 if selection fails
+            k_ar_diff = 1
+
+        # 3) Deterministic term: include intercept (det_order=0) for log-price levels
+        det_order = 0
+
+        result = coint_johansen(df.values, det_order=det_order, k_ar_diff=k_ar_diff)
+
+        # --- Normalize access to stats and critical values across statsmodels versions ---
+        # Trace and Max-Eig statistics
+        if hasattr(result, "lr1") and hasattr(result, "lr2"):
+            trace_stat = float(result.lr1[0])
+            eigen_stat = float(result.lr2[0])
+        else:
+            # Newer API names
+            trace_stat = float(result.trace_stat[0])
+            eigen_stat = float(result.max_eig_stat[0])
+
+        # Critical values at 95% and 99%
+        if hasattr(result, "cvt") and hasattr(result, "cvm"):
+            trace_crit_5pct = float(result.cvt[0, 1])
+            trace_crit_1pct = float(result.cvt[0, 2])
+            eigen_crit_5pct = float(result.cvm[0, 1])
+            eigen_crit_1pct = float(result.cvm[0, 2])
+        elif hasattr(result, "trace_stat_crit_vals") and hasattr(result, "max_eig_stat_crit_vals"):
+            trace_crit_5pct = float(result.trace_stat_crit_vals[0, 1])
+            trace_crit_1pct = float(result.trace_stat_crit_vals[0, 2])
+            eigen_crit_5pct = float(result.max_eig_stat_crit_vals[0, 1])
+            eigen_crit_1pct = float(result.max_eig_stat_crit_vals[0, 2])
+        else:
+            return {"error": "Critical values not available from statsmodels result"}
+
+        # Ratios vs 5% criticals
+        trace_ratio = trace_stat / trace_crit_5pct if trace_crit_5pct else np.nan
+        eigen_ratio = eigen_stat / eigen_crit_5pct if eigen_crit_5pct else np.nan
+
+        # Strength classification (keep your relaxed buckets for downstream logic)
+        if trace_stat >= trace_crit_1pct:
+            strength = "Strong"
+        elif trace_stat >= trace_crit_5pct:
+            strength = "Moderate"
+        elif trace_ratio >= 0.7:
             strength = "Weak-Moderate"
-        elif trace_ratio >= 0.4:  # 40% of critical value (very lenient for memecoins)
+        elif trace_ratio >= 0.4:
             strength = "Weak"
         else:
             strength = "Very Weak"
-        
+
         return {
-            'trace_stat': trace_stat,
-            'trace_crit_5pct': float(trace_crit_5pct),
-            'trace_crit_1pct': float(trace_crit_1pct),
-            'eigen_stat': eigen_stat, 
-            'eigen_crit_5pct': float(eigen_crit_5pct),
-            'eigen_crit_1pct': float(eigen_crit_1pct),
-            'trace_ratio': trace_ratio,
-            'eigen_ratio': eigen_ratio,
-            'cointegrated_5pct': trace_stat > trace_crit_5pct,
-            'cointegrated_1pct': trace_stat > trace_crit_1pct,
-            'cointegrated_relaxed': trace_ratio >= 0.4,  # NEW: More lenient threshold
-            'cointegration_strength': strength
+            "trace_stat": trace_stat,
+            "trace_crit_5pct": trace_crit_5pct,
+            "trace_crit_1pct": trace_crit_1pct,
+            "eigen_stat": eigen_stat,
+            "eigen_crit_5pct": eigen_crit_5pct,
+            "eigen_crit_1pct": eigen_crit_1pct,
+            "trace_ratio": trace_ratio,
+            "eigen_ratio": eigen_ratio,
+            "cointegrated_5pct": trace_stat >= trace_crit_5pct,
+            "cointegrated_1pct": trace_stat >= trace_crit_1pct,
+            "cointegrated_relaxed": trace_ratio >= 0.4,
+            "cointegration_strength": strength,
+            "det_order": det_order,
+            "k_ar_diff": int(k_ar_diff),
         }
     except Exception as e:
         log.warning(f"      Johansen cointegration test failed: {e}")
-        return {'error': str(e)}
+        return {"error": str(e)}
 
 def analyze_signal_quality(zscore: pd.Series, threshold: float = 2.0, resample_minutes: int = 1) -> Dict:
     """FIXED: Analyze trading signal quality with proper time conversion"""

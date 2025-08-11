@@ -86,7 +86,35 @@ class LiquidityConfig:
             # 8 points up to 5k, more spacing at higher values
             self.notional_grid = [100, 250, 500, 1000, 1500, 2500, 3500, 5000]
 
+
 config = LiquidityConfig()
+
+# ===== UTILS: DISCOVER SYMBOLS =====
+
+def get_available_symbols() -> List[str]:
+    """Discover all available symbols. Tries symbol_info first, falls back to orderbook."""
+    with db_manager.get_session() as session:
+        try:
+            rows = session.execute(text(
+                """
+                SELECT DISTINCT symbol_id 
+                FROM symbol_info 
+                ORDER BY symbol_id
+                """
+            )).fetchall()
+            symbols = [r[0] for r in rows]
+            if symbols:
+                return symbols
+        except Exception as e:
+            log.warning(f"⚠️ Could not query symbol_info: {e}. Falling back to orderbook.")
+        rows = session.execute(text(
+            """
+            SELECT DISTINCT symbol 
+            FROM orderbook
+            ORDER BY symbol
+            """
+        )).fetchall()
+        return [r[0] for r in rows]
 
 # ===== CORE DATA LOADING FUNCTIONS =====
 
@@ -1330,77 +1358,105 @@ def generate_refined_report(symbol: str, analysis_all: Dict, analysis_3m: Dict =
 
 # ===== MAIN FUNCTION =====
 
+
 def main():
-    """Main analysis function with comprehensive timing"""
+    """Main analysis function with comprehensive timing and multi-symbol support"""
     start_time = time.time()
-    
+
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Liquidity analysis with statistics table and timing")
-    parser.add_argument("--symbol", type=str, required=True, help="Symbol to analyze")
-    
+    # Make symbol optional and allow comma-separated list
+    parser.add_argument("--symbol", type=str, required=False,
+                        help="Symbol(s) to analyze (comma-separated). If omitted, analyze ALL available symbols.")
+
     args = parser.parse_args()
-    
+
     log.info("🚀 Starting liquidity analysis")
-    log.info(f"  🎯 Symbol: {args.symbol}")
+    if args.symbol:
+        log.info(f"  🎯 Symbols: {args.symbol}")
+    else:
+        log.info("  🎯 Symbols: [ALL] (auto-discovered)")
     log.info(f"  📊 Sampling: {config.sample_rate:.0%} (distributed across full period)")
     log.info(f"  💰 Fee: {config.fee_bps} bps ({config.fee_bps/100:.2f}%)")
     log.info(f"  📈 Notional range: ${min(config.notional_grid):,} - ${max(config.notional_grid):,}")
-    
+
     # Create output directory
     Path("plots").mkdir(exist_ok=True)
-    
+
     try:
-        symbol = args.symbol
-        
-        log.info(f"\n{'='*80}")
-        log.info(f"🔍 ANALYZING: {symbol}")
-        log.info(f"{'='*80}")
-        
-        # Load all historical data (with sampling)
-        with timer("Loading historical orderbook data"):
-            orderbook_all = load_orderbook_data(symbol)
-        
-        if len(orderbook_all) == 0:
-            log.error(f"❌ No orderbook data found for {symbol}")
+        # Resolve symbol list
+        if args.symbol:
+            symbols = [s.strip() for s in args.symbol.split(",") if s.strip()]
+        else:
+            symbols = get_available_symbols()
+            log.info(f"  🔎 Auto-discovered {len(symbols)} symbols")
+
+        if not symbols:
+            log.error("❌ No symbols found to analyze")
             return False
-        
-        # Load trades data (with sampling) - not needed for current analysis
-        trades_all = None
-        
-        # Analyze all data
-        with timer("Analyzing historical data"):
-            log.info("📊 Processing historical data...")
-            analysis_all = analyze_liquidity_metrics(symbol, orderbook_all, trades_all)
-        
-        # Analyze last 3 months
-        analysis_3m = None
-        three_months_ago = orderbook_all.index.max() - timedelta(days=90)
-        if orderbook_all.index.min() < three_months_ago:
-            with timer("Processing recent 3-month data"):
-                log.info("📊 Processing recent 3-month data...")
-                orderbook_3m = orderbook_all[orderbook_all.index >= three_months_ago]
-                
-                analysis_3m = analyze_liquidity_metrics(symbol, orderbook_3m, None)
-        
-        # Create visualizations
-        with timer("Creating comprehensive visualizations"):
-            log.info("🎨 Creating visualizations...")
-            create_comprehensive_visualizations(symbol, analysis_all, analysis_3m)
-        
-        # Generate report
-        generate_refined_report(symbol, analysis_all, analysis_3m)
-          
+
+        successes = 0
+
+        for idx, symbol in enumerate(symbols, 1):
+            log.info(f"\n{'='*80}")
+            log.info(f"🔍 ANALYZING: {symbol} ({idx}/{len(symbols)})")
+            log.info(f"{'='*80}")
+
+            try:
+                # Load all historical data (with sampling)
+                with timer("Loading historical orderbook data"):
+                    orderbook_all = load_orderbook_data(symbol)
+
+                if len(orderbook_all) == 0:
+                    log.error(f"❌ No orderbook data found for {symbol}")
+                    continue
+
+                # Analyze all data
+                with timer("Analyzing historical data"):
+                    log.info("📊 Processing historical data...")
+                    analysis_all = analyze_liquidity_metrics(symbol, orderbook_all, None)
+
+                # Analyze last 3 months
+                analysis_3m = None
+                three_months_ago = orderbook_all.index.max() - timedelta(days=90)
+                if orderbook_all.index.min() < three_months_ago:
+                    with timer("Processing recent 3-month data"):
+                        log.info("📊 Processing recent 3-month data...")
+                        orderbook_3m = orderbook_all[orderbook_all.index >= three_months_ago]
+                        analysis_3m = analyze_liquidity_metrics(symbol, orderbook_3m, None)
+
+                # Create visualizations
+                with timer("Creating comprehensive visualizations"):
+                    log.info("🎨 Creating visualizations...")
+                    create_comprehensive_visualizations(symbol, analysis_all, analysis_3m)
+
+                # Generate report
+                generate_refined_report(symbol, analysis_all, analysis_3m)
+
+                successes += 1
+
+            except Exception as e:
+                log.error(f"❌ Analysis failed for {symbol}: {e}")
+                import traceback
+                log.error(traceback.format_exc())
+                continue
+
         total_time = time.time() - start_time
         log.info(f"\n{'='*80}")
-        log.info(f"🎉 ANALYSIS COMPLETED SUCCESSFULLY!")
-        log.info(f"⏱️ Total Execution Time: {total_time:.2f} seconds")
-        log.info(f"📊 Check plots/ directory for visualizations")
-        log.info(f"⚡ Performance: {config.sample_rate:.0%} sampling provided significant speedup")
-        log.info(f"{'='*80}")
-        
-        return True
-        
+        if successes > 0:
+            log.info(f"🎉 ANALYSIS COMPLETED: {successes}/{len(symbols)} symbols analyzed successfully")
+            log.info(f"⏱️ Total Execution Time: {total_time:.2f} seconds")
+            log.info("📊 Check plots/ directory for visualizations")
+            log.info(f"⚡ Performance: {config.sample_rate:.0%} sampling provided significant speedup")
+            log.info(f"{'='*80}")
+            return True
+        else:
+            log.error("🛑 No symbols analyzed successfully")
+            log.info(f"⏱️ Total Execution Time: {total_time:.2f} seconds")
+            log.info(f"{'='*80}")
+            return False
+
     except Exception as e:
         total_time = time.time() - start_time
         log.error(f"❌ Analysis failed after {total_time:.2f}s: {e}")
