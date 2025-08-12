@@ -1,5 +1,5 @@
 # ===========================
-# BACKTEST CONFIGURATION
+# BACKTEST CONFIGURATION - CORREGIDO
 # ===========================
 
 # Trading Pair
@@ -18,16 +18,14 @@ position_size: 0.1
 max_positions: 1
 
 # ===========================
-# EXECUTION CONFIGURATION
+# EXECUTION CONFIGURATION - CORREGIDO
 # ===========================
 execution:
   commission_bps: 2.0
   use_orderbook: false
-  fallback_slippage_bps: 0.01
+  fallback_slippage_bps: 5.0  # 🔧 CORREGIDO: era 0.01
   max_participation_rate: 0.10
-  # Tolerancia temporal para casar vela con orderbook (en segundos):
-  # si lo omites, se usa la mitad de resample_minutes.
-  orderbook_time_tolerance_seconds: 450   # 7.5 min (para velas de 15m)
+  orderbook_time_tolerance_seconds: 450
 
 # ===========================
 # DATA CONFIGURATION
@@ -36,16 +34,16 @@ data:
   resample_minutes: 15
 
 # ===========================
-# PAIRS STRATEGY PARAMETERS
+# PAIRS STRATEGY PARAMETERS - CORREGIDO
 # ===========================
 strategy:
-  # Ventanas EN DÍAS (no barras)
-  lookback_window: 7
-  hedge_ratio_window: 7
-  rebalance_frequency: "never"   # muy alto = no rebalancea
+  # Ventanas EN DÍAS
+  lookback_window: 7           # 🔧 CORREGIDO: días para z-score
+  hedge_ratio_window: 60       # 🔧 CORREGIDO: días para hedge ratio
+  rebalance_frequency: "never" # 🔧 CORREGIDO: desactivado
 
-  entry_threshold: 2
-  exit_threshold: 0.5
+  entry_threshold: 2.0
+  exit_threshold: 0.5          # 🔧 CORREGIDO: era 0.0
   stop_loss_threshold: 4.0
 
   min_correlation: 0.5

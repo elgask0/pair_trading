@@ -18,7 +18,7 @@ def get_script_name():
         return "unknown_script"
 
 def setup_logger(script_name: str = None):
-    """Setup simple y funcional del logger"""
+    """Setup simple y funcional del logger con archivo timestamped"""
     
     # Remove existing handlers
     logger.remove()
@@ -46,7 +46,19 @@ def setup_logger(script_name: str = None):
         colorize=True
     )
     
-    # File handler específico del script
+    # 🔧 NUEVO: Archivo específico con timestamp para cada ejecución
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamped_log = logs_dir / f"{script_name}_{timestamp}.log"
+    logger.add(
+        str(timestamped_log),
+        level=log_level,
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+        rotation="10 MB",
+        retention="30 days",
+        compression="zip"
+    )
+    
+    # File handler específico del script (histórico)
     log_file = logs_dir / f"{script_name}.log"
     logger.add(
         str(log_file),
@@ -68,7 +80,12 @@ def setup_logger(script_name: str = None):
             compression="zip"
         )
     
+    logger.info(f"📝 Logging to: {timestamped_log}")
     return logger
+
+def get_logger(script_name: str = None):
+    """Get logger with automatic script name detection"""
+    return setup_logger(script_name)
 
 def get_logger(script_name: str = None):
     """Get logger with automatic script name detection"""

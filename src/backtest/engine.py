@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Backtest Engine - slippage dinámico con orderbook y ventanas por días
+Backtest Engine - LOGS CONDENSADOS (CORREGIDO)
 """
 import pandas as pd
 import numpy as np
@@ -33,7 +33,6 @@ class BacktestConfig:
     max_participation_rate: float = 0.1
 
     resample_minutes: int = 1
-    # si None => se calcula como mitad de resample_minutes
     orderbook_time_tolerance_seconds: Optional[int] = None
 
 @dataclass
@@ -52,7 +51,7 @@ class BacktestEngine:
 
         tol = config.orderbook_time_tolerance_seconds
         if tol is None:
-            tol = max(60, int(config.resample_minutes * 60 / 2))  # mitad de la vela
+            tol = max(60, int(config.resample_minutes * 60 / 2))
 
         self.execution = EnhancedExecutionSimulator(
             commission_bps=config.commission_bps,
@@ -101,7 +100,8 @@ class BacktestEngine:
 
         except Exception as e:
             log.error(f"Error loading data: {e}")
-            import traceback; log.error(traceback.format_exc())
+            import traceback
+            log.error(traceback.format_exc())
             return False
 
     def _align_data(self) -> pd.DataFrame:
@@ -135,8 +135,14 @@ class BacktestEngine:
     def set_strategy(self, strategy: BaseStrategy):
         self.strategy = strategy
         self.strategy.set_data(self.aligned_data)
+        
+        # 🔧 NUEVO: Pasar resample_minutes a la estrategia
+        if hasattr(self.strategy, 'set_resample_minutes'):
+            self.strategy.set_resample_minutes(self.config.resample_minutes)
+        
         log.info(f"Strategy set: {strategy.__class__.__name__}")
         log.info(f"Strategy params: {getattr(strategy, 'params', {})}")
+        log.info(f"Resample minutes passed to strategy: {self.config.resample_minutes}")
 
     def run(self) -> BacktestResults:
         if not self.strategy:
@@ -210,15 +216,19 @@ class BacktestEngine:
         for action, count in signals_generated.items():
             log.info(f"  {action}: {count}")
 
-        self._print_summary()
+        self._print_enhanced_summary()
         return self.results
 
     def _execute_signal(self, signal: Dict, timestamp: datetime, row: pd.Series) -> Optional[Dict]:
+        """LOGS CONDENSADOS: Una línea por operación"""
         try:
             if signal['action'] in ['LONG', 'SHORT']:
                 if len(self.portfolio.positions) >= self.config.max_positions:
+                    log.warning(f"🚫 MAX POSITIONS | Current: {len(self.portfolio.positions)}/{self.config.max_positions}")
                     return None
+                    
                 position_value = self.portfolio.cash * self.config.position_size
+                
                 execution_result = self.execution.simulate_execution(
                     signal=signal,
                     symbol1=self.config.symbol1,
@@ -227,6 +237,7 @@ class BacktestEngine:
                     volume1=row['volume1'], volume2=row['volume2'],
                     position_value=position_value, timestamp=timestamp
                 )
+                
                 if execution_result['success']:
                     position = self.portfolio.open_position(
                         timestamp=timestamp, direction=signal['action'],
@@ -234,6 +245,14 @@ class BacktestEngine:
                         price1=execution_result['exec_price1'], price2=execution_result['exec_price2'],
                         cost=execution_result['total_cost']
                     )
+                    
+                    # LOG CONDENSADO: Una sola línea con toda la info
+                    log.info(f"🚀 OPEN {signal['action']} | {timestamp} | ID:{position.id} | Z:{signal.get('z_score', 0):.3f} | HR:{signal.get('hedge_ratio', 1):.4f} | "
+                            f"S1:{execution_result['size1']:.2f}@{execution_result['exec_price1']:.6f}({execution_result.get('side1','?')}) | "
+                            f"S2:{execution_result['size2']:.2f}@{execution_result['exec_price2']:.6f}({execution_result.get('side2','?')}) | "
+                            f"Cost:${execution_result['total_cost']:.2f} | Slip:{execution_result.get('avg_slippage_bps', 0):.1f}bps | "
+                            f"Cash:${self.portfolio.cash:.2f}")
+                    
                     trade = {
                         'timestamp': timestamp, 'action': signal['action'], 'position_id': position.id,
                         'size1': execution_result['size1'], 'size2': execution_result['size2'],
@@ -246,50 +265,72 @@ class BacktestEngine:
                         'avg_slippage_bps': execution_result.get('avg_slippage_bps', 0),
                         'orderbook_used': execution_result.get('orderbook_used', False)
                     }
+                    
                     self.slippage_tracking.append({
                         'timestamp': timestamp,
                         'slippage_bps': execution_result.get('avg_slippage_bps', 0),
                         'orderbook_used': execution_result.get('orderbook_used', False)
                     })
+                    
                     return trade
 
             elif signal['action'] == 'CLOSE' and self.portfolio.positions:
                 position_id = list(self.portfolio.positions.keys())[0]
                 position = self.portfolio.positions[position_id]
+                
                 close_result = self.execution.simulate_close(
                     position=position, symbol1=self.config.symbol1, symbol2=self.config.symbol2,
                     price1=row['price1'], price2=row['price2'], timestamp=timestamp
                 )
+                
                 pnl = self.portfolio.close_position(
                     position_id=position_id, price1=close_result['exec_price1'],
                     price2=close_result['exec_price2'], cost=close_result['total_cost']
                 )
+                
+                # Calcular duración del trade
+                duration = timestamp - position.timestamp
+                
+                # LOG CONDENSADO: Una sola línea con toda la info
+                log.info(f"🔄 CLOSE {position.direction} | {timestamp} | ID:{position_id} | Z:{signal.get('z_score', 0):.3f} | "
+                        f"PnL:${pnl:.2f} | Duration:{duration} | "
+                        f"Reason:{signal.get('reason', 'N/A')} | Cash:${self.portfolio.cash:.2f}")
+                
                 return {
                     'timestamp': timestamp, 'action': 'CLOSE', 'position_id': position_id,
                     'pnl': pnl, 'price1': close_result['exec_price1'],
                     'price2': close_result['exec_price2'], 'cost': close_result['total_cost'],
-                    'z_score': signal.get('z_score', 0)
+                    'z_score': signal.get('z_score', 0), 'reason': signal.get('reason', 'N/A'),
+                    'duration_seconds': duration.total_seconds()
                 }
+                
         except Exception as e:
-            log.error(f"Error executing signal: {e}")
-            import traceback; log.error(traceback.format_exc())
+            log.error(f"❌ Error executing signal: {e}")
             return None
 
     def _close_all_positions(self, timestamp: datetime, row: pd.Series):
+        """Cerrar todas las posiciones al final"""
         for position_id in list(self.portfolio.positions.keys()):
             position = self.portfolio.positions[position_id]
+            
             close_result = self.execution.simulate_close(
                 position=position, symbol1=self.config.symbol1, symbol2=self.config.symbol2,
                 price1=row['price1'], price2=row['price2'], timestamp=timestamp
             )
+            
             pnl = self.portfolio.close_position(
                 position_id=position_id, price1=close_result['exec_price1'],
                 price2=close_result['exec_price2'], cost=close_result['total_cost']
             )
+            
+            duration = timestamp - position.timestamp
+            log.info(f"🔚 FINAL CLOSE | ID:{position_id} | PnL:${pnl:.2f} | Duration:{duration}")
+            
             self.results.trades.append({
                 'timestamp': timestamp, 'action': 'CLOSE_FINAL', 'position_id': position_id,
                 'pnl': pnl, 'price1': close_result['exec_price1'],
-                'price2': close_result['exec_price2'], 'cost': close_result['total_cost']
+                'price2': close_result['exec_price2'], 'cost': close_result['total_cost'],
+                'reason': 'final_close', 'duration_seconds': duration.total_seconds()
             })
 
     def _analyze_slippage(self):
@@ -309,42 +350,125 @@ class BacktestEngine:
                     avg_slip = t['avg_slippage_bps'].mean()
                     self.results.slippage_analysis['total_slippage_cost'] = total_value * (avg_slip / 10000)
 
-    def _print_summary(self):
+    def _print_enhanced_summary(self):
+        """REPORTE AMPLIADO CON MÉTRICAS DETALLADAS"""
         m = self.results.metrics
-        log.info("\n" + "=" * 80)
-        log.info("BACKTEST RESULTS SUMMARY")
-        log.info("=" * 80)
-        log.info(f"\n📊 Performance Metrics:")
-        log.info(f"  Total Return: {m.get('total_return', 0):.2%}")
-        log.info(f"  Annual Return: {m.get('annual_return', 0):.2%}")
-        log.info(f"  Sharpe Ratio: {m.get('sharpe_ratio', 0):.2f}")
-        log.info(f"  Calmar Ratio: {m.get('calmar_ratio', 0):.2f}")
-        log.info(f"  Max Drawdown: {m.get('max_drawdown', 0):.2%}")
-        log.info(f"\n📈 Trading Statistics:")
-        log.info(f"  Total Trades: {m.get('total_trades', 0)}")
-        log.info(f"  Win Rate: {m.get('win_rate', 0):.2%}")
-        log.info(f"  Avg Win: ${m.get('avg_win', 0):.2f}")
-        log.info(f"  Avg Loss: ${m.get('avg_loss', 0):.2f}")
-        log.info(f"  Profit Factor: {m.get('profit_factor', 0):.2f}")
-        log.info(f"  Expectancy: ${m.get('expectancy', 0):.2f}")
+        
+        # Análisis detallado de trades
+        trades_df = pd.DataFrame(self.results.trades) if self.results.trades else pd.DataFrame()
+        
+        log.info("\n" + "=" * 100)
+        log.info("🔍 ENHANCED BACKTEST RESULTS SUMMARY")
+        log.info("=" * 100)
+        
+        # Performance básica
+        log.info(f"\n📊 PERFORMANCE OVERVIEW:")
+        log.info(f"  Total Return: {m.get('total_return', 0):.2%} | Annual: {m.get('annual_return', 0):.2%}")
+        log.info(f"  Sharpe: {m.get('sharpe_ratio', 0):.2f} | Calmar: {m.get('calmar_ratio', 0):.2f} | Max DD: {m.get('max_drawdown', 0):.2%}")
+        
+        # Trading Statistics Detalladas
+        if not trades_df.empty:
+            close_trades = trades_df[trades_df['action'].isin(['CLOSE', 'CLOSE_FINAL'])].copy()
+            
+            if not close_trades.empty:
+                # Análisis por razón de cierre
+                exit_reasons = close_trades['reason'].value_counts() if 'reason' in close_trades.columns else {}
+                stop_losses = exit_reasons.get('stop_loss', 0)
+                normal_exits = exit_reasons.get('exit_signal', 0) + exit_reasons.get('final_close', 0)
+                
+                # Duración de trades
+                if 'duration_seconds' in close_trades.columns:
+                    durations_hours = close_trades['duration_seconds'] / 3600
+                    avg_duration_hours = durations_hours.mean()
+                    median_duration_hours = durations_hours.median()
+                    max_duration_hours = durations_hours.max()
+                else:
+                    avg_duration_hours = median_duration_hours = max_duration_hours = 0
+                
+                # PnL Analysis
+                pnls = close_trades['pnl'].dropna()
+                wins = pnls[pnls > 0]
+                losses = pnls[pnls < 0]
+                
+                log.info(f"\n📈 DETAILED TRADING STATS:")
+                log.info(f"  Total Trades: {len(close_trades)} | Wins: {len(wins)} ({len(wins)/len(close_trades)*100:.1f}%) | Losses: {len(losses)} ({len(losses)/len(close_trades)*100:.1f}%)")
+                log.info(f"  Normal Exits: {normal_exits} | Stop Losses: {stop_losses} | Stop Loss Rate: {stop_losses/len(close_trades)*100:.1f}%")
+                log.info(f"  Avg Win: ${wins.mean():.2f} | Avg Loss: ${losses.mean():.2f} | Win/Loss Ratio: {abs(wins.mean()/losses.mean()) if len(losses) > 0 else float('inf'):.2f}")
+                log.info(f"  Best Trade: ${pnls.max():.2f} | Worst Trade: ${pnls.min():.2f} | Profit Factor: {m.get('profit_factor', 0):.2f}")
+                log.info(f"  Expectancy: ${m.get('expectancy', 0):.2f} | Avg Trade: ${pnls.mean():.2f} | Median Trade: ${pnls.median():.2f}")
+                
+                log.info(f"\n⏱️ TRADE DURATION ANALYSIS:")
+                log.info(f"  Avg Duration: {avg_duration_hours:.1f}h | Median: {median_duration_hours:.1f}h | Max: {max_duration_hours:.1f}h")
+                
+                # PnL Distribution
+                log.info(f"\n💰 PnL DISTRIBUTION:")
+                pnl_ranges = [
+                    (pnls >= 50, ">= $50"),
+                    ((pnls >= 20) & (pnls < 50), "$20-$50"),
+                    ((pnls >= 5) & (pnls < 20), "$5-$20"),
+                    ((pnls >= 0) & (pnls < 5), "$0-$5"),
+                    ((pnls >= -5) & (pnls < 0), "$0 to -$5"),
+                    ((pnls >= -20) & (pnls < -5), "-$5 to -$20"),
+                    ((pnls >= -50) & (pnls < -20), "-$20 to -$50"),
+                    (pnls < -50, "< -$50")
+                ]
+                
+                for condition, label in pnl_ranges:
+                    count = condition.sum()
+                    pct = count / len(pnls) * 100 if len(pnls) > 0 else 0
+                    log.info(f"    {label}: {count} trades ({pct:.1f}%)")
+                
+                # Z-Score Analysis
+                if 'z_score' in close_trades.columns:
+                    z_scores = close_trades['z_score'].abs()
+                    log.info(f"\n📊 Z-SCORE AT CLOSE ANALYSIS:")
+                    log.info(f"  Avg |Z|: {z_scores.mean():.2f} | Median |Z|: {z_scores.median():.2f} | Max |Z|: {z_scores.max():.2f}")
+                    log.info(f"  Extreme Closes (|Z|>3): {(z_scores > 3).sum()} ({(z_scores > 3).mean()*100:.1f}%)")
+        
+        # Strategy Analysis
+        strategy_metrics = self.strategy.get_strategy_metrics() if hasattr(self.strategy, 'get_strategy_metrics') else {}
+        if strategy_metrics:
+            log.info(f"\n🎯 STRATEGY ANALYSIS:")
+            log.info(f"  Current Hedge Ratio: {strategy_metrics.get('current_hedge_ratio', 1.0):.4f}")
+            log.info(f"  Z-Score Range: {strategy_metrics.get('min_z_score', 0):.2f} to {strategy_metrics.get('max_z_score', 0):.2f}")
+            log.info(f"  Avg Z-Score: {strategy_metrics.get('avg_z_score', 0):.3f} | Std: {strategy_metrics.get('z_score_std', 0):.3f}")
+            if 'avg_correlation' in strategy_metrics:
+                log.info(f"  Avg Correlation: {strategy_metrics.get('avg_correlation', 0):.3f}")
+            if 'extreme_z_scores' in strategy_metrics:
+                log.info(f"  Extreme Signals (|Z|>3): {strategy_metrics.get('extreme_z_scores', 0)}")
+            log.info(f"  Total Signals: {strategy_metrics.get('signals_generated', 0)}")
+            
+            # 🔧 DEBUG INFO
+            if 'resample_minutes' in strategy_metrics:
+                log.info(f"  Resample Minutes: {strategy_metrics.get('resample_minutes', 0)}")
+                log.info(f"  Lookback Days: {strategy_metrics.get('lookback_days', 0)} = {strategy_metrics.get('lookback_periods', 0)} periods")
+        
+        # Slippage Analysis
         if self.results.slippage_analysis:
             s = self.results.slippage_analysis
-            log.info(f"\n💹 Slippage Analysis:")
-            log.info(f"  Avg Slippage: {s.get('avg_slippage_bps', 0):.1f} bps")
-            log.info(f"  Max Slippage: {s.get('max_slippage_bps', 0):.1f} bps")
-            log.info(f"  Orderbook Usage: {s.get('orderbook_usage', 0):.1f}%")
+            log.info(f"\n💹 EXECUTION ANALYSIS:")
+            log.info(f"  Avg Slippage: {s.get('avg_slippage_bps', 0):.1f} bps | Max: {s.get('max_slippage_bps', 0):.1f} bps")
+            log.info(f"  Orderbook Usage: {s.get('orderbook_usage', 0):.1f}% | Slippage Events: {s.get('total_slippage_events', 0)}")
             if 'total_slippage_cost' in s:
                 log.info(f"  Total Slippage Cost: ${s['total_slippage_cost']:.2f}")
-        log.info(f"\n💰 Final Results:")
-        log.info(f"  Initial Capital: ${self.config.initial_capital:,.2f}")
-        log.info(f"  Final Equity: ${m.get('final_equity', 0):,.2f}")
-        log.info(f"  Total PnL: ${m.get('total_pnl', 0):,.2f}")
-        if hasattr(self.strategy, 'get_strategy_metrics'):
-            smetrics = self.strategy.get_strategy_metrics() or {}
-            if smetrics:
-                log.info(f"\n🎯 Strategy Metrics:")
-                log.info(f"  Current Hedge Ratio: {smetrics.get('current_hedge_ratio', 1.0):.4f}")
-                log.info(f"  Avg Z-Score: {smetrics.get('avg_z_score', 0):.2f}")
-                log.info(f"  Max Z-Score: {smetrics.get('max_z_score', 0):.2f}")
-                log.info(f"  Min Z-Score: {smetrics.get('min_z_score', 0):.2f}")
-        log.info("=" * 80)
+        
+        # Capital Efficiency
+        log.info(f"\n💵 CAPITAL EFFICIENCY:")
+        log.info(f"  Initial Capital: ${self.config.initial_capital:,.2f} | Final Equity: ${m.get('final_equity', 0):,.2f}")
+        log.info(f"  Total PnL: ${m.get('total_pnl', 0):,.2f} | Max Capital Used: {self.config.position_size:.1%}")
+        
+        if not trades_df.empty:
+            total_volume = trades_df[trades_df['action'].isin(['LONG', 'SHORT'])]['cost'].sum() if 'cost' in trades_df.columns else 0
+            log.info(f"  Total Volume Traded: ${total_volume:,.2f} | Turnover: {total_volume/self.config.initial_capital:.1f}x")
+        
+        # Risk Metrics
+        if len(self.results.equity_curve) > 0:
+            returns = self.results.equity_curve.pct_change().dropna()
+            if len(returns) > 0:
+                volatility = returns.std() * np.sqrt(252 * 24 * 60 / self.config.resample_minutes)  # Annualized
+                var_95 = returns.quantile(0.05)
+                log.info(f"\n📉 RISK METRICS:")
+                log.info(f"  Annualized Volatility: {volatility:.2%} | VaR(95%): {var_95:.2%}")
+                log.info(f"  Best Day: +{returns.max():.2%} | Worst Day: {returns.min():.2%}")
+        
+        log.info("=" * 100)

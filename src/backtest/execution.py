@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Enhanced Execution Simulator - Usa datos reales de orderbook para slippage dinámico
+Enhanced Execution Simulator - CORREGIDO para pairs trading
 """
 import pandas as pd
 from typing import Dict, Optional, Tuple
@@ -41,7 +41,7 @@ class EnhancedExecutionSimulator:
         self.orderbook_cache = {}
 
     def _get_orderbook_snapshot(self, symbol: str, timestamp: datetime) -> Optional[pd.Series]:
-        """Snapshot más cercano dentro de ±tolerancia (default: mitad de la vela)."""
+        """Snapshot más cercano dentro de ±tolerancia"""
         key = f"{symbol}_{timestamp.strftime('%Y%m%d_%H%M')}"
         if key in self.orderbook_cache:
             return self.orderbook_cache[key]
@@ -131,39 +131,69 @@ class EnhancedExecutionSimulator:
                            price1: float, price2: float,
                            volume1: float, volume2: float,
                            position_value: float, timestamp: datetime) -> Dict:
-        hedge = signal.get('hedge_ratio', 1.0)
-        v1 = position_value / (1 + hedge)
-        v2 = position_value - v1
+        """🔧 CORREGIDO: Ejecución correcta de pairs trading"""
+        
+        hedge_ratio = signal.get('hedge_ratio', 1.0)
+        
+        # 🔧 CORREGIDO: Distribución correcta del capital con hedge ratio
+        # Para pairs trading: valor_symbol1 = hedge_ratio * valor_symbol2
+        # Si hedge_ratio = 0.5, entonces por cada $1 de symbol2, necesitamos $0.5 de symbol1
+        
+        # Resolvemos: v1 = hedge_ratio * v2 y v1 + v2 = position_value
+        # Sustituyendo: hedge_ratio * v2 + v2 = position_value
+        # v2 = position_value / (hedge_ratio + 1)
+        # v1 = hedge_ratio * v2
+        
+        v2 = position_value / (hedge_ratio + 1)
+        v1 = hedge_ratio * v2
 
-        if self.use_orderbook:
+        # Determinar direcciones de trading
+        if signal['action'] == 'LONG':
+            # LONG spread = comprar symbol1, vender symbol2
+            side1, side2 = 'buy', 'sell'
+        else:
+            # SHORT spread = vender symbol1, comprar symbol2
+            side1, side2 = 'sell', 'buy'
+
+        # Calcular slippage y precios de ejecución
+        if not self.use_orderbook:
+            # Slippage fijo
+            s1_bps = s2_bps = self.fallback_slippage_bps
+            
+            if side1 == 'buy':
+                px1 = price1 * (1 + s1_bps/10000)  # Pagar más al comprar
+            else:
+                px1 = price1 * (1 - s1_bps/10000)  # Recibir menos al vender
+                
+            if side2 == 'buy':
+                px2 = price2 * (1 + s2_bps/10000)  # Pagar más al comprar
+            else:
+                px2 = price2 * (1 - s2_bps/10000)  # Recibir menos al vender
+        else:
+            # Usar orderbook (implementación existente)
             ob1 = self._get_orderbook_snapshot(symbol1, timestamp)
             if ob1 is not None:
-                side1 = 'buy' if signal['action'] == 'LONG' else 'sell'
                 s1_bps, px1 = self._calculate_market_impact(ob1, v1, side1)
                 if px1 == 0:
                     px1 = price1 * (1 + (s1_bps/10000 if side1 == 'buy' else -s1_bps/10000))
             else:
                 s1_bps = self.fallback_slippage_bps
-                px1 = price1 * (1 + (s1_bps/10000 if signal['action'] == 'LONG' else -s1_bps/10000))
+                px1 = price1 * (1 + (s1_bps/10000 if side1 == 'buy' else -s1_bps/10000))
 
             ob2 = self._get_orderbook_snapshot(symbol2, timestamp)
             if ob2 is not None:
-                side2 = 'sell' if signal['action'] == 'LONG' else 'buy'
                 s2_bps, px2 = self._calculate_market_impact(ob2, v2, side2)
                 if px2 == 0:
-                    px2 = price2 * (1 + (-s2_bps/10000 if side2 == 'sell' else s2_bps/10000))
+                    px2 = price2 * (1 + (s2_bps/10000 if side2 == 'buy' else -s2_bps/10000))
             else:
                 s2_bps = self.fallback_slippage_bps
-                px2 = price2 * (1 - s2_bps/10000) if signal['action'] == 'LONG' else price2 * (1 + s2_bps/10000)
-        else:
-            s1_bps = s2_bps = self.fallback_slippage_bps
-            if signal['action'] == 'LONG':
-                px1 = price1 * (1 + s1_bps/10000); px2 = price2 * (1 - s2_bps/10000)
-            else:
-                px1 = price1 * (1 - s1_bps/10000); px2 = price2 * (1 + s2_bps/10000)
+                px2 = price2 * (1 + (s2_bps/10000 if side2 == 'buy' else -s2_bps/10000))
 
-        size1, size2 = v1 / px1, v2 / px2
+        # Calcular tamaños
+        size1 = v1 / px1
+        size2 = v2 / px2
 
+        # Verificar liquidez
         max_part = self.max_participation_rate
         max1, max2 = volume1 * max_part, volume2 * max_part
         liq_ok = True
@@ -173,11 +203,12 @@ class EnhancedExecutionSimulator:
             v1 *= scale; v2 *= scale
             position_value = v1 + v2
             liq_ok = False
-            log.warning(f"Position scaled down to {scale:.1%} due to volume constraints")
+            log.warning(f"⚠️ LIQUIDITY CONSTRAINT | Position scaled to {scale:.1%}")
 
+        # Calcular costos
         slip_cost = (v1 * s1_bps/10000) + (v2 * s2_bps/10000)
-        comm = position_value * (self.commission_bps/10000) * 2
-        total_cost = position_value + comm
+        comm = position_value * (self.commission_bps/10000) * 2  # Entrada + salida
+        total_cost = position_value + slip_cost + comm
 
         return {
             'success': True,
@@ -187,32 +218,57 @@ class EnhancedExecutionSimulator:
             'avg_slippage_bps': (s1_bps + s2_bps) / 2,
             'slippage_cost': slip_cost, 'commission': comm, 'total_cost': total_cost,
             'liquidity_ok': liq_ok,
-            'orderbook_used': self.use_orderbook and (ob1 is not None or ob2 is not None)
+            'orderbook_used': self.use_orderbook and (
+                self._get_orderbook_snapshot(symbol1, timestamp) is not None or 
+                self._get_orderbook_snapshot(symbol2, timestamp) is not None
+            ),
+            'side1': side1, 'side2': side2,  # Para logging
+            'v1': v1, 'v2': v2  # Para logging
         }
 
     def simulate_close(self, position: Position, symbol1: str, symbol2: str,
                        price1: float, price2: float, timestamp: datetime) -> Dict:
+        """🔧 CORREGIDO: Cierre correcto de pairs trading"""
+        
+        # Para cerrar, invertimos las direcciones de la apertura
         if position.direction == 'LONG':
-            v1, v2 = position.size1 * price1, position.size2 * price2
-            if self.use_orderbook:
-                ob1 = self._get_orderbook_snapshot(symbol1, timestamp)
-                s1_bps, px1 = self._calculate_market_impact(ob1, v1, 'sell') if ob1 is not None else (self.fallback_slippage_bps, price1*(1 - self.fallback_slippage_bps/10000))
-                ob2 = self._get_orderbook_snapshot(symbol2, timestamp)
-                s2_bps, px2 = self._calculate_market_impact(ob2, v2, 'buy')  if ob2 is not None else (self.fallback_slippage_bps, price2*(1 + self.fallback_slippage_bps/10000))
-            else:
-                px1 = price1*(1 - self.fallback_slippage_bps/10000)
-                px2 = price2*(1 + self.fallback_slippage_bps/10000)
+            # Originalmente: compramos symbol1, vendimos symbol2
+            # Para cerrar: vendemos symbol1, compramos symbol2
+            side1, side2 = 'sell', 'buy'
         else:
-            v1, v2 = position.size1 * price1, position.size2 * price2
-            if self.use_orderbook:
-                ob1 = self._get_orderbook_snapshot(symbol1, timestamp)
-                s1_bps, px1 = self._calculate_market_impact(ob1, v1, 'buy')  if ob1 is not None else (self.fallback_slippage_bps, price1*(1 + self.fallback_slippage_bps/10000))
-                ob2 = self._get_orderbook_snapshot(symbol2, timestamp)
-                s2_bps, px2 = self._calculate_market_impact(ob2, v2, 'sell') if ob2 is not None else (self.fallback_slippage_bps, price2*(1 - self.fallback_slippage_bps/10000))
-            else:
-                px1 = price1*(1 + self.fallback_slippage_bps/10000)
-                px2 = price2*(1 - self.fallback_slippage_bps/10000)
+            # Originalmente: vendimos symbol1, compramos symbol2
+            # Para cerrar: compramos symbol1, vendemos symbol2
+            side1, side2 = 'buy', 'sell'
 
-        close_val = position.size1*px1 + position.size2*px2
+        v1 = position.size1 * price1
+        v2 = position.size2 * price2
+        
+        if not self.use_orderbook:
+            # Slippage fijo
+            s1_bps = s2_bps = self.fallback_slippage_bps
+            
+            if side1 == 'buy':
+                px1 = price1 * (1 + s1_bps/10000)
+            else:
+                px1 = price1 * (1 - s1_bps/10000)
+                
+            if side2 == 'buy':
+                px2 = price2 * (1 + s2_bps/10000)
+            else:
+                px2 = price2 * (1 - s2_bps/10000)
+        else:
+            # Usar orderbook
+            ob1 = self._get_orderbook_snapshot(symbol1, timestamp)
+            s1_bps, px1 = self._calculate_market_impact(ob1, v1, side1) if ob1 is not None else (self.fallback_slippage_bps, price1*(1 + (self.fallback_slippage_bps/10000 if side1 == 'buy' else -self.fallback_slippage_bps/10000)))
+            
+            ob2 = self._get_orderbook_snapshot(symbol2, timestamp)
+            s2_bps, px2 = self._calculate_market_impact(ob2, v2, side2) if ob2 is not None else (self.fallback_slippage_bps, price2*(1 + (self.fallback_slippage_bps/10000 if side2 == 'buy' else -self.fallback_slippage_bps/10000)))
+
+        close_val = position.size1 * px1 + position.size2 * px2
         comm = close_val * (self.commission_bps/10000)
-        return {'exec_price1': px1, 'exec_price2': px2, 'close_value': close_val, 'commission': comm, 'total_cost': comm}
+        
+        return {
+            'exec_price1': px1, 'exec_price2': px2, 
+            'close_value': close_val, 'commission': comm, 'total_cost': comm,
+            'side1': side1, 'side2': side2  # Para logging
+        }
