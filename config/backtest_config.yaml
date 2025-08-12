@@ -1,5 +1,5 @@
 # ===========================
-# BACKTEST CONFIGURATION - OPTIMIZADO
+# BACKTEST CONFIGURATION - OPTIMIZADO v2.0
 # ===========================
 
 # Trading Pair
@@ -11,20 +11,20 @@ start_date: 2024-12-01
 end_date: 2025-08-01
 
 # ===========================
-# CAPITAL & RISK MANAGEMENT
+# CAPITAL & RISK MANAGEMENT - OPTIMIZADO
 # ===========================
 initial_capital: 10000
-position_size: 0.1
+position_size: 0.15          # 15% por trade (más agresivo pero controlado)
 max_positions: 1
 
 # ===========================
-# EXECUTION CONFIGURATION - CORREGIDO
+# EXECUTION CONFIGURATION - MEJORADO
 # ===========================
 execution:
   commission_bps: 2.0
-  use_orderbook: false
-  fallback_slippage_bps: 5.0  # CORREGIDO: era 1e-07
-  max_participation_rate: 0.10
+  use_orderbook: false        # Desactivado para simplificar
+  fallback_slippage_bps: 8.0  # Más realista para memecoins
+  max_participation_rate: 0.05 # Más conservador
   orderbook_time_tolerance_seconds: 450
 
 # ===========================
@@ -34,24 +34,39 @@ data:
   resample_minutes: 15
 
 # ===========================
-# PAIRS STRATEGY PARAMETERS - OPTIMIZADO
+# PAIRS STRATEGY PARAMETERS - TOTALMENTE OPTIMIZADO
 # ===========================
 strategy:
-  # Ventanas EN DÍAS
-  lookback_window: 7           # días para z-score
-  hedge_ratio_window: 60       # días para hedge ratio
-  rebalance_frequency: "never"
+  # Ventanas EN DÍAS - CRÍTICO: Valores correctos
+  lookback_window: 5            # Más reactivo (5 días)
+  hedge_ratio_window: 30        # Más adaptativo (30 días)
+  rebalance_frequency: "never"  # No rebalancear posiciones activas
 
   # THRESHOLDS OPTIMIZADOS
-  entry_threshold: 2.0         # Más conservador
-  exit_threshold: 0.0          # CORREGIDO: salir en la media
-  stop_loss_threshold: 4.0
+  entry_threshold: 2.5          # Más conservador
+  exit_threshold: 0.3           # Salir antes de la media
+  stop_loss_threshold: 3.5      # Stop más ajustado
 
-  min_correlation: 0.5
-  use_robust_zscore: false     # Usar std tradicional
+  # FILTROS DE CALIDAD
+  min_correlation: 0.6          # Más estricto
+  use_robust_zscore: true       # MAD en lugar de std
+  
+  # NUEVOS PARÁMETROS AVANZADOS
+  min_spread_volatility: 0.001
+  max_spread_volatility: 0.05
+  volume_filter: true
+  min_volume_percentile: 20
+  use_dynamic_thresholds: true
+  volatility_lookback: 10
+  max_hedge_ratio: 2.0
+  min_hedge_ratio: 0.2
+  use_half_life_filter: true
+  min_half_life: 1.0
+  max_half_life: 15.0
 
+  # Confirmación y límites
   signal_confirmation_bars: 0
-  max_holding_periods: 0
+  max_holding_periods: 0        # Sin límite fijo
 
 # ===========================
 # LOGGING & OUTPUT
