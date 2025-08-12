@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Backtest Engine - LOGS CONDENSADOS (CORREGIDO)
+Backtest Engine - LOGS MEJORADOS con PnL detallado
 """
 import pandas as pd
 import numpy as np
@@ -257,128 +257,120 @@ class BacktestEngine:
         self._print_enhanced_summary()
         return self.results
 
-    def _execute_signal(
-        self, signal: Dict, timestamp: datetime, row: pd.Series
-    ) -> Optional[Dict]:
-        """Ejecutar señal con hedge ratio tracking"""
+    def _execute_signal(self, signal: Dict, timestamp: datetime, row: pd.Series) -> Optional[Dict]:
+        """LOGS MEJORADOS: PnL por activo y validación"""
         try:
-            if signal["action"] in ["LONG", "SHORT"]:
+            if signal['action'] in ['LONG', 'SHORT']:
                 if len(self.portfolio.positions) >= self.config.max_positions:
-                    log.warning(
-                        f"🚫 MAX POSITIONS | Current: {len(self.portfolio.positions)}/{self.config.max_positions}"
-                    )
+                    log.warning(f"🚫 MAX POSITIONS | Current: {len(self.portfolio.positions)}/{self.config.max_positions}")
                     return None
-
+                    
                 position_value = self.portfolio.cash * self.config.position_size
-
+                
                 execution_result = self.execution.simulate_execution(
                     signal=signal,
                     symbol1=self.config.symbol1,
                     symbol2=self.config.symbol2,
-                    price1=row["price1"],
-                    price2=row["price2"],
-                    volume1=row["volume1"],
-                    volume2=row["volume2"],
-                    position_value=position_value,
-                    timestamp=timestamp,
+                    price1=row['price1'], price2=row['price2'],
+                    volume1=row['volume1'], volume2=row['volume2'],
+                    position_value=position_value, timestamp=timestamp
                 )
-
-                if execution_result["success"]:
+                
+                if execution_result['success']:
                     position = self.portfolio.open_position(
-                        timestamp=timestamp,
-                        direction=signal["action"],
-                        size1=execution_result["size1"],
-                        size2=execution_result["size2"],
-                        price1=execution_result["exec_price1"],
-                        price2=execution_result["exec_price2"],
-                        cost=execution_result["total_cost"],
-                        hedge_ratio=signal.get("hedge_ratio", 1.0),
+                        timestamp=timestamp, direction=signal['action'],
+                        size1=execution_result['size1'], size2=execution_result['size2'],
+                        price1=execution_result['exec_price1'], price2=execution_result['exec_price2'],
+                        cost=execution_result['total_cost'],
+                        hedge_ratio=signal.get('hedge_ratio', 1.0)
                     )
-
-                    # LOG CONDENSADO: Una sola línea con toda la info
-                    log.info(
-                        f"🚀 OPEN {signal['action']} | {timestamp} | ID:{position.id} | Z:{signal.get('z_score', 0):.3f} | HR:{signal.get('hedge_ratio', 1):.4f} | "
-                        f"S1:{execution_result['size1']:.2f}@{execution_result['exec_price1']:.6f}({execution_result.get('side1','?')}) | "
-                        f"S2:{execution_result['size2']:.2f}@{execution_result['exec_price2']:.6f}({execution_result.get('side2','?')}) | "
-                        f"Cost:${execution_result['total_cost']:.2f} | Slip:{execution_result.get('avg_slippage_bps', 0):.1f}bps | "
-                        f"Cash:${self.portfolio.cash:.2f}"
-                    )
-
+                    
+                    # Calcular spread de entrada
+                    entry_spread = np.log(execution_result['exec_price1']) - signal.get('hedge_ratio', 1.0) * np.log(execution_result['exec_price2'])
+                    
+                    # LOG MEJORADO sin ID
+                    log.info(f"🚀 OPEN {signal['action']} | {timestamp} | "
+                            f"Z:{signal.get('z_score', 0):.3f} | HR:{signal.get('hedge_ratio', 1):.4f} | "
+                            f"Spread:{entry_spread:.6f} | "
+                            f"P1:{execution_result['exec_price1']:.6f} P2:{execution_result['exec_price2']:.6f} | "
+                            f"Size1:{execution_result['size1']:.2f} Size2:{execution_result['size2']:.2f} | "
+                            f"Cost:${execution_result['total_cost']:.2f} | Cash:${self.portfolio.cash:.2f}")
+                    
                     trade = {
-                        "timestamp": timestamp,
-                        "action": signal["action"],
-                        "position_id": position.id,
-                        "size1": execution_result["size1"],
-                        "size2": execution_result["size2"],
-                        "price1": execution_result["exec_price1"],
-                        "price2": execution_result["exec_price2"],
-                        "cost": execution_result["total_cost"],
-                        "signal_strength": signal.get("strength", 0),
-                        "z_score": signal.get("z_score", 0),
-                        "hedge_ratio": signal.get("hedge_ratio", 1.0),
-                        "slippage1_bps": execution_result.get("slippage1_bps", 0),
-                        "slippage2_bps": execution_result.get("slippage2_bps", 0),
-                        "avg_slippage_bps": execution_result.get("avg_slippage_bps", 0),
-                        "orderbook_used": execution_result.get("orderbook_used", False),
+                        'timestamp': timestamp, 'action': signal['action'], 'position_id': position.id,
+                        'size1': execution_result['size1'], 'size2': execution_result['size2'],
+                        'price1': execution_result['exec_price1'], 'price2': execution_result['exec_price2'],
+                        'cost': execution_result['total_cost'],
+                        'signal_strength': signal.get('strength', 0), 'z_score': signal.get('z_score', 0),
+                        'hedge_ratio': signal.get('hedge_ratio', 1.0),
+                        'spread': entry_spread
                     }
-
-                    self.slippage_tracking.append(
-                        {
-                            "timestamp": timestamp,
-                            "slippage_bps": execution_result.get("avg_slippage_bps", 0),
-                            "orderbook_used": execution_result.get(
-                                "orderbook_used", False
-                            ),
-                        }
-                    )
-
+                    
                     return trade
 
-            elif signal["action"] == "CLOSE" and self.portfolio.positions:
+            elif signal['action'] == 'CLOSE' and self.portfolio.positions:
                 position_id = list(self.portfolio.positions.keys())[0]
                 position = self.portfolio.positions[position_id]
-
+                
                 close_result = self.execution.simulate_close(
-                    position=position,
-                    symbol1=self.config.symbol1,
-                    symbol2=self.config.symbol2,
-                    price1=row["price1"],
-                    price2=row["price2"],
-                    timestamp=timestamp,
+                    position=position, symbol1=self.config.symbol1, symbol2=self.config.symbol2,
+                    price1=row['price1'], price2=row['price2'], timestamp=timestamp
                 )
-
+                
+                # Calcular spreads
+                entry_spread = np.log(position.entry_price1) - position.hedge_ratio * np.log(position.entry_price2)
+                exit_spread = np.log(close_result['exec_price1']) - position.hedge_ratio * np.log(close_result['exec_price2'])
+                spread_change = exit_spread - entry_spread
+                
+                # Guardar precios antes de cerrar
+                entry_p1 = position.entry_price1
+                entry_p2 = position.entry_price2
+                exit_p1 = close_result['exec_price1']
+                exit_p2 = close_result['exec_price2']
+                
                 pnl = self.portfolio.close_position(
-                    position_id=position_id,
-                    price1=close_result["exec_price1"],
-                    price2=close_result["exec_price2"],
-                    cost=close_result["total_cost"],
+                    position_id=position_id, price1=exit_p1,
+                    price2=exit_p2, cost=close_result['total_cost']
                 )
-
-                # Calcular duración del trade
+                
+                # Obtener PnL detallado del portfolio
+                last_transaction = self.portfolio.transaction_history[-1]
+                pnl1 = last_transaction.get('pnl_symbol1', 0)
+                pnl2 = last_transaction.get('pnl_symbol2', 0)
+                
                 duration = timestamp - position.timestamp
-
-                # LOG CONDENSADO: Una sola línea con toda la info
-                log.info(
-                    f"🔄 CLOSE {position.direction} | {timestamp} | ID:{position_id} | Z:{signal.get('z_score', 0):.3f} | "
-                    f"PnL:${pnl:.2f} | Duration:{duration} | "
-                    f"Reason:{signal.get('reason', 'N/A')} | Cash:${self.portfolio.cash:.2f}"
-                )
-
+                
+                # Validación de coherencia
+                expected_direction = "positive" if position.direction == "SHORT" and spread_change < 0 else "positive" if position.direction == "LONG" and spread_change > 0 else "negative"
+                actual_direction = "positive" if pnl > 0 else "negative"
+                
+                if expected_direction != actual_direction and abs(pnl) > 10:
+                    log.warning(f"⚠️ PnL VALIDATION: Expected {expected_direction} but got {actual_direction} | "
+                               f"Spread: {entry_spread:.6f}→{exit_spread:.6f} (Δ{spread_change:.6f}) | "
+                               f"PnL: ${pnl:.2f}")
+                
+                # LOG DETALLADO con validación
+                log.info(f"🔄 CLOSE {position.direction} | {timestamp} | Z:{signal.get('z_score', 0):.3f} | "
+                        f"PnL:${pnl:.2f} (P1:${pnl1:.2f} + P2:${pnl2:.2f}) | "
+                        f"Spread:{entry_spread:.6f}→{exit_spread:.6f} (Δ{spread_change:+.6f}) | "
+                        f"P1:{entry_p1:.4f}→{exit_p1:.4f} | P2:{entry_p2:.4f}→{exit_p2:.4f} | "
+                        f"Duration:{duration} | Reason:{signal.get('reason', 'N/A')} | Cash:${self.portfolio.cash:.2f}")
+                
                 return {
-                    "timestamp": timestamp,
-                    "action": "CLOSE",
-                    "position_id": position_id,
-                    "pnl": pnl,
-                    "price1": close_result["exec_price1"],
-                    "price2": close_result["exec_price2"],
-                    "cost": close_result["total_cost"],
-                    "z_score": signal.get("z_score", 0),
-                    "reason": signal.get("reason", "N/A"),
-                    "duration_seconds": duration.total_seconds(),
+                    'timestamp': timestamp, 'action': 'CLOSE', 'position_id': position_id,
+                    'pnl': pnl, 'pnl1': pnl1, 'pnl2': pnl2,
+                    'entry_price1': entry_p1, 'entry_price2': entry_p2,
+                    'exit_price1': exit_p1, 'exit_price2': exit_p2,
+                    'z_score': signal.get('z_score', 0), 'reason': signal.get('reason', 'N/A'),
+                    'duration_seconds': duration.total_seconds(),
+                    'entry_spread': entry_spread, 'exit_spread': exit_spread,
+                    'spread_change': spread_change
                 }
-
+                
         except Exception as e:
             log.error(f"❌ Error executing signal: {e}")
+            import traceback
+            log.error(traceback.format_exc())
             return None
 
     def _close_all_positions(self, timestamp: datetime, row: pd.Series):

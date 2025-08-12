@@ -1,5 +1,5 @@
 # ===========================
-# BACKTEST CONFIGURATION - CORREGIDO
+# BACKTEST CONFIGURATION - OPTIMIZADO
 # ===========================
 
 # Trading Pair
@@ -23,7 +23,7 @@ max_positions: 1
 execution:
   commission_bps: 2.0
   use_orderbook: false
-  fallback_slippage_bps: 0.0000001  # 🔧 CORREGIDO: era 0.01
+  fallback_slippage_bps: 5.0  # CORREGIDO: era 1e-07
   max_participation_rate: 0.10
   orderbook_time_tolerance_seconds: 450
 
@@ -34,20 +34,21 @@ data:
   resample_minutes: 15
 
 # ===========================
-# PAIRS STRATEGY PARAMETERS - CORREGIDO
+# PAIRS STRATEGY PARAMETERS - OPTIMIZADO
 # ===========================
 strategy:
   # Ventanas EN DÍAS
-  lookback_window: 7           # 🔧 CORREGIDO: días para z-score
-  hedge_ratio_window: 60       # 🔧 CORREGIDO: días para hedge ratio
-  rebalance_frequency: "never" # 🔧 CORREGIDO: desactivado
+  lookback_window: 7           # días para z-score
+  hedge_ratio_window: 60       # días para hedge ratio
+  rebalance_frequency: "never"
 
-  entry_threshold: 1.75
-  exit_threshold: 0.25          # 🔧 CORREGIDO: era 0.0
-  stop_loss_threshold: 5
+  # THRESHOLDS OPTIMIZADOS
+  entry_threshold: 2.0         # Más conservador
+  exit_threshold: 0.0          # CORREGIDO: salir en la media
+  stop_loss_threshold: 4.0
 
   min_correlation: 0.5
-  use_robust_zscore: true
+  use_robust_zscore: false     # Usar std tradicional
 
   signal_confirmation_bars: 0
   max_holding_periods: 0

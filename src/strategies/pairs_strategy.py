@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pairs Trading Strategy - CORREGIDO: Rolling hedge ratio + Exit direccional
+Pairs Trading Strategy - Con validación de coherencia
 """
 
 from typing import Dict, Optional, Any
@@ -204,24 +204,23 @@ class PairsTradingStrategy(BaseStrategy):
         return (corr >= min_corr) if not np.isnan(corr) else True
 
     def generate_signal(self, timestamp: datetime, row: pd.Series, index: int) -> Optional[Dict]:
-        """Generar señales con hedge ratio rolling para NUEVAS posiciones"""
+        """Generar señales con validación de coherencia"""
         
         # Si NO hay posición, calcular NUEVO hedge ratio con datos RECIENTES
         if not self.current_position:
             self.current_hedge_ratio = self._calculate_hedge_ratio_at(index)
         
-        # Usar el hedge ratio apropiado
-        # - Para posición existente: usar el hedge ratio con el que se abrió
-        # - Para nueva posición: usar el hedge ratio recién calculado
         hedge_ratio_to_use = self.position_hedge_ratio if self.current_position else self.current_hedge_ratio
         
-        # Calcular z-score con el hedge ratio apropiado
+        # Calcular z-score y spread actual
         z = self._zscore_at(index, hedge_ratio_to_use)
+        current_spread = self._calculate_spread_at(index, hedge_ratio_to_use)
         
         # Guardar para diagnóstico
         self.signals_history.append({
             'timestamp': timestamp,
             'z_score': float(z),
+            'spread': float(current_spread),
             'hedge_ratio': float(hedge_ratio_to_use),
             'current_hedge_ratio': float(self.current_hedge_ratio),
             'position_hedge_ratio': float(self.position_hedge_ratio) if self.position_hedge_ratio else None,
@@ -233,7 +232,7 @@ class PairsTradingStrategy(BaseStrategy):
         # Debug cada 500 observaciones
         if index % 500 == 0 and index > 0:
             log.info(
-                f"📊 SIGNAL DEBUG | idx:{index} | Z:{z:.3f} | "
+                f"📊 DEBUG | idx:{index} | Z:{z:.3f} | Spread:{current_spread:.6f} | "
                 f"HR_current:{self.current_hedge_ratio:.4f} | "
                 f"HR_position:{(0.0 if self.position_hedge_ratio is None else self.position_hedge_ratio):.4f} | "
                 f"Position:{self.current_position or 'None'}"
@@ -245,6 +244,7 @@ class PairsTradingStrategy(BaseStrategy):
                 log.info(f"⚠️ LOW CORR EXIT | Z:{z:.3f}")
                 self.current_position = None
                 self.position_hedge_ratio = None
+                self.entry_spread = None if hasattr(self, 'entry_spread') else None
                 return {
                     'action': 'CLOSE',
                     'position_id': 'current',
@@ -255,7 +255,7 @@ class PairsTradingStrategy(BaseStrategy):
 
         # Parámetros de trading
         entry = float(self.params.get('entry_threshold', 2.0))
-        exit_thr = float(self.params.get('exit_threshold', 0.5))
+        exit_thr = float(self.params.get('exit_threshold', 0.0))
         stop = float(self.params.get('stop_loss_threshold', 4.0))
 
         signal: Optional[Dict[str, Any]] = None
@@ -265,9 +265,11 @@ class PairsTradingStrategy(BaseStrategy):
             if z <= -entry:
                 # LONG: Spread infravalorado
                 self.current_position = 'LONG'
-                self.position_hedge_ratio = self.current_hedge_ratio  # Fijar hedge ratio
+                self.position_hedge_ratio = self.current_hedge_ratio
+                self.entry_spread = current_spread  # Guardar para validación
+                self.entry_z = z
                 
-                log.info(f"📈 LONG SIGNAL | Z:{z:.4f} ≤ -{entry} | HR:{self.position_hedge_ratio:.6f}")
+                log.info(f"📈 LONG SIGNAL | Z:{z:.4f} ≤ -{entry} | HR:{self.position_hedge_ratio:.6f} | Spread:{current_spread:.6f}")
                 
                 signal = {
                     'action': 'LONG',
@@ -275,14 +277,17 @@ class PairsTradingStrategy(BaseStrategy):
                     'reason': 'spread_undervalued',
                     'z_score': float(z),
                     'hedge_ratio': float(self.position_hedge_ratio),
+                    'spread': float(current_spread)
                 }
                 
             elif z >= entry:
                 # SHORT: Spread sobrevalorado
                 self.current_position = 'SHORT'
-                self.position_hedge_ratio = self.current_hedge_ratio  # Fijar hedge ratio
+                self.position_hedge_ratio = self.current_hedge_ratio
+                self.entry_spread = current_spread  # Guardar para validación
+                self.entry_z = z
                 
-                log.info(f"📉 SHORT SIGNAL | Z:{z:.4f} ≥ +{entry} | HR:{self.position_hedge_ratio:.6f}")
+                log.info(f"📉 SHORT SIGNAL | Z:{z:.4f} ≥ +{entry} | HR:{self.position_hedge_ratio:.6f} | Spread:{current_spread:.6f}")
                 
                 signal = {
                     'action': 'SHORT',
@@ -290,53 +295,85 @@ class PairsTradingStrategy(BaseStrategy):
                     'reason': 'spread_overvalued',
                     'z_score': float(z),
                     'hedge_ratio': float(self.position_hedge_ratio),
+                    'spread': float(current_spread)
                 }
         else:
-            # === SALIDA (direccional) ===
+            # === SALIDA ===
+            # Validación de coherencia
+            if hasattr(self, 'entry_spread'):
+                spread_change = current_spread - self.entry_spread
+                z_change = z - self.entry_z if hasattr(self, 'entry_z') else 0
+                
+                # Para debugging
+                if abs(spread_change) > 0.1:  # Si el spread se movió significativamente
+                    expected_z_direction = np.sign(spread_change)
+                    actual_z_direction = np.sign(z_change)
+                    
+                    if expected_z_direction != actual_z_direction and abs(z_change) > 0.5:
+                        log.warning(f"⚠️ Z-SCORE COHERENCE: Spread Δ{spread_change:+.6f} but Z Δ{z_change:+.3f}")
+            
             if self.current_position == 'LONG':
-                # Entró en z <= -2, sale cuando z >= +exit_threshold
+                # LONG: entrada en Z≤-entry, salida en Z≥exit_threshold
                 if z >= exit_thr:
-                    log.info(f"🔄 LONG EXIT | Z:{z:.4f} ≥ +{exit_thr} (mean reversion)")
+                    log.info(
+                        f"🔄 LONG EXIT | Z:{z:.4f} ≥ {exit_thr} | Spread:{current_spread:.6f} (from "
+                        f"{(self.entry_spread if hasattr(self, 'entry_spread') else 0):.6f})"
+                    )
                     self.current_position = None
                     self.position_hedge_ratio = None
+                    self.entry_spread = None if hasattr(self, 'entry_spread') else None
+                    self.entry_z = None if hasattr(self, 'entry_z') else None
                     signal = {
                         'action': 'CLOSE',
                         'position_id': 'current',
                         'reason': 'exit_signal',
                         'z_score': float(z),
+                        'spread': float(current_spread)
                     }
                 elif z < -stop:
-                    log.info(f"🛑 LONG STOP | Z:{z:.4f} < -{stop} (stop loss)")
+                    log.info(f"🛑 LONG STOP | Z:{z:.4f} < -{stop}")
                     self.current_position = None
                     self.position_hedge_ratio = None
+                    self.entry_spread = None if hasattr(self, 'entry_spread') else None
+                    self.entry_z = None if hasattr(self, 'entry_z') else None
                     signal = {
                         'action': 'CLOSE',
                         'position_id': 'current',
                         'reason': 'stop_loss',
                         'z_score': float(z),
+                        'spread': float(current_spread)
                     }
                     
             elif self.current_position == 'SHORT':
-                # Entró en z >= +2, sale cuando z <= -exit_threshold
+                # SHORT: entrada en Z≥entry, salida en Z≤-exit_threshold
                 if z <= -exit_thr:
-                    log.info(f"🔄 SHORT EXIT | Z:{z:.4f} ≤ -{exit_thr} (mean reversion)")
+                    log.info(
+                        f"🔄 SHORT EXIT | Z:{z:.4f} ≤ {-exit_thr} | Spread:{current_spread:.6f} (from "
+                        f"{(self.entry_spread if hasattr(self, 'entry_spread') else 0):.6f})"
+                    )
                     self.current_position = None
                     self.position_hedge_ratio = None
+                    self.entry_spread = None if hasattr(self, 'entry_spread') else None
+                    self.entry_z = None if hasattr(self, 'entry_z') else None
                     signal = {
                         'action': 'CLOSE',
                         'position_id': 'current',
                         'reason': 'exit_signal',
                         'z_score': float(z),
+                        'spread': float(current_spread)
                     }
                 elif z > stop:
-                    log.info(f"🛑 SHORT STOP | Z:{z:.4f} > +{stop} (stop loss)")
+                    log.info(f"🛑 SHORT STOP | Z:{z:.4f} > +{stop}")
                     self.current_position = None
                     self.position_hedge_ratio = None
+                    self.entry_spread = None if hasattr(self, 'entry_spread') else None
+                    self.entry_z = None if hasattr(self, 'entry_z') else None
                     signal = {
                         'action': 'CLOSE',
                         'position_id': 'current',
                         'reason': 'stop_loss',
                         'z_score': float(z),
+                        'spread': float(current_spread)
                     }
 
         return signal or {'action': 'HOLD'}

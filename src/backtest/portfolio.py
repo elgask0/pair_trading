@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Portfolio Manager - CORREGIDO: Mark-to-market continuo para equity curve suave
+Portfolio Manager - CORREGIDO: PnL calculation definitivo
 """
 
 import pandas as pd
@@ -56,7 +56,7 @@ class Portfolio:
         return position
     
     def close_position(self, position_id: str, price1: float, price2: float, cost: float) -> float:
-        """CORREGIDO: PnL calculation para pairs trading"""
+        """CORREGIDO DEFINITIVO: PnL calculation para pairs trading"""
         
         if position_id not in self.positions:
             log.warning(f"Position {position_id} not found")
@@ -64,25 +64,45 @@ class Portfolio:
         
         position = self.positions[position_id]
         
-        # CORRECCIÓN: Cálculo correcto del PnL para pairs
+        # CORRECCIÓN CRÍTICA: El PnL depende de qué hacemos con cada activo
         if position.direction == 'LONG':
-            # LONG spread: compramos P1, vendimos P2
-            # PnL = (P1_exit - P1_entry) * size1 - (P2_exit - P2_entry) * size2
+            # LONG spread = Compramos symbol1, Vendimos symbol2
+            # En execution.py: side1='buy', side2='sell'
+            
+            # Symbol1: Lo COMPRAMOS, ganamos si sube
             pnl_symbol1 = position.size1 * (price1 - position.entry_price1)
-            pnl_symbol2 = -position.size2 * (price2 - position.entry_price2)
-            pnl_gross = pnl_symbol1 + pnl_symbol2
+            
+            # Symbol2: Lo VENDIMOS (short), ganamos si BAJA
+            pnl_symbol2 = position.size2 * (position.entry_price2 - price2)  # INVERTIDO!
+            
         else:  # SHORT
-            # SHORT spread: vendimos P1, compramos P2
-            # PnL = -(P1_exit - P1_entry) * size1 + (P2_exit - P2_entry) * size2
-            pnl_symbol1 = -position.size1 * (price1 - position.entry_price1)
+            # SHORT spread = Vendimos symbol1, Compramos symbol2
+            # En execution.py: side1='sell', side2='buy'
+            
+            # Symbol1: Lo VENDIMOS (short), ganamos si BAJA
+            pnl_symbol1 = position.size1 * (position.entry_price1 - price1)  # INVERTIDO!
+            
+            # Symbol2: Lo COMPRAMOS, ganamos si sube
             pnl_symbol2 = position.size2 * (price2 - position.entry_price2)
-            pnl_gross = pnl_symbol1 + pnl_symbol2
         
-        # Restar comisiones
+        pnl_gross = pnl_symbol1 + pnl_symbol2
         pnl_net = pnl_gross - cost
         
+        # Guardar para debugging
+        position.exit_price1 = price1
+        position.exit_price2 = price2
+        position.pnl_symbol1 = pnl_symbol1
+        position.pnl_symbol2 = pnl_symbol2
+        position.pnl_gross = pnl_gross
+        position.pnl_net = pnl_net
+        
+        # Log detallado para debugging
+        log.debug(f"PnL Debug | {position.direction} | "
+                 f"S1: {position.entry_price1:.4f}→{price1:.4f} pnl={pnl_symbol1:.2f} | "
+                 f"S2: {position.entry_price2:.4f}→{price2:.4f} pnl={pnl_symbol2:.2f} | "
+                 f"Total: {pnl_gross:.2f}")
+        
         # Actualizar cash
-        # El cash aumenta por el PnL neto (puede ser negativo)
         self.cash += position.entry_cost + pnl_net
         
         # Mover a posiciones cerradas
@@ -95,38 +115,36 @@ class Portfolio:
             'position_id': position_id,
             'pnl_gross': pnl_gross,
             'pnl_net': pnl_net,
+            'pnl_symbol1': pnl_symbol1,
+            'pnl_symbol2': pnl_symbol2,
             'cash_after': self.cash
         })
         
         return pnl_net
     
     def update_positions(self, price1: float, price2: float):
-        """CORREGIDO: Mark-to-market continuo para equity curve suave"""
+        """Mark-to-market continuo - mismo cálculo que close"""
         
         for position in self.positions.values():
-            # Calcular PnL no realizado
+            # Usar la misma lógica que close_position
             if position.direction == 'LONG':
-                # LONG: compramos P1, vendimos P2
+                # LONG: compramos S1, vendimos S2
                 unrealized_pnl1 = position.size1 * (price1 - position.entry_price1)
-                unrealized_pnl2 = -position.size2 * (price2 - position.entry_price2)
-                unrealized_pnl = unrealized_pnl1 + unrealized_pnl2
+                unrealized_pnl2 = position.size2 * (position.entry_price2 - price2)
             else:  # SHORT
-                # SHORT: vendimos P1, compramos P2
-                unrealized_pnl1 = -position.size1 * (price1 - position.entry_price1)
+                # SHORT: vendimos S1, compramos S2
+                unrealized_pnl1 = position.size1 * (position.entry_price1 - price1)
                 unrealized_pnl2 = position.size2 * (price2 - position.entry_price2)
-                unrealized_pnl = unrealized_pnl1 + unrealized_pnl2
             
-            # Valor actual de la posición (para reporting)
+            unrealized_pnl = unrealized_pnl1 + unrealized_pnl2
+            
             position.current_value = position.size1 * price1 + position.size2 * price2
             position.unrealized_pnl = unrealized_pnl
+            position.unrealized_pnl1 = unrealized_pnl1
+            position.unrealized_pnl2 = unrealized_pnl2
     
     def get_equity(self) -> float:
-        """CORREGIDO: Equity = Cash + Capital invertido + PnL no realizado"""
-        # El equity total es:
-        # 1. Cash disponible
-        # 2. Capital invertido en posiciones (entry_cost)
-        # 3. PnL no realizado
-        
+        """Equity = Cash + Capital invertido + PnL no realizado"""
         capital_invested = sum(p.entry_cost for p in self.positions.values())
         unrealized_pnl = sum(p.unrealized_pnl for p in self.positions.values())
         
