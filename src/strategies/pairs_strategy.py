@@ -308,9 +308,7 @@ class PairsTradingStrategy(BaseStrategy):
                 if abs(spread_change) > 0.1:  # Si el spread se movió significativamente
                     expected_z_direction = np.sign(spread_change)
                     actual_z_direction = np.sign(z_change)
-                    
-                    if expected_z_direction != actual_z_direction and abs(z_change) > 0.5:
-                        log.warning(f"⚠️ Z-SCORE COHERENCE: Spread Δ{spread_change:+.6f} but Z Δ{z_change:+.3f}")
+                
             
             if self.current_position == 'LONG':
                 # LONG: entrada en Z≤-entry, salida en Z≥exit_threshold
