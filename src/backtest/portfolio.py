@@ -158,28 +158,6 @@ class Portfolio:
         """Calcular exposición total"""
         return sum(abs(p.current_value) for p in self.positions.values())
     
-    def get_trade_metrics(self) -> Dict:
-        """Obtener métricas de trading detalladas"""
-        if not self.closed_positions:
-            return {}
-        
-        pnls = [p.pnl_net for p in self.closed_positions if hasattr(p, 'pnl_net')]
-        if not pnls:
-            return {}
-        
-        wins = [p for p in pnls if p > 0]
-        losses = [p for p in pnls if p < 0]
-        
-        return {
-            'total_trades': len(pnls),
-            'win_rate': len(wins) / len(pnls) if pnls else 0,
-            'avg_win': np.mean(wins) if wins else 0,
-            'avg_loss': np.mean(losses) if losses else 0,
-            'best_trade': max(pnls) if pnls else 0,
-            'worst_trade': min(pnls) if pnls else 0,
-            'profit_factor': sum(wins) / abs(sum(losses)) if losses else float('inf')
-        }
-    
     def get_position_summary(self) -> pd.DataFrame:
         """Resumen de posiciones actuales"""
         if not self.positions:
