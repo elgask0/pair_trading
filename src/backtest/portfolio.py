@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Portfolio Manager - CORREGIDO: Mark-to-market continuo
+Portfolio Manager - CORREGIDO: Mark-to-market continuo para equity curve suave
 """
 
 import pandas as pd
@@ -24,7 +24,9 @@ class Portfolio:
         self.equity_history = []
         
     def open_position(self, timestamp: datetime, direction: str, size1: float, 
-                     size2: float, price1: float, price2: float, cost: float) -> Position:
+                     size2: float, price1: float, price2: float, cost: float,
+                     hedge_ratio: float = 1.0) -> Position:
+        """Abrir posición con tracking de hedge ratio"""
         position_id = str(uuid.uuid4())[:8]
         
         position = Position(
@@ -35,7 +37,8 @@ class Portfolio:
             size2=size2,
             entry_price1=price1,
             entry_price2=price2,
-            entry_cost=cost
+            entry_cost=cost,
+            hedge_ratio=hedge_ratio
         )
         
         self.positions[position_id] = position
@@ -53,7 +56,7 @@ class Portfolio:
         return position
     
     def close_position(self, position_id: str, price1: float, price2: float, cost: float) -> float:
-        """🔧 CORREGIDO: PnL calculation para pairs trading"""
+        """CORREGIDO: PnL calculation para pairs trading"""
         
         if position_id not in self.positions:
             log.warning(f"Position {position_id} not found")
@@ -61,23 +64,26 @@ class Portfolio:
         
         position = self.positions[position_id]
         
-        # 🔧 CORREGIDO: Cálculo correcto del PnL para pairs trading
+        # CORRECCIÓN: Cálculo correcto del PnL para pairs
         if position.direction == 'LONG':
-            # LONG spread = comprar symbol1, vender symbol2
-            pnl_symbol1 = position.size1 * (price1 - position.entry_price1)  # Posición larga
-            pnl_symbol2 = -position.size2 * (price2 - position.entry_price2)  # Posición corta (NEGATIVO)
+            # LONG spread: compramos P1, vendimos P2
+            # PnL = (P1_exit - P1_entry) * size1 - (P2_exit - P2_entry) * size2
+            pnl_symbol1 = position.size1 * (price1 - position.entry_price1)
+            pnl_symbol2 = -position.size2 * (price2 - position.entry_price2)
             pnl_gross = pnl_symbol1 + pnl_symbol2
         else:  # SHORT
-            # SHORT spread = vender symbol1, comprar symbol2
-            pnl_symbol1 = -position.size1 * (price1 - position.entry_price1)  # Posición corta (NEGATIVO)
-            pnl_symbol2 = position.size2 * (price2 - position.entry_price2)   # Posición larga
+            # SHORT spread: vendimos P1, compramos P2
+            # PnL = -(P1_exit - P1_entry) * size1 + (P2_exit - P2_entry) * size2
+            pnl_symbol1 = -position.size1 * (price1 - position.entry_price1)
+            pnl_symbol2 = position.size2 * (price2 - position.entry_price2)
             pnl_gross = pnl_symbol1 + pnl_symbol2
         
+        # Restar comisiones
         pnl_net = pnl_gross - cost
         
-        # Actualizar cash con el valor de cierre
-        close_value = position.size1 * price1 + position.size2 * price2
-        self.cash += close_value - cost
+        # Actualizar cash
+        # El cash aumenta por el PnL neto (puede ser negativo)
+        self.cash += position.entry_cost + pnl_net
         
         # Mover a posiciones cerradas
         self.closed_positions.append(position)
@@ -95,33 +101,36 @@ class Portfolio:
         return pnl_net
     
     def update_positions(self, price1: float, price2: float):
-        """🔧 CORREGIDO: Mark-to-market continuo para equity curve smooth"""
+        """CORREGIDO: Mark-to-market continuo para equity curve suave"""
         
         for position in self.positions.values():
-            # 🔧 CORREGIDO: Valor de mercado actual
-            current_value1 = position.size1 * price1
-            current_value2 = position.size2 * price2
-            
-            # 🔧 CORREGIDO: PnL no realizado para pairs trading
+            # Calcular PnL no realizado
             if position.direction == 'LONG':
-                # LONG spread = comprar symbol1, vender symbol2
-                unrealized_pnl1 = position.size1 * (price1 - position.entry_price1)  # Larga
-                unrealized_pnl2 = -position.size2 * (price2 - position.entry_price2)  # Corta
+                # LONG: compramos P1, vendimos P2
+                unrealized_pnl1 = position.size1 * (price1 - position.entry_price1)
+                unrealized_pnl2 = -position.size2 * (price2 - position.entry_price2)
                 unrealized_pnl = unrealized_pnl1 + unrealized_pnl2
             else:  # SHORT
-                # SHORT spread = vender symbol1, comprar symbol2
-                unrealized_pnl1 = -position.size1 * (price1 - position.entry_price1)  # Corta
-                unrealized_pnl2 = position.size2 * (price2 - position.entry_price2)   # Larga
+                # SHORT: vendimos P1, compramos P2
+                unrealized_pnl1 = -position.size1 * (price1 - position.entry_price1)
+                unrealized_pnl2 = position.size2 * (price2 - position.entry_price2)
                 unrealized_pnl = unrealized_pnl1 + unrealized_pnl2
             
-            # 🔧 IMPORTANTE: Current value es el valor de mercado de la posición
-            position.current_value = current_value1 + current_value2
+            # Valor actual de la posición (para reporting)
+            position.current_value = position.size1 * price1 + position.size2 * price2
             position.unrealized_pnl = unrealized_pnl
     
     def get_equity(self) -> float:
-        """🔧 CORREGIDO: Equity = Cash + Unrealized PnL (no current_value)"""
+        """CORREGIDO: Equity = Cash + Capital invertido + PnL no realizado"""
+        # El equity total es:
+        # 1. Cash disponible
+        # 2. Capital invertido en posiciones (entry_cost)
+        # 3. PnL no realizado
+        
+        capital_invested = sum(p.entry_cost for p in self.positions.values())
         unrealized_pnl = sum(p.unrealized_pnl for p in self.positions.values())
-        return self.cash + unrealized_pnl
+        
+        return self.cash + capital_invested + unrealized_pnl
     
     def get_positions_value(self) -> float:
         """Obtener valor total de posiciones abiertas"""
@@ -146,7 +155,8 @@ class Portfolio:
                 'entry_price1': pos.entry_price1,
                 'entry_price2': pos.entry_price2,
                 'current_value': pos.current_value,
-                'unrealized_pnl': pos.unrealized_pnl
+                'unrealized_pnl': pos.unrealized_pnl,
+                'hedge_ratio': pos.hedge_ratio
             })
         
         return pd.DataFrame(data)

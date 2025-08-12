@@ -23,7 +23,7 @@ max_positions: 1
 execution:
   commission_bps: 2.0
   use_orderbook: false
-  fallback_slippage_bps: 5.0  # 🔧 CORREGIDO: era 0.01
+  fallback_slippage_bps: 0.0000001  # 🔧 CORREGIDO: era 0.01
   max_participation_rate: 0.10
   orderbook_time_tolerance_seconds: 450
 
@@ -42,9 +42,9 @@ strategy:
   hedge_ratio_window: 60       # 🔧 CORREGIDO: días para hedge ratio
   rebalance_frequency: "never" # 🔧 CORREGIDO: desactivado
 
-  entry_threshold: 2.0
-  exit_threshold: 0.5          # 🔧 CORREGIDO: era 0.0
-  stop_loss_threshold: 4.0
+  entry_threshold: 1.75
+  exit_threshold: 0.25          # 🔧 CORREGIDO: era 0.0
+  stop_loss_threshold: 5
 
   min_correlation: 0.5
   use_robust_zscore: true
