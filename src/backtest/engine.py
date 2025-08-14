@@ -257,25 +257,38 @@ class BacktestEngine:
         self._print_enhanced_summary()
         return self.results
 
+
+
     def _execute_signal(self, signal: Dict, timestamp: datetime, row: pd.Series) -> Optional[Dict]:
-        """LOGS MEJORADOS: PnL por activo y validación"""
         try:
             if signal['action'] in ['LONG', 'SHORT']:
                 if len(self.portfolio.positions) >= self.config.max_positions:
                     log.warning(f"🚫 MAX POSITIONS | Current: {len(self.portfolio.positions)}/{self.config.max_positions}")
                     return None
-                    
-                position_value = self.portfolio.cash * self.config.position_size
+                
+                # NUEVO: Ajustar tamaño por volatilidad
+                base_position_value = self.portfolio.cash * self.config.position_size
+                
+                # Aplicar multiplier si existe
+                size_multiplier = signal.get('position_size_multiplier', 1.0)
+                position_value = base_position_value * size_multiplier
+                
+                if size_multiplier < 1.0:
+                    log.info(f"📉 Position size adjusted to {size_multiplier:.0%} due to high volatility")
                 
                 execution_result = self.execution.simulate_execution(
                     signal=signal,
                     symbol1=self.config.symbol1,
                     symbol2=self.config.symbol2,
-                    price1=row['price1'], price2=row['price2'],
-                    volume1=row['volume1'], volume2=row['volume2'],
-                    position_value=position_value, timestamp=timestamp
+                    price1=row['price1'], 
+                    price2=row['price2'],
+                    volume1=row['volume1'], 
+                    volume2=row['volume2'],
+                    position_value=position_value,  # Usar el valor ajustado
+                    timestamp=timestamp
                 )
-                
+            
+            # ... resto del código igual ...                
                 if execution_result['success']:
                     position = self.portfolio.open_position(
                         timestamp=timestamp, direction=signal['action'],

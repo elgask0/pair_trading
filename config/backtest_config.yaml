@@ -1,5 +1,5 @@
 # ===========================
-# BACKTEST CONFIGURATION - OPTIMIZADO
+# BACKTEST CONFIGURATION - FINAL OPTIMIZED
 # ===========================
 
 # Trading Pair
@@ -14,16 +14,16 @@ end_date: 2025-08-01
 # CAPITAL & RISK MANAGEMENT
 # ===========================
 initial_capital: 10000
-position_size: 0.1
+position_size: 0.3
 max_positions: 1
 
 # ===========================
-# EXECUTION CONFIGURATION - CORREGIDO
+# EXECUTION CONFIGURATION
 # ===========================
 execution:
-  commission_bps: 2.0
+  commission_bps: 0
   use_orderbook: false
-  fallback_slippage_bps: 5.0  # CORREGIDO: era 1e-07
+  fallback_slippage_bps: 0
   max_participation_rate: 0.10
   orderbook_time_tolerance_seconds: 450
 
@@ -34,22 +34,38 @@ data:
   resample_minutes: 15
 
 # ===========================
-# PAIRS STRATEGY PARAMETERS - OPTIMIZADO
+# PAIRS STRATEGY PARAMETERS - FINAL TUNING
 # ===========================
 strategy:
-  # Ventanas EN DÍAS
-  lookback_window: 7           # días para z-score
-  hedge_ratio_window: 60       # días para hedge ratio
+  # Ventanas temporales (en DÍAS)
+  lookback_window: 10
+  hedge_ratio_window: 20
   rebalance_frequency: "never"
 
-  # THRESHOLDS OPTIMIZADOS
-  entry_threshold: 2.0         # Más conservador
-  exit_threshold: 0.0          # CORREGIDO: salir en la media
-  stop_loss_threshold: 4.0
+  # Trading thresholds - AJUSTADOS
+  entry_threshold: 2
+  exit_threshold: 0           
+  stop_loss_threshold: 4
 
-  min_correlation: 0.5
-  use_robust_zscore: false     # Usar std tradicional
-
+  # Correlación
+  min_correlation: 0.7
+  min_correlation_rolling: 0.6
+  
+  # Hedge Ratio Quality - RELAJADO
+  min_r_squared: 0.7
+  max_hedge_ratio: 3
+  min_hedge_ratio: 0.3
+  
+  # Risk Management - AJUSTADO
+  max_position_hours: 48
+  
+  # Volatility adjustment
+  volatility_lookback_hours: 24
+  high_volatility_multiplier: 1.5
+  position_size_reduction: 0.5
+  
+  # Otros
+  use_robust_zscore: false
   signal_confirmation_bars: 0
   max_holding_periods: 0
 
